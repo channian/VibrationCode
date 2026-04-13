@@ -1,0 +1,4 @@
+tagname,devicename,machine_id,model_group,train_start,train_end
+CWP_CUR_AVG_01,ZP1_2,ZP1_2,Pump_A,,
+CWP_CUR_AVG_02,ZP1_3,ZP1_3,Pump_A,,
+CWP_CUR_AVG_03,ZP2_1,ZP2_1,Pump_B,,
