@@ -96,6 +96,14 @@ def main() -> int:
     logger.info(f"\nProcessing {len(vib_data)} device position(s)...\n")
 
     for device_id, df_raw in sorted(vib_data.items()):
+        if df_raw.empty:
+            logger.warning(f"{device_id}: DataFrame is empty, skipping")
+            records.append({
+                'device_id': device_id, 'position': 'unknown', 'row_count': 0,
+                'time_start': None, 'time_end': None, 'has_current': False,
+            })
+            continue
+
         device_base = df_raw['devicename'].iloc[0]
         position    = df_raw['position'].iloc[0]
         tagname     = name_to_tag.get(device_base)

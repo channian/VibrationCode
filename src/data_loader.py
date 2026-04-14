@@ -114,6 +114,13 @@ def load_vibration(folder: str) -> dict[str, pd.DataFrame]:
             df = df.dropna(subset=['datetime']).reset_index(drop=True)
             df = df.sort_values('datetime').reset_index(drop=True)
 
+            if df.empty:
+                logger.warning(
+                    f"[vib] {device_id}: all rows dropped after datetime parse in "
+                    f"{os.path.basename(filepath)} — check time column format"
+                )
+                continue
+
             # 掛載設備識別欄位
             df['devicename'] = device_base
             df['position'] = position
