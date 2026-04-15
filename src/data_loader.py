@@ -164,41 +164,133 @@ def load_vibration(folder: str) -> dict[str, pd.DataFrame]:
     return result
 
 
+def _detect_tagname_col(df: pd.DataFrame) -> str | None:
+    """
+    自動偵測 tagname 欄位，支援常見 SCADA 匯出格式。
+    優先完全匹配，其次包含 'tag' 字眼。
+    """
+    exact = ['tagname', 'TagName', 'tag_name', 'tag', 'Tag',
+             'TagID', 'tag_id', 'sensor', 'sensor_id', 'SensorID']
+    for name in exact:
+        if name in df.columns:
+            return name
+    for col in df.columns:
+        if 'tag' in col.lower():
+            return col
+    return None
+
+
+def _detect_value_col(df: pd.DataFrame, exclude_cols: list[str]) -> str | None:
+    """
+    自動偵測 value 欄位，排除時間與 tagname 欄位。
+    優先完全匹配，其次包含 'val' 字眼。
+    """
+    exclude_lower = {c.lower() for c in exclude_cols}
+    exact = ['value', 'Value', 'val', 'Val', 'measurement',
+             'Measurement', 'reading', 'Reading', 'data', 'Data']
+    for name in exact:
+        if name in df.columns and name.lower() not in exclude_lower:
+            return name
+    for col in df.columns:
+        if col.lower() not in exclude_lower and 'val' in col.lower():
+            return col
+    return None
+
+
 def load_current(folder: str) -> pd.DataFrame:
     """
     讀取 Current_Data/ 下所有 CSV，合併成虛擬大表。
     期望欄位：datetime（或含 Date/Time 字眼的欄位）、tagname、value
 
+    欄位名稱自動偵測，支援 SCADA 常見的 TagName/tag/sensor 等變體。
+    遇到無法解析的檔案會印出詳細診斷訊息而非靜默跳過。
+
     Returns:
-        合併後的 DataFrame，欄位: datetime, tagname, value（及原有其他欄位）
+        合併後的 DataFrame，統一欄位: datetime, tagname, value
         若無資料則回傳空 DataFrame
     """
     csv_files = sorted(glob.glob(os.path.join(folder, '*.csv')))
 
     if not csv_files:
-        logger.warning(f"No CSV files found in {folder}")
+        logger.warning(f"[cur] No CSV files found in '{folder}'")
+        logger.warning(f"[cur] 請確認電流 CSV 已放入 {os.path.abspath(folder)}/")
         return pd.DataFrame(columns=['datetime', 'tagname', 'value'])
 
+    logger.info(f"[cur] Found {len(csv_files)} file(s) in {folder}")
     dfs = []
+
     for filepath in csv_files:
+        fname = os.path.basename(filepath)
         try:
             df = safe_read_csv(filepath)
-            time_col = _detect_time_col(df, filepath)
-            df[time_col] = _parse_and_validate_datetime(df[time_col], filepath)
+            logger.info(f"[cur] {fname}: columns = {list(df.columns)}")
+
+            # ── 時間欄位 ────────────────────────────────────
+            try:
+                time_col = _detect_time_col(df, filepath)
+            except ValueError:
+                logger.error(
+                    f"[cur] {fname}: 找不到時間欄位！"
+                    f" 現有欄位: {list(df.columns)}"
+                    f" — 需要含 'Date' 或 'Time' 字眼的欄位名稱"
+                )
+                continue
+
+            df[time_col] = _parse_and_validate_datetime(df[time_col], fname)
             df = df.rename(columns={time_col: 'datetime'})
             df = df.dropna(subset=['datetime'])
 
-            for required in ('tagname', 'value'):
-                if required not in df.columns:
-                    raise ValueError(f"Missing required column '{required}'")
+            if df.empty:
+                logger.warning(f"[cur] {fname}: 時間解析後無有效資料，請確認時間格式")
+                continue
 
-            dfs.append(df)
-            logger.info(f"[cur] loaded {len(df)} rows from {os.path.basename(filepath)}")
+            # ── tagname 欄位（自動偵測）────────────────────
+            tag_col = _detect_tagname_col(df)
+            if tag_col is None:
+                logger.error(
+                    f"[cur] {fname}: 找不到 tagname 欄位！"
+                    f" 現有欄位: {list(df.columns)}"
+                    f" — 需要含 'tag' 字眼的欄位名稱（如 tagname、TagName、tag_id）"
+                )
+                continue
+            if tag_col != 'tagname':
+                logger.info(f"[cur] {fname}: tagname 欄位對應 '{tag_col}'")
+                df = df.rename(columns={tag_col: 'tagname'})
+
+            # ── value 欄位（自動偵測）──────────────────────
+            val_col = _detect_value_col(df, exclude_cols=['datetime', 'tagname'])
+            if val_col is None:
+                logger.error(
+                    f"[cur] {fname}: 找不到 value 欄位！"
+                    f" 現有欄位: {list(df.columns)}"
+                    f" — 需要含 'val' 字眼的欄位名稱（如 value、Value、measurement）"
+                )
+                continue
+            if val_col != 'value':
+                logger.info(f"[cur] {fname}: value 欄位對應 '{val_col}'")
+                df = df.rename(columns={val_col: 'value'})
+
+            # ── value 轉數值 ────────────────────────────────
+            df['value'] = pd.to_numeric(df['value'], errors='coerce')
+            invalid_val = df['value'].isna().sum()
+            if invalid_val > 0:
+                logger.warning(f"[cur] {fname}: {invalid_val} 筆 value 無法轉為數值 → NaN")
+
+            tags = df['tagname'].unique().tolist()
+            logger.info(
+                f"[cur] {fname}: {len(df)} rows | "
+                f"{len(tags)} tag(s): {tags[:5]}{'...' if len(tags) > 5 else ''}"
+            )
+            dfs.append(df[['datetime', 'tagname', 'value']])
 
         except Exception as e:
-            logger.error(f"Failed to load current file {filepath}: {e}")
+            logger.error(f"[cur] {fname}: 載入失敗 — {e}")
 
     if not dfs:
+        logger.warning(
+            "[cur] 所有電流 CSV 均載入失敗，健康模型將以無電流模式（單一 bin）執行。\n"
+            "      請檢查上方 [ERROR] 訊息確認欄位格式。"
+        )
         return pd.DataFrame(columns=['datetime', 'tagname', 'value'])
 
     combined = (
@@ -206,7 +298,11 @@ def load_current(folder: str) -> pd.DataFrame:
         .sort_values('datetime')
         .reset_index(drop=True)
     )
-    logger.info(f"load_current: {len(combined)} rows, {combined['tagname'].nunique()} tag(s)")
+    logger.info(
+        f"[cur] 合計: {len(combined)} rows | "
+        f"{combined['tagname'].nunique()} tag(s): "
+        f"{combined['tagname'].unique().tolist()[:5]}"
+    )
     return combined
 
 
