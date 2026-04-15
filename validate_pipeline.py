@@ -108,14 +108,41 @@ def main() -> int:
         position    = df_raw['position'].iloc[0]
         tagname     = name_to_tag.get(device_base)
 
+        # ── 電流對齊前診斷 ────────────────────────────────
+        if cur_data.empty:
+            logger.warning(f"  {device_id}: 電流大表為空，跳過對齊")
+        elif tagname is None:
+            logger.warning(
+                f"  {device_id}: device_mapping 中找不到 devicename='{device_base}' 的 tagname\n"
+                f"    device_mapping 現有 devicename: {name_to_tag and list(name_to_tag.keys())}"
+            )
+        else:
+            cur_tags = cur_data['tagname'].unique().tolist()
+            if tagname not in cur_tags:
+                logger.warning(
+                    f"  {device_id}: tagname='{tagname}' 不在電流資料中！\n"
+                    f"    電流資料實際 tagname: {cur_tags[:10]}"
+                )
+            else:
+                vib_t0 = df_raw['datetime'].min()
+                vib_t1 = df_raw['datetime'].max()
+                cur_df_tag = cur_data[cur_data['tagname'] == tagname]
+                cur_t0 = cur_df_tag['datetime'].min()
+                cur_t1 = cur_df_tag['datetime'].max()
+                overlap = not (vib_t1 < cur_t0 or cur_t1 < vib_t0)
+                logger.info(
+                    f"  {device_id}: tagname='{tagname}' ✅ | "
+                    f"振動 {str(vib_t0)[:10]}~{str(vib_t1)[:10]} | "
+                    f"電流 {str(cur_t0)[:10]}~{str(cur_t1)[:10]} | "
+                    f"時間重疊={'是' if overlap else '❌ 無重疊'}"
+                )
+
         # 電流對齊
         if tagname and not cur_data.empty:
             df_aligned = align_current(df_raw, cur_data, tagname)
         else:
             df_aligned = df_raw.copy()
             df_aligned['current_A'] = None
-            if tagname is None:
-                logger.debug(f"{device_id}: no tagname in mapping — skipping current alignment")
 
         has_current = (
             'current_A' in df_aligned.columns
