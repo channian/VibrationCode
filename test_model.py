@@ -21,7 +21,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.data_loader import load_vibration, load_current, load_mapping, align_current
+from src.data_loader import load_vibration, load_current, load_mapping, align_current_with_diag
 from src.filters import apply_all_filters
 from src.baseline_detector import resolve_baseline
 from src.health_model import VFDEdgeHealthModel
@@ -74,15 +74,10 @@ def main():
         logger.info(f"{'='*60}")
 
         device_base = df_raw['devicename'].iloc[0]
-        tagname     = name_to_tag.get(device_base)
         mapping_row = name_to_row.get(device_base)
 
-        # 電流對齊
-        if tagname and not cur_data.empty:
-            df = align_current(df_raw, cur_data, tagname)
-        else:
-            df = df_raw.copy()
-            df['current_A'] = None
+        # 電流對齊（含診斷）
+        df = align_current_with_diag(df_raw, cur_data, device_id, device_base, name_to_tag)
 
         # 清洗管線
         df_clean = apply_all_filters(df)

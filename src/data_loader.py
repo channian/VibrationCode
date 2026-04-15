@@ -306,6 +306,73 @@ def load_current(folder: str) -> pd.DataFrame:
     return combined
 
 
+def align_current_with_diag(
+    df_raw: pd.DataFrame,
+    cur_data: pd.DataFrame,
+    device_id: str,
+    device_base: str,
+    name_to_tag: dict,
+) -> pd.DataFrame:
+    """
+    電流對齊的共用入口：包含對齊前診斷訊息。
+
+    在 tagname 找不到、tagname 不在電流表、時間不重疊時
+    印出明確的 WARNING 而非靜默返回 current_A=NaN。
+
+    Returns:
+        df_raw 加上 'current_A' 欄位（對齊失敗時全為 NaN）
+    """
+    tagname = name_to_tag.get(device_base)
+
+    if cur_data.empty:
+        logger.warning(f"  [{device_id}] 電流大表為空，無法對齊")
+        df = df_raw.copy()
+        df['current_A'] = None
+        return df
+
+    if tagname is None:
+        logger.warning(
+            f"  [{device_id}] device_mapping 中找不到 devicename='{device_base}' 的 tagname\n"
+            f"    mapping 現有 devicename: {list(name_to_tag.keys())}"
+        )
+        df = df_raw.copy()
+        df['current_A'] = None
+        return df
+
+    cur_tags = cur_data['tagname'].unique().tolist()
+    if tagname not in cur_tags:
+        logger.warning(
+            f"  [{device_id}] tagname='{tagname}' 不在電流資料中！\n"
+            f"    電流資料實際 tagname: {cur_tags[:10]}"
+        )
+        df = df_raw.copy()
+        df['current_A'] = None
+        return df
+
+    # 時間重疊檢查
+    vib_t0, vib_t1 = df_raw['datetime'].min(), df_raw['datetime'].max()
+    cur_slice = cur_data[cur_data['tagname'] == tagname]
+    cur_t0, cur_t1 = cur_slice['datetime'].min(), cur_slice['datetime'].max()
+    overlap = not (vib_t1 < cur_t0 or cur_t1 < vib_t0)
+
+    if not overlap:
+        logger.warning(
+            f"  [{device_id}] 振動與電流時間範圍無重疊！\n"
+            f"    振動: {str(vib_t0)[:19]} ~ {str(vib_t1)[:19]}\n"
+            f"    電流: {str(cur_t0)[:19]} ~ {str(cur_t1)[:19]}"
+        )
+        df = df_raw.copy()
+        df['current_A'] = None
+        return df
+
+    logger.info(
+        f"  [{device_id}] tagname='{tagname}' ✅ | "
+        f"振動 {str(vib_t0)[:10]}~{str(vib_t1)[:10]} | "
+        f"電流 {str(cur_t0)[:10]}~{str(cur_t1)[:10]}"
+    )
+    return align_current(df_raw, cur_data, tagname)
+
+
 def load_mapping(path: str) -> pd.DataFrame:
     """
     讀取 device_mapping.csv。
