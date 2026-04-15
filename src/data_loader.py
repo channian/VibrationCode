@@ -62,7 +62,27 @@ def _parse_and_validate_datetime(series: pd.Series, source: str = '') -> pd.Seri
     解析時間欄位，並驗證年份在 2020–2030 合法範圍內。
     超出範圍的值不丟棄，但印出警告。
     """
-    dt = pd.to_datetime(series, format='mixed', dayfirst=False, errors='coerce')
+     # 1. 確保是字串，並把所有斜線 / 換成橫線 -
+    # 同時把多個空格縮減為一個空格，並去掉前後空白
+    clean_series = (
+        series.astype(str)
+        .str.replace('/', '-', regex=False)
+        .str.replace(r'\s+', ' ', regex=True)
+        .str.strip()
+    )
+
+    # 2. 解析時間 (因為已經統一成橫線，解析會變得非常穩定)
+    # 不指定 format，讓 Pandas 處理 yyyy-mm-dd 格式
+    dt = pd.to_datetime(clean_series, errors='coerce')
+
+    # 3. 偵測哪些行失敗並印出「真正」的原始內容
+    nat_mask = dt.isna() & series.notna()
+    if nat_mask.any():
+        bad_val = series[nat_mask].unique()[:3]
+        logger.warning(f"{source}: 解析失敗！原始內容範例: {list(bad_val)}")
+
+    # ... 剩下的年份驗證邏輯 ...
+
 
     nat_count = dt.isna().sum()
     if nat_count > 0:
