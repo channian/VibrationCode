@@ -24,6 +24,7 @@ DEFAULT_N_BINS = 3                  # 電流工況分層數（低/中/高負載�
 MIN_SAMPLES_PER_BIN = 15            # 每層最低樣本數，不足則合併鄰近層
 SCORE_AT_95TH = 80                  # 基準期 95th percentile 對應健康分數（λ 校準錨點）
 FEATURES = ['Total_vRMS', 'accOA', 'Crest_Factor']  # 進入特徵向量的欄位
+SCORE_SMOOTH_WINDOW = 5             # 輸出分數的滾動平滑窗口（筆數）；0 或 1 表示不平滑
 
 # --- 滾動基準微調（本次不實作，保留開關）---
 ENABLE_ROLLING_UPDATE = False       # True 時每 30 天自動微調基準池

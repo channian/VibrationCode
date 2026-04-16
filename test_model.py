@@ -11,6 +11,8 @@ test_model.py — 階段三快速驗證腳本
 執行方式：
     python test_model.py
     python test_model.py --device ZP1_2_M1
+    python test_model.py --diagnose              # 加印模型有效性診斷報告
+    python test_model.py --device ZP1_2_M1 --diagnose
 """
 
 import os
@@ -38,9 +40,75 @@ MODEL_DIR     = 'output/models'
 CANDIDATE_DIR = 'output/baseline_candidates'
 
 
+def _print_diagnose(device_id: str, df_scored: pd.DataFrame,
+                    df_baseline: pd.DataFrame, model) -> None:
+    """
+    印出模型有效性診斷報告，協助判斷分數飄浮原因。
+    """
+    import numpy as np
+    SEP = '-' * 55
+
+    print(f"\n{SEP}")
+    print(f"  診斷報告：{device_id}")
+    print(SEP)
+
+    # 1. Bin 邊界（電流工況分層）
+    print("\n【1】Load Bin 邊界（電流 A）")
+    if model._bin_edges is not None:
+        edges = model._bin_edges
+        for i in range(len(edges) - 1):
+            print(f"  Bin {i}: {edges[i]:.2f} ~ {edges[i+1]:.2f} A")
+    else:
+        print("  無電流資料，使用單一 Bin（不分層）")
+
+    # 2. 各 Bin 基準期均分與 λ
+    print("\n【2】各 Bin 訓練參數")
+    print(model.summary().to_string(index=False))
+
+    # 3. 基準期特徵 CV（穩定性）
+    print("\n【3】基準期特徵變異係數 CV（< 設定門檻才算穩定）")
+    from config import settings
+    for feat in settings.FEATURES:
+        if feat in df_baseline.columns:
+            col = df_baseline[feat].dropna()
+            cv = col.std() / col.mean() if col.mean() != 0 else float('nan')
+            thresh = settings.CV_THRESHOLDS.get(feat, 0.25)
+            flag = '✅' if cv < thresh else '⚠️ '
+            print(f"  {flag} {feat:20s} CV={cv:.3f}  (門檻 {thresh})")
+
+    # 4. 分數與特徵相關性（全量）
+    print("\n【4】Health_Score 與特徵相關性（負值代表特徵升 → 分數降，符合預期）")
+    for feat in settings.FEATURES:
+        if feat in df_scored.columns:
+            valid = df_scored[['Health_Score', feat]].dropna()
+            if len(valid) > 10:
+                corr = valid['Health_Score'].corr(valid[feat])
+                direction = '✅ 負相關' if corr < -0.3 else ('⚠️  弱' if corr < 0 else '❌ 正相關（異常）')
+                print(f"  {direction}  {feat:20s} r={corr:.3f}")
+
+    # 5. 各 Bin 分數穩定性（std）
+    print("\n【5】各 Bin 分數標準差（越小越穩定，> 15 代表可能有 Bin 跳動）")
+    for bid in sorted(df_scored['load_bin'].unique()):
+        subset = df_scored[df_scored['load_bin'] == bid]['Health_Score'].dropna()
+        if len(subset) > 0:
+            flag = '✅' if subset.std() <= 15 else '⚠️ '
+            print(f"  {flag} Bin {bid}: n={len(subset):>5}  std={subset.std():.1f}  "
+                  f"mean={subset.mean():.1f}  min={subset.min():.1f}  max={subset.max():.1f}")
+
+    # 6. 平滑效果比較
+    if 'health_score_smooth' in df_scored.columns:
+        raw_std    = df_scored['Health_Score'].std()
+        smooth_std = df_scored['health_score_smooth'].std()
+        print(f"\n【6】平滑效果（SCORE_SMOOTH_WINDOW={settings.SCORE_SMOOTH_WINDOW}）")
+        print(f"  原始分數 std={raw_std:.1f}  →  平滑後 std={smooth_std:.1f}"
+              f"  （降低 {(1 - smooth_std/raw_std)*100:.0f}%）" if raw_std > 0 else "")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--device', default=None, help='只跑指定 device_id，如 ZP1_2_M1')
+    parser.add_argument('--device',   default=None,  help='只跑指定 device_id，如 ZP1_2_M1')
+    parser.add_argument('--diagnose', action='store_true', help='印出模型有效性診斷報告')
     args = parser.parse_args()
 
     os.makedirs(SCORE_DIR, exist_ok=True)
@@ -118,7 +186,7 @@ def main():
         # 輸出分數 CSV
         position = df_raw['position'].iloc[0]
         out_cols = ['datetime', 'device_id', 'position', 'load_bin',
-                    'Health_Score', 'alert_level',
+                    'Health_Score', 'health_score_smooth', 'alert_level',
                     'Total_vRMS', 'accOA', 'Crest_Factor', 'current_A']
         df_scored['device_id'] = device_id
         df_scored['position']  = position
@@ -138,7 +206,9 @@ def main():
         logger.info(f"  基準期平均分數 : {baseline_avg:.1f}  {baseline_ok}")
         logger.info(f"  最新健康分數   : {latest_score:.1f}  [{alert}]")
         logger.info(f"  分數 CSV 已存  : {score_path}")
-        logger.info(model.summary().to_string(index=False))
+
+        if args.diagnose:
+            _print_diagnose(device_id, df_scored, df_baseline, model)
 
         summary.append({
             'device_id':      device_id,

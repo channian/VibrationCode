@@ -234,6 +234,20 @@ class VFDEdgeHealthModel:
 
         df['Health_Score'] = scores
         df['alert_level']  = df['Health_Score'].apply(_alert_level)
+
+        # ── 平滑分數（用於趨勢圖與警報，不取代原始分）──────
+        w = settings.SCORE_SMOOTH_WINDOW
+        if w and w > 1:
+            df['health_score_smooth'] = (
+                df['Health_Score']
+                .rolling(window=w, center=True, min_periods=1)
+                .median()
+                .ffill()
+                .bfill()
+            )
+        else:
+            df['health_score_smooth'] = df['Health_Score']
+
         return df
 
     # ── 序列化 ──────────────────────────────────────────────
