@@ -58,10 +58,23 @@ def _print_diagnose(device_id: str, df_scored: pd.DataFrame,
         edges = model._bin_edges
         for i in range(len(edges) - 1):
             print(f"  Bin {i}: {edges[i]:.2f} ~ {edges[i+1]:.2f} A")
+        # 評分期電流是否超出訓練範圍
+        if 'current_A' in df_scored.columns:
+            cur_min = df_scored['current_A'].min()
+            cur_max = df_scored['current_A'].max()
+            out_low  = cur_min < edges[0]
+            out_high = cur_max > edges[-1]
+            if out_low or out_high:
+                print(f"  ⚠️  評分期電流範圍 {cur_min:.1f}~{cur_max:.1f} A "
+                      f"{'部分低於' if out_low else ''}{'部分高於' if out_high else ''}"
+                      f"訓練範圍 {edges[0]:.1f}~{edges[-1]:.1f} A\n"
+                      f"     → 超出範圍的資料強制分到邊界 Bin，負載補償可能失效")
+            else:
+                print(f"  ✅ 評分期電流 {cur_min:.1f}~{cur_max:.1f} A 在訓練範圍內")
     else:
         print("  無電流資料，使用單一 Bin（不分層）")
 
-    # 2. 各 Bin 基準期均分與 λ
+    # 2. 各 Bin 訓練參數
     print("\n【2】各 Bin 訓練參數")
     print(model.summary().to_string(index=False))
 
@@ -76,8 +89,33 @@ def _print_diagnose(device_id: str, df_scored: pd.DataFrame,
             flag = '✅' if cv < thresh else '⚠️ '
             print(f"  {flag} {feat:20s} CV={cv:.3f}  (門檻 {thresh})")
 
-    # 4. 分數與特徵相關性（全量）
-    print("\n【4】Health_Score 與特徵相關性（負值代表特徵升 → 分數降，符合預期）")
+    # 4. 各 Bin：基準期 vs 近期 accOA 中位數比較（核心負載補償驗證）
+    print("\n【4】各 Bin 的 accOA 比較：基準期 vs 近期")
+    print("     （同 Bin 內近期中位數 > 基準期中位數 → 確認是真實劣化，非負載影響）")
+    if 'accOA' in df_scored.columns and not df_baseline.empty:
+        bl_ts = set(df_baseline['datetime'])
+        df_scored['_is_baseline'] = df_scored['datetime'].isin(bl_ts)
+        for bid in sorted(df_scored['load_bin'].unique()):
+            grp = df_scored[df_scored['load_bin'] == bid]
+            bl_med   = grp.loc[grp['_is_baseline'],  'accOA'].median()
+            rec_med  = grp.loc[~grp['_is_baseline'], 'accOA'].median()
+            bl_cur   = grp.loc[grp['_is_baseline'],  'current_A'].median() if 'current_A' in grp.columns else float('nan')
+            rec_cur  = grp.loc[~grp['_is_baseline'], 'current_A'].median() if 'current_A' in grp.columns else float('nan')
+            if not (isinstance(bl_med, float) and isinstance(rec_med, float)):
+                continue
+            import math
+            if math.isnan(bl_med) or math.isnan(rec_med):
+                print(f"  Bin {bid}: 資料不足，無法比較")
+                continue
+            ratio = rec_med / bl_med if bl_med > 0 else float('nan')
+            flag  = '✅ 劣化確認' if ratio > 1.15 else ('— 相近' if ratio >= 0.9 else '⬇️  改善')
+            print(f"  Bin {bid}: 基準 accOA={bl_med:.3f}(cur≈{bl_cur:.1f}A)  "
+                  f"近期 accOA={rec_med:.3f}(cur≈{rec_cur:.1f}A)  "
+                  f"比值={ratio:.2f}  {flag}")
+        df_scored.drop(columns=['_is_baseline'], inplace=True, errors='ignore')
+
+    # 5. 分數與特徵相關性（全量）
+    print("\n【5】Health_Score 與特徵相關性（負值代表特徵升 → 分數降，符合預期）")
     for feat in settings.FEATURES:
         if feat in df_scored.columns:
             valid = df_scored[['Health_Score', feat]].dropna()
@@ -86,8 +124,8 @@ def _print_diagnose(device_id: str, df_scored: pd.DataFrame,
                 direction = '✅ 負相關' if corr < -0.3 else ('⚠️  弱' if corr < 0 else '❌ 正相關（異常）')
                 print(f"  {direction}  {feat:20s} r={corr:.3f}")
 
-    # 5. 各 Bin 分數穩定性（std）
-    print("\n【5】各 Bin 分數標準差（越小越穩定，> 15 代表可能有 Bin 跳動）")
+    # 6. 各 Bin 分數穩定性（std）
+    print("\n【6】各 Bin 分數標準差（越小越穩定，> 15 代表可能有 Bin 跳動）")
     for bid in sorted(df_scored['load_bin'].unique()):
         subset = df_scored[df_scored['load_bin'] == bid]['Health_Score'].dropna()
         if len(subset) > 0:
@@ -95,11 +133,11 @@ def _print_diagnose(device_id: str, df_scored: pd.DataFrame,
             print(f"  {flag} Bin {bid}: n={len(subset):>5}  std={subset.std():.1f}  "
                   f"mean={subset.mean():.1f}  min={subset.min():.1f}  max={subset.max():.1f}")
 
-    # 6. 平滑效果比較
+    # 7. 平滑效果比較
     if 'health_score_smooth' in df_scored.columns:
         raw_std    = df_scored['Health_Score'].std()
         smooth_std = df_scored['health_score_smooth'].std()
-        print(f"\n【6】平滑效果（SCORE_SMOOTH_WINDOW={settings.SCORE_SMOOTH_WINDOW}）")
+        print(f"\n【7】平滑效果（SCORE_SMOOTH_WINDOW={settings.SCORE_SMOOTH_WINDOW}）")
         print(f"  原始分數 std={raw_std:.1f}  →  平滑後 std={smooth_std:.1f}"
               f"  （降低 {(1 - smooth_std/raw_std)*100:.0f}%）" if raw_std > 0 else "")
     print()
