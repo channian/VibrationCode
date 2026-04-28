@@ -1,18 +1,21 @@
 """
-test_model.py — 階段三快速驗證腳本
+test_model.py — 階段三 / 四快速驗證腳本
 
 讀取 Vibration_Data/ 的真實資料，跑完整管線後：
   1. 自動偵測基準期
   2. 訓練 VFDEdgeHealthModel
   3. 全量推論
   4. 輸出 output/scores/{device_id}_scores.csv
-  5. 印出摘要（基準期平均分數、最新分數）
+  5. 產出 output/reports/{device_id}_{position}_report.png
+  6. 產出 output/device_summary.csv
+  7. 印出摘要（基準期平均分數、最新分數）
 
 執行方式：
     python test_model.py
     python test_model.py --device ZP1_2_M1
     python test_model.py --diagnose              # 加印模型有效性診斷報告
     python test_model.py --device ZP1_2_M1 --diagnose
+    python test_model.py --no-report             # 跳過 PNG 產出（純數字驗證）
 """
 
 import os
@@ -27,6 +30,7 @@ from src.data_loader import load_vibration, load_current, load_mapping, align_cu
 from src.filters import apply_all_filters
 from src.baseline_detector import resolve_baseline
 from src.health_model import VFDEdgeHealthModel
+from src.reporter import generate_report, generate_device_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +41,7 @@ logger = logging.getLogger('test_model')
 
 SCORE_DIR     = 'output/scores'
 MODEL_DIR     = 'output/models'
+REPORT_DIR    = 'output/reports'
 CANDIDATE_DIR = 'output/baseline_candidates'
 
 
@@ -145,12 +150,14 @@ def _print_diagnose(device_id: str, df_scored: pd.DataFrame,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--device',   default=None,  help='只跑指定 device_id，如 ZP1_2_M1')
-    parser.add_argument('--diagnose', action='store_true', help='印出模型有效性診斷報告')
+    parser.add_argument('--device',    default=None,  help='只跑指定 device_id，如 ZP1_2_M1')
+    parser.add_argument('--diagnose',  action='store_true', help='印出模型有效性診斷報告')
+    parser.add_argument('--no-report', action='store_true', help='跳過 PNG 報告產出')
     args = parser.parse_args()
 
-    os.makedirs(SCORE_DIR, exist_ok=True)
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs(SCORE_DIR,     exist_ok=True)
+    os.makedirs(MODEL_DIR,     exist_ok=True)
+    os.makedirs(REPORT_DIR,    exist_ok=True)
     os.makedirs(CANDIDATE_DIR, exist_ok=True)
 
     # ── 載入資料 ──────────────────────────────────────────────
@@ -221,8 +228,9 @@ def main():
         model_path = os.path.join(MODEL_DIR, f"{device_id}.pkl")
         model.save(model_path)
 
-        # 輸出分數 CSV
         position = df_raw['position'].iloc[0]
+
+        # 輸出分數 CSV
         out_cols = ['datetime', 'device_id', 'position', 'load_bin',
                     'Health_Score', 'health_score_smooth', 'alert_level',
                     'Total_vRMS', 'accOA', 'Crest_Factor', 'current_A']
@@ -245,16 +253,46 @@ def main():
         logger.info(f"  最新健康分數   : {latest_score:.1f}  [{alert}]")
         logger.info(f"  分數 CSV 已存  : {score_path}")
 
+        # PNG 報告
+        if not args.no_report:
+            try:
+                report_path = generate_report(
+                    device_id=device_id,
+                    position=position,
+                    df_scored=df_scored,
+                    df_baseline=df_baseline,
+                    output_dir=REPORT_DIR,
+                )
+                logger.info(f"  PNG 報告已存   : {report_path}")
+            except Exception as e:
+                logger.error(f"{device_id}: 報告產出失敗 — {e}")
+
         if args.diagnose:
             _print_diagnose(device_id, df_scored, df_baseline, model)
 
+        # 取 machine_id / model_group（from mapping，否則退回預設值）
+        def _mval(key, default=''):
+            if mapping_row is None:
+                return default
+            try:
+                v = mapping_row[key]
+                return str(v) if pd.notna(v) else default
+            except (KeyError, TypeError):
+                return default
+
         summary.append({
             'device_id':      device_id,
+            'machine_id':     _mval('machine_id', device_base),
+            'model_group':    _mval('model_group'),
+            'position':       position,
             'baseline_avg':   round(baseline_avg, 1),
             'baseline_ok':    baseline_ok,
             'latest_score':   round(latest_score, 1),
             'alert':          alert,
             'is_manual_base': is_manual,
+            'baseline_start': df_baseline['datetime'].min().strftime('%Y-%m-%d') if not df_baseline.empty else '',
+            'baseline_end':   df_baseline['datetime'].max().strftime('%Y-%m-%d') if not df_baseline.empty else '',
+            'data_count':     len(df_clean),
         })
 
     # ── 最終摘要 ──────────────────────────────────────────────
@@ -275,7 +313,17 @@ def main():
             print(f"  ⚠️  {len(failed)} 台基準期均分 < 85，建議確認基準期是否正確")
         else:
             print("  ✅ 所有設備基準期均分 >= 85，模型校準正常")
-        print(f"\n  下一步：確認後進行階段四（PNG 報告產出）")
+
+        # 產出設備總覽 CSV
+        summary_path = 'output/device_summary.csv'
+        try:
+            generate_device_summary(summary, output_path=summary_path)
+            print(f"\n  設備總覽已存   : {summary_path}")
+        except Exception as e:
+            logger.error(f"device_summary 產出失敗 — {e}")
+
+        print(f"\n  PNG 報告位置   : output/reports/")
+        print(f"  分數 CSV 位置  : output/scores/")
 
 
 if __name__ == '__main__':
