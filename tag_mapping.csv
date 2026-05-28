@@ -1,0 +1,6 @@
+tagname,variable_type,device_id,unit
+CWP_FREQ_01,頻率,ZP1_2,Hz
+CWP_CURR_01,電流,ZP1_2,A
+CWP_PWR_01,輸入功率,ZP1_2,kW
+CWP_TDIFF_01,溫差,ZP1_2,°C
+CWP_TEMP_01,水溫,ZP1_2,°C
