@@ -168,14 +168,24 @@ def load_tag_mapping(path: str) -> pd.DataFrame:
         return pd.DataFrame(columns=['tagname', 'variable_type', 'device_id', 'unit'])
 
     df.columns = [c.strip() for c in df.columns]
-    # case-insensitive 欄位對應
-    col_map = {c.lower(): c for c in df.columns}
+    # case-insensitive + 空格/底線互換 的欄位對應
+    def _normalize(s: str) -> str:
+        return s.lower().replace(' ', '_').replace('-', '_')
+
+    col_map = {_normalize(c): c for c in df.columns}
     rename = {}
     for target in ('tagname', 'variable_type', 'device_id', 'unit'):
         if target in col_map and col_map[target] != target:
             rename[col_map[target]] = target
     if rename:
         df = df.rename(columns=rename)
+
+    # 若仍找不到，印出實際欄位名稱幫助診斷
+    still_missing = [t for t in ('tagname', 'variable_type', 'device_id')
+                     if t not in df.columns]
+    if still_missing:
+        logger.error(f"tag_mapping 欄位對應失敗：找不到 {still_missing}。"
+                     f"實際欄位：{list(df.columns)}")
 
     required = ['tagname', 'variable_type', 'device_id']
     missing = [c for c in required if c not in df.columns]
