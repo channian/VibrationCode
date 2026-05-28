@@ -254,8 +254,16 @@ def compute_correlations(df: pd.DataFrame,
             if n < 10:
                 continue
             x, y = valid[sc].values, valid[vc].values
-            pr, pp = stats.pearsonr(x, y)
-            sr, sp = stats.spearmanr(x, y)
+            # 常數欄位無法計算相關係數，跳過
+            if np.std(x) < 1e-10 or np.std(y) < 1e-10:
+                logger.debug(f"  skip constant: {sc} vs {vc}")
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                pr, pp = stats.pearsonr(x, y)
+                sr, sp = stats.spearmanr(x, y)
+            if np.isnan(pr) or np.isnan(sr):
+                continue
             rows.append({
                 'variable_type':     sc,
                 'vibration_feature': vc,
