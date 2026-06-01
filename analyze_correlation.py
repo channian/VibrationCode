@@ -38,6 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.data_loader import load_vibration, safe_read_csv
 from src.filters import apply_all_filters
+from src.scada_loader import (load_other_data, load_tag_mapping,
+                               pivot_scada, merge_vib_scada, MERGE_TOL)
 from config import settings
 
 logging.basicConfig(
@@ -53,7 +55,6 @@ OTHER_DATA_DIR   = 'Other_Data'
 TAG_MAPPING_PATH = 'tag_mapping.csv'
 OUTPUT_DIR       = 'output/correlation'
 VIB_FEATURES     = settings.FEATURES          # ['Total_vRMS', 'accOA', 'Crest_Factor']
-MERGE_TOL        = pd.Timedelta(minutes=settings.MERGE_TOLERANCE_MIN)
 
 _FONT_READY = False
 
@@ -73,167 +74,6 @@ def _setup_font() -> None:
             return
     matplotlib.rcParams['axes.unicode_minus'] = False
     _FONT_READY = True
-
-
-# ── 資料載入 ────────────────────────────────────────────────
-
-def _parse_dt(series: pd.Series) -> pd.Series:
-    """同 data_loader 的時間解析邏輯（/ → - 正規化後轉換）。"""
-    return pd.to_datetime(
-        series.astype(str)
-        .str.replace('/', '-', regex=False)
-        .str.replace(r'\s+', ' ', regex=True)
-        .str.strip(),
-        errors='coerce',
-    )
-
-
-def _detect_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """從 candidates 清單依序找到第一個存在於 df 的欄位（不分大小寫）。"""
-    lower_map = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-    return None
-
-
-def load_other_data(folder: str) -> pd.DataFrame:
-    """
-    讀取 Other_Data/ 的所有 CSV，合併為 long format。
-    回傳欄位：datetime, tagname, value
-    """
-    if not os.path.exists(folder):
-        logger.warning(f"資料夾 '{folder}' 不存在")
-        return pd.DataFrame(columns=['datetime', 'tagname', 'value'])
-
-    dfs = []
-    for fname in sorted(os.listdir(folder)):
-        if not fname.lower().endswith('.csv'):
-            continue
-        path = os.path.join(folder, fname)
-        try:
-            df = safe_read_csv(path)
-        except Exception as e:
-            logger.warning(f"{fname}: 讀取失敗 — {e}")
-            continue
-
-        time_col = _detect_col(df, ['datetime', 'date', 'time', 'timestamp'])
-        if time_col is None:
-            time_col = next((c for c in df.columns
-                             if 'date' in c.lower() or 'time' in c.lower()), None)
-        if time_col is None:
-            logger.warning(f"{fname}: 找不到時間欄位，跳過")
-            continue
-
-        tag_col = _detect_col(df, ['tagname', 'tag_name', 'tag', 'sensor', 'sensorname', 'TagName'])
-        if tag_col is None:
-            logger.warning(f"{fname}: 找不到 tagname 欄位，跳過。現有欄位：{list(df.columns)}")
-            continue
-
-        val_col = _detect_col(df, ['value', 'val', 'measurement', 'reading', 'current', 'Value'])
-        if val_col is None:
-            logger.warning(f"{fname}: 找不到 value 欄位，跳過。現有欄位：{list(df.columns)}")
-            continue
-
-        chunk = df[[time_col, tag_col, val_col]].copy()
-        chunk.columns = ['datetime', 'tagname', 'value']
-        chunk['datetime'] = _parse_dt(chunk['datetime'])
-        chunk = chunk.dropna(subset=['datetime'])
-        chunk['value'] = pd.to_numeric(chunk['value'], errors='coerce')
-        dfs.append(chunk)
-        logger.info(f"  {fname}: {len(chunk)} 筆")
-
-    if not dfs:
-        logger.warning("Other_Data/ 沒有可讀取的資料")
-        return pd.DataFrame(columns=['datetime', 'tagname', 'value'])
-
-    result = pd.concat(dfs, ignore_index=True).sort_values('datetime').reset_index(drop=True)
-    logger.info(f"Other_Data 合計：{len(result)} 筆，{result['tagname'].nunique()} 個 tagname")
-    return result
-
-
-def load_tag_mapping(path: str) -> pd.DataFrame:
-    """
-    讀取 tag_mapping.csv。
-    必要欄位：tagname / variable_type / device_id
-    選填欄位：unit
-    """
-    if not os.path.exists(path):
-        logger.warning(f"'{path}' 不存在")
-        return pd.DataFrame(columns=['tagname', 'variable_type', 'device_id', 'unit'])
-    try:
-        df = safe_read_csv(path)
-    except Exception as e:
-        logger.error(f"tag_mapping 讀取失敗：{e}")
-        return pd.DataFrame(columns=['tagname', 'variable_type', 'device_id', 'unit'])
-
-    df.columns = [c.strip() for c in df.columns]
-    # case-insensitive + 空格/底線互換 的欄位對應
-    def _normalize(s: str) -> str:
-        return s.lower().replace(' ', '_').replace('-', '_')
-
-    col_map = {_normalize(c): c for c in df.columns}
-    rename = {}
-    for target in ('tagname', 'variable_type', 'device_id', 'unit'):
-        if target in col_map and col_map[target] != target:
-            rename[col_map[target]] = target
-    if rename:
-        df = df.rename(columns=rename)
-
-    # 若仍找不到，印出實際欄位名稱幫助診斷
-    still_missing = [t for t in ('tagname', 'variable_type', 'device_id')
-                     if t not in df.columns]
-    if still_missing:
-        logger.error(f"tag_mapping 欄位對應失敗：找不到 {still_missing}。"
-                     f"實際欄位：{list(df.columns)}")
-
-    required = ['tagname', 'variable_type', 'device_id']
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        logger.error(f"tag_mapping 缺少欄位：{missing}")
-        return pd.DataFrame(columns=['tagname', 'variable_type', 'device_id', 'unit'])
-
-    if 'unit' not in df.columns:
-        df['unit'] = ''
-
-    # strip 空白
-    for col in ('tagname', 'variable_type', 'device_id'):
-        df[col] = df[col].astype(str).str.strip()
-
-    logger.info(f"tag_mapping：{len(df)} 筆，涵蓋 {df['device_id'].nunique()} 台設備")
-    return df[['tagname', 'variable_type', 'device_id', 'unit']]
-
-
-# ── 資料對齊 ────────────────────────────────────────────────
-
-def _pivot_scada(df_long: pd.DataFrame, tag_map_dev: pd.DataFrame) -> pd.DataFrame:
-    """
-    將設備的 long-format SCADA 轉為寬表（每個 variable_type 一欄）。
-    同一時間點有多筆 → 取平均。
-    """
-    tag_to_type = dict(zip(tag_map_dev['tagname'], tag_map_dev['variable_type']))
-    df = df_long.copy()
-    df['variable_type'] = df['tagname'].map(tag_to_type)
-    df = df.dropna(subset=['variable_type'])
-
-    wide = (df
-            .pivot_table(index='datetime', columns='variable_type',
-                         values='value', aggfunc='mean')
-            .reset_index())
-    wide.columns.name = None
-    return wide
-
-
-def _merge_vib_scada(df_vib: pd.DataFrame, df_wide: pd.DataFrame) -> pd.DataFrame:
-    """merge_asof 對齊振動與 SCADA 寬表（以振動時間軸為基準）。"""
-    vib  = df_vib.sort_values('datetime').reset_index(drop=True)
-    wide = df_wide.sort_values('datetime').reset_index(drop=True)
-    merged = pd.merge_asof(vib, wide, on='datetime',
-                           tolerance=MERGE_TOL, direction='nearest')
-    scada_cols = [c for c in wide.columns if c != 'datetime']
-    matched = merged[scada_cols].notna().any(axis=1).sum()
-    logger.info(f"  振動 {len(vib)} 筆 × SCADA 對齊 {matched} 筆（tolerance={MERGE_TOL}）")
-    return merged
 
 
 # ── 相關性計算 ───────────────────────────────────────────────
@@ -414,7 +254,7 @@ def analyze_device(device_id: str,
         return pd.DataFrame()
 
     # ── Pivot 成寬表 ──
-    df_wide = _pivot_scada(df_dev, dev_tags)
+    df_wide = pivot_scada(df_dev, dev_tags)
     scada_cols = [c for c in df_wide.columns if c != 'datetime']
     logger.info(f"  SCADA 變數：{scada_cols}")
 
@@ -428,7 +268,7 @@ def analyze_device(device_id: str,
         return pd.DataFrame()
 
     # ── 對齊合併 ──
-    df_merged = _merge_vib_scada(df_vib, df_wide)
+    df_merged = merge_vib_scada(df_vib, df_wide)
 
     # ── 計算相關性 ──
     vib_cols  = [f for f in VIB_FEATURES if f in df_merged.columns]
