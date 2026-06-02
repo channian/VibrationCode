@@ -247,12 +247,9 @@ def _build_html(device_id: str, df: pd.DataFrame,
     date_range = (f"{df['datetime'].min().strftime('%Y-%m-%d')} ~ "
                   f"{df['datetime'].max().strftime('%Y-%m-%d')}")
 
-    display_cols = (['datetime'] +
-                    [c for c in ['Total_vRMS', 'accOA', 'Crest_Factor'] if c in df.columns] +
-                    ([current_col] if current_col and current_col in df.columns else []) +
-                    [c for c in df.columns
-                     if c not in ('datetime', 'Total_vRMS', 'accOA', 'Crest_Factor',
-                                  current_col, 'tagname', 'devicename')])
+    display_cols = [c for c in
+                    ['Total_vRMS', 'accOA', 'Crest_Factor', 'health_score', current_col]
+                    if c and c in df.columns]
 
     stats_html = _stats_table_html(df, display_cols)
     scatter_section = ''
