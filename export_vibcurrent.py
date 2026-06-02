@@ -193,8 +193,8 @@ def _plot_timeseries(df: pd.DataFrame, device_id: str,
     """
     _setup_font()
     maint_events = maint_events or []
-    has_current = current_col and current_col in df.columns and df[current_col].notna().any()
-    has_health  = 'health_score' in df.columns and df['health_score'].notna().any()
+    has_current = bool(current_col and current_col in df.columns and df[current_col].notna().any())
+    has_health  = bool('health_score' in df.columns and df['health_score'].notna().any())
     nrows = 1 + int(has_current) + int(has_health)
 
     fig, axes = plt.subplots(nrows, 1, figsize=(13, 3.6 * nrows), sharex=False)
