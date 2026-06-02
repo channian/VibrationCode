@@ -317,6 +317,32 @@ VFDEdgeHealthModel export_vibcurrent.py</footer>
 </html>"""
 
 
+# ── 電流欄位辨識 ─────────────────────────────────────────────
+
+def _resolve_current_col(scada_cols: list[str], current_type: str) -> str | None:
+    """
+    從 SCADA 欄位（= variable_type 值）中找出電流欄位。
+    依序嘗試：1) 完全一致  2) 包含 current_type  3) 包含「電流/current/安培」。
+    回傳找到的欄位名稱，找不到回傳 None。
+    """
+    if not scada_cols:
+        return None
+    # 1) 完全一致
+    if current_type in scada_cols:
+        return current_type
+    # 2) 包含使用者指定的關鍵字（容許貼整段 description）
+    ct = current_type.lower()
+    for c in scada_cols:
+        if ct in c.lower():
+            return c
+    # 3) 常見電流關鍵字
+    for kw in ('電流', 'current', '安培', 'amp'):
+        for c in scada_cols:
+            if kw.lower() in c.lower():
+                return c
+    return None
+
+
 # ── 單設備匯出 ───────────────────────────────────────────────
 
 def export_device(device_id: str,
@@ -344,30 +370,36 @@ def export_device(device_id: str,
 
     current_col = None
     if not dev_tags.empty:
-        curr_tags = dev_tags[dev_tags['variable_type'] == current_type]
         tagnames  = dev_tags['tagname'].tolist()
         df_dev    = df_other[df_other['tagname'].isin(tagnames)]
 
         if df_dev.empty:
-            logger.warning(f"{device_id}: Other_Data 中找不到 tagname {tagnames}")
+            logger.warning(f"{device_id}: Other_Data 中找不到此設備的 tagname。"
+                           f"tag_mapping 列出：{tagnames}")
         else:
             df_wide = pivot_scada(df_dev, dev_tags)
             scada_cols = [c for c in df_wide.columns if c != 'datetime']
-            logger.info(f"  SCADA 欄位：{scada_cols}")
+            logger.info(f"  SCADA 欄位（variable_type）：{scada_cols}")
 
             # 時間重疊確認
             vib_range   = (df_vib['datetime'].min(), df_vib['datetime'].max())
             scada_range = (df_wide['datetime'].min(), df_wide['datetime'].max())
             if vib_range[0] <= scada_range[1] and scada_range[0] <= vib_range[1]:
                 df_vib = merge_vib_scada(df_vib, df_wide)
-                current_col = current_type if current_type in df_vib.columns else None
-                if current_col is None and scada_cols:
-                    logger.warning(f"  variable_type='{current_type}' 不在 SCADA 欄位中；"
-                                   f"現有：{scada_cols}")
+                current_col = _resolve_current_col(scada_cols, current_type)
+                if current_col is None:
+                    logger.warning(f"  找不到電流欄位（指定 current_type='{current_type}'）；"
+                                   f"現有 variable_type：{scada_cols}。"
+                                   f"請用 --current-type 指定正確名稱")
+                elif current_col != current_type:
+                    logger.info(f"  電流欄位以部分比對找到：'{current_col}'")
             else:
-                logger.warning(f"{device_id}: 振動與 SCADA 無時間重疊，跳過 SCADA 對齊")
+                logger.warning(f"{device_id}: 振動 {vib_range[0].date()}~{vib_range[1].date()} "
+                               f"與 SCADA {scada_range[0].date()}~{scada_range[1].date()} "
+                               f"無時間重疊，跳過 SCADA 對齊")
     else:
-        logger.warning(f"{device_id}: tag_mapping 中找不到 device_id='{device_base}'")
+        logger.warning(f"{device_id}: tag_mapping 中找不到 device_id='{device_base}'。"
+                       f"請確認 tag_mapping 的 device_id 值與振動 devicename 一致")
 
     # ── 開機篩選 ──
     if current_col and current_col in df_vib.columns and df_vib[current_col].notna().any():
