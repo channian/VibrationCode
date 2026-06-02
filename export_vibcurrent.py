@@ -6,11 +6,19 @@ export_vibcurrent.py — 振動 + 電流 資料匯出（CSV + 靜態 HTML）
   output/export/{device_id}.csv   — 對齊後的完整數值表
   output/export/{device_id}.html  — 靜態報告（時序圖 + 散佈圖 + 統計表）
 
+若 output/scores/{device_id}_scores.csv 存在，會一併納入 health_score；
+若 maintenance_log.csv 存在，會標示保養日期並做「相同負載下保養前後比較」。
+
 執行方式：
     python export_vibcurrent.py                      # 全部設備
     python export_vibcurrent.py --device ZP1_2_M1    # 指定設備
     python export_vibcurrent.py --threshold 5.0      # 自訂電流下限（A）
     python export_vibcurrent.py --current-type 電流  # tag_mapping variable_type 名稱
+    python export_vibcurrent.py --maintenance x.csv  # 自訂保養紀錄路徑
+
+maintenance_log.csv 格式（device_id 用基底名，不含 M1/M2）：
+    device_id,date,event_name
+    ZP1_2,2026-03-15,換油
 """
 
 import os
@@ -30,7 +38,7 @@ from matplotlib import font_manager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.data_loader import load_vibration
+from src.data_loader import load_vibration, safe_read_csv
 from src.filters import compute_derived, filter_spikes
 from src.scada_loader import (load_other_data, load_tag_mapping,
                                pivot_scada, merge_vib_scada, MERGE_TOL)
@@ -47,8 +55,13 @@ warnings.filterwarnings('ignore', message='Glyph.*missing', category=UserWarning
 
 OTHER_DATA_DIR   = 'Other_Data'
 TAG_MAPPING_PATH = 'tag_mapping.csv'
+MAINTENANCE_PATH = 'maintenance_log.csv'
+SCORE_DIR        = 'output/scores'
 OUTPUT_DIR       = 'output/export'
 DEFAULT_CURRENT_TYPE = '電流'
+
+# 保養前後比較的負載基準欄（優先序）：先功率、再電流
+LOAD_COL_KEYWORDS = ('輸入功率', 'power', '功率')
 
 _FONT_READY = False
 
@@ -68,6 +81,66 @@ def _setup_font() -> None:
             return
     matplotlib.rcParams['axes.unicode_minus'] = False
     _FONT_READY = True
+
+
+# ── 保養紀錄 / 健康分數載入 ──────────────────────────────────
+
+def load_maintenance_log(path: str) -> dict:
+    """
+    讀取 maintenance_log.csv。
+    欄位：device_id（基底名，如 ZP1_2）/ date / event_name（選填）
+    回傳：{device_base: [(Timestamp, event_name), ...]}（依日期排序）
+    """
+    if not os.path.exists(path):
+        logger.info(f"無保養紀錄檔 '{path}'，跳過保養標記")
+        return {}
+    try:
+        df = safe_read_csv(path)
+    except Exception as e:
+        logger.warning(f"保養紀錄讀取失敗：{e}")
+        return {}
+
+    df.columns = [c.strip().lower() for c in df.columns]
+    dev_col  = next((c for c in df.columns if c in ('device_id', 'device', 'deviceid')), None)
+    date_col = next((c for c in df.columns if 'date' in c or c in ('日期', '保養日期')), None)
+    name_col = next((c for c in df.columns if 'event' in c or 'name' in c or '項目' in c), None)
+    if dev_col is None or date_col is None:
+        logger.warning(f"保養紀錄缺少 device_id 或 date 欄；現有欄位：{list(df.columns)}")
+        return {}
+
+    log: dict = {}
+    for _, row in df.iterrows():
+        dev = str(row[dev_col]).strip()
+        dt  = pd.to_datetime(str(row[date_col]).replace('/', '-'), errors='coerce')
+        if pd.isna(dt):
+            continue
+        name = str(row[name_col]).strip() if name_col and pd.notna(row.get(name_col)) else '保養'
+        log.setdefault(dev, []).append((dt, name))
+
+    for dev in log:
+        log[dev].sort(key=lambda t: t[0])
+    logger.info(f"保養紀錄：{len(log)} 台設備，共 {sum(len(v) for v in log.values())} 筆")
+    return log
+
+
+def load_health_score(device_id: str, score_dir: str = SCORE_DIR) -> pd.DataFrame | None:
+    """
+    讀取 output/scores/{device_id}_scores.csv 的 health_score。
+    回傳 df[['datetime', 'health_score']]，不存在則回傳 None。
+    """
+    path = os.path.join(score_dir, f"{device_id}_scores.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        df = safe_read_csv(path)
+    except Exception as e:
+        logger.warning(f"{device_id}: health_score 讀取失敗 — {e}")
+        return None
+    if 'datetime' not in df.columns or 'health_score' not in df.columns:
+        return None
+    df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    out = df[['datetime', 'health_score']].dropna(subset=['datetime'])
+    return out if not out.empty else None
 
 
 # ── 圖表工具 ─────────────────────────────────────────────────
@@ -98,48 +171,64 @@ def _x_fmt(ax, dates: pd.Series) -> None:
 
 # ── 圖表產生 ─────────────────────────────────────────────────
 
+def _mark_maintenance(ax, maint_events: list) -> None:
+    """在子圖畫保養垂直線（紅虛線）＋頂部標籤。"""
+    if not maint_events:
+        return
+    for dt, name in maint_events:
+        ax.axvline(dt, color='crimson', linestyle='--', linewidth=1.0, alpha=0.8, zorder=5)
+        ax.text(dt, 1.01, name, transform=ax.get_xaxis_transform(),
+                rotation=90, va='bottom', ha='center', fontsize=7, color='crimson')
+
+
 def _plot_timeseries(df: pd.DataFrame, device_id: str,
-                     current_col: str | None) -> str:
+                     current_col: str | None,
+                     maint_events: list | None = None) -> str:
     """
-    時序圖（2 列）：
-      上：Total_vRMS  [+ accOA 次軸]
-      下：電流（若有）[+ 頻率 次軸（若有）]
+    時序圖（最多 3 列）：
+      ① Total_vRMS [+ accOA 次軸]
+      ② 電流（若有）[+ 頻率 次軸（若有）]
+      ③ health_score（若有）
+    各列以紅虛線標示保養日期。
     """
     _setup_font()
+    maint_events = maint_events or []
     has_current = current_col and current_col in df.columns and df[current_col].notna().any()
-    nrows = 2 if has_current else 1
-    fig, axes = plt.subplots(nrows, 1, figsize=(13, 4 * nrows), sharex=False)
+    has_health  = 'health_score' in df.columns and df['health_score'].notna().any()
+    nrows = 1 + int(has_current) + int(has_health)
+
+    fig, axes = plt.subplots(nrows, 1, figsize=(13, 3.6 * nrows), sharex=False)
     if nrows == 1:
         axes = [axes]
+    axes = list(np.atleast_1d(axes))
+    ai = 0
 
-    # ── 振動軸 ──
-    ax1 = axes[0]
+    # ── ① 振動 ──
+    ax1 = axes[ai]; ai += 1
     if 'Total_vRMS' in df.columns:
         ax1.plot(df['datetime'], df['Total_vRMS'],
                  color='steelblue', lw=1, label='Total vRMS (mm/s)')
     ax1.set_ylabel('Total vRMS (mm/s)', color='steelblue')
     ax1.tick_params(axis='y', labelcolor='steelblue')
     ax1.grid(True, alpha=0.3)
-
     if 'accOA' in df.columns:
         ax1r = ax1.twinx()
         ax1r.plot(df['datetime'], df['accOA'],
                   color='darkorange', lw=0.8, alpha=0.7, label='accOA (g)')
         ax1r.set_ylabel('accOA (g)', color='darkorange')
         ax1r.tick_params(axis='y', labelcolor='darkorange')
-
     ax1.set_title(f"{device_id}  —  振動時序", fontsize=11)
+    _mark_maintenance(ax1, maint_events)
     _x_fmt(ax1, df['datetime'])
 
-    # ── 電流軸 ──
+    # ── ② 電流 ──
     if has_current:
-        ax2 = axes[1]
+        ax2 = axes[ai]; ai += 1
         ax2.plot(df['datetime'], df[current_col],
                  color='crimson', lw=1, label=f'{current_col} (A)')
         ax2.set_ylabel(f'{current_col} (A)', color='crimson')
         ax2.tick_params(axis='y', labelcolor='crimson')
         ax2.grid(True, alpha=0.3)
-
         freq_col = next((c for c in df.columns if '頻率' in c or 'freq' in c.lower()), None)
         if freq_col:
             ax2r = ax2.twinx()
@@ -147,22 +236,36 @@ def _plot_timeseries(df: pd.DataFrame, device_id: str,
                       color='teal', lw=0.8, alpha=0.7, label=f'{freq_col} (Hz)')
             ax2r.set_ylabel(f'{freq_col} (Hz)', color='teal')
             ax2r.tick_params(axis='y', labelcolor='teal')
-
         ax2.set_title(f"{device_id}  —  電流時序", fontsize=11)
+        _mark_maintenance(ax2, maint_events)
         _x_fmt(ax2, df['datetime'])
+
+    # ── ③ 健康分數 ──
+    if has_health:
+        ax3 = axes[ai]; ai += 1
+        ax3.plot(df['datetime'], df['health_score'],
+                 color='seagreen', lw=1.1, label='Health Score')
+        ax3.axhline(85, color='gray', ls=':', lw=0.8, alpha=0.7)
+        ax3.set_ylabel('Health Score', color='seagreen')
+        ax3.set_ylim(0, 105)
+        ax3.tick_params(axis='y', labelcolor='seagreen')
+        ax3.grid(True, alpha=0.3)
+        ax3.set_title(f"{device_id}  —  健康分數", fontsize=11)
+        _mark_maintenance(ax3, maint_events)
+        _x_fmt(ax3, df['datetime'])
 
     plt.tight_layout()
     return _fig_to_b64(fig)
 
 
 def _plot_scatter(df: pd.DataFrame, device_id: str,
-                  current_col: str | None) -> str | None:
+                  current_col: str | None,
+                  split_date: pd.Timestamp | None = None) -> str | None:
     """
-    散佈圖（2 格）：
-      左：電流 vs Total_vRMS
-      右：電流 vs accOA
-    時間著色（早=藍、近=紅）＋趨勢線。
-    若無電流欄位則回傳 None。
+    電流 vs 振動散佈圖（2 格：Total_vRMS / accOA）。
+      有 split_date（最近一次保養）→ 保養前(灰) vs 保養後(橘) 分群，各畫趨勢線；
+                                     相同電流下橘線整體較低 = 保養有效。
+      無 split_date → 以時間早晚著色（早=藍、近=紅）。
     """
     _setup_font()
     if not current_col or current_col not in df.columns:
@@ -170,47 +273,64 @@ def _plot_scatter(df: pd.DataFrame, device_id: str,
     if df[current_col].notna().sum() < 10:
         return None
 
-    vib_targets = [(c, 'steelblue') for c in ['Total_vRMS', 'accOA']
+    vib_targets = [c for c in ['Total_vRMS', 'accOA']
                    if c in df.columns and df[c].notna().any()]
     if not vib_targets:
         return None
 
     ncols = len(vib_targets)
     fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
-    if ncols == 1:
-        axes = [axes]
+    axes = list(np.atleast_1d(axes))
+    use_split = split_date is not None
 
-    t_min = df['datetime'].min()
-    t_max = df['datetime'].max()
-    t_span = (t_max - t_min).total_seconds() or 1
-    time_norm = ((df['datetime'] - t_min).dt.total_seconds() / t_span).values
+    if not use_split:
+        t_min, t_max = df['datetime'].min(), df['datetime'].max()
+        t_span = (t_max - t_min).total_seconds() or 1
+        time_norm = ((df['datetime'] - t_min).dt.total_seconds() / t_span).values
 
-    for ax, (ycol, _) in zip(axes, vib_targets):
-        valid = df[[current_col, ycol]].dropna()
+    def _trend(ax, x, y, color):
+        if len(x) >= 2:
+            z = np.polyfit(x, y, 1)
+            xr = np.linspace(x.min(), x.max(), 200)
+            ax.plot(xr, np.poly1d(z)(xr), color=color, lw=2, ls='--')
+
+    for ax, ycol in zip(axes, vib_targets):
+        valid = df[[current_col, ycol, 'datetime']].dropna()
         if len(valid) < 5:
             ax.set_visible(False)
             continue
-        idx = valid.index
         x = valid[current_col].values
         y = valid[ycol].values
-        tn = time_norm[idx]
 
-        sc = ax.scatter(x, y, c=tn, cmap='coolwarm_r', s=12, alpha=0.5)
-        plt.colorbar(sc, ax=ax, label='早 → 近', fraction=0.04, pad=0.02)
+        if use_split:
+            pre  = valid['datetime'] < split_date
+            post = ~pre
+            ax.scatter(x[pre.values],  y[pre.values],
+                       c='gray',   s=12, alpha=0.45, label=f'保養前 (n={pre.sum()})')
+            ax.scatter(x[post.values], y[post.values],
+                       c='darkorange', s=12, alpha=0.55, label=f'保養後 (n={post.sum()})')
+            if pre.sum()  >= 2:
+                _trend(ax, x[pre.values],  y[pre.values],  'dimgray')
+            if post.sum() >= 2:
+                _trend(ax, x[post.values], y[post.values], 'orangered')
+            ax.legend(fontsize=8, loc='best')
+            ax.set_title(f'{current_col} vs {ycol}', fontsize=10)
+        else:
+            tn = time_norm[valid.index]
+            sc = ax.scatter(x, y, c=tn, cmap='coolwarm_r', s=12, alpha=0.5)
+            plt.colorbar(sc, ax=ax, label='早 → 近', fraction=0.04, pad=0.02)
+            _trend(ax, x, y, 'black')
+            r = np.corrcoef(x, y)[0, 1]
+            ax.set_title(f'{current_col} vs {ycol}\nPearson r = {r:.3f}  (n={len(valid)})',
+                         fontsize=10)
 
-        z = np.polyfit(x, y, 1)
-        xr = np.linspace(x.min(), x.max(), 200)
-        ax.plot(xr, np.poly1d(z)(xr), 'k--', lw=1.5)
-
-        r = np.corrcoef(x, y)[0, 1]
         ax.set_xlabel(f'{current_col} (A)', fontsize=9)
         ax.set_ylabel(ycol, fontsize=9)
-        ax.set_title(f'{current_col} vs {ycol}\nPearson r = {r:.3f}  (n={len(valid)})',
-                     fontsize=10)
         ax.grid(True, alpha=0.3, linestyle='--')
 
-    fig.suptitle(f"{device_id}  —  電流 vs 振動散佈圖（藍=早期  紅=近期）",
-                 fontsize=12, y=1.01)
+    sub = ('（灰=保養前  橘=保養後；相同電流下橘點較低 = 有效）' if use_split
+           else '（藍=早期  紅=近期）')
+    fig.suptitle(f"{device_id}  —  電流 vs 振動散佈圖 {sub}", fontsize=12, y=1.01)
     plt.tight_layout()
     return _fig_to_b64(fig)
 
@@ -240,10 +360,88 @@ def _stats_table_html(df: pd.DataFrame, cols: list[str]) -> str:
 </table>"""
 
 
+def _pick_load_col(df: pd.DataFrame, current_col: str | None) -> str | None:
+    """挑選負載基準欄：優先功率（輸入功率/power），否則電流。"""
+    for c in df.columns:
+        if any(kw.lower() in c.lower() for kw in LOAD_COL_KEYWORDS):
+            if df[c].notna().sum() >= 10:
+                return c
+    return current_col
+
+
+def _maintenance_effect_table(df: pd.DataFrame, load_col: str | None,
+                              split_date: pd.Timestamp, n_bins: int = 4) -> str:
+    """
+    相同負載下的保養前後比較表。
+    以 load_col（功率優先，否則電流）分箱，每箱用相同邊界比較
+    保養前/後的 accOA、health_score 中位數。
+    """
+    if load_col is None or load_col not in df.columns:
+        return '<p style="color:#888">（無負載欄位，無法進行相同負載比較）</p>'
+
+    data = df[df[load_col].notna()].copy()
+    if len(data) < 20:
+        return '<p style="color:#888">（資料量不足，無法分箱比較）</p>'
+
+    # 整體分箱 → 前後共用相同負載區間（這是「相同功率」的關鍵）
+    try:
+        data['_bin'] = pd.qcut(data[load_col], q=n_bins, duplicates='drop')
+    except ValueError:
+        return '<p style="color:#888">（負載值變異不足，無法分箱）</p>'
+
+    data['_period'] = np.where(data['datetime'] < split_date, '前', '後')
+    has_hs = 'health_score' in data.columns and data['health_score'].notna().any()
+
+    rows_html = ''
+    for b in data['_bin'].cat.categories:
+        sub = data[data['_bin'] == b]
+        pre, post = sub[sub['_period'] == '前'], sub[sub['_period'] == '後']
+        if pre.empty or post.empty:
+            continue
+        acc_pre, acc_post = pre['accOA'].median(), post['accOA'].median()
+        acc_imp = (acc_pre - acc_post) / acc_pre * 100 if acc_pre else float('nan')
+        arrow = '↓' if acc_imp > 0 else '↑'
+        imp_color = '#157f3b' if acc_imp > 0 else '#c0392b'
+
+        bin_label = f'{b.left:.1f} ~ {b.right:.1f}'
+        rows_html += (f'<tr><td>{bin_label}</td>'
+                      f'<td>{len(pre)}</td><td>{len(post)}</td>'
+                      f'<td>{acc_pre:.4f}</td><td>{acc_post:.4f}</td>'
+                      f'<td style="color:{imp_color}"><b>{arrow}{abs(acc_imp):.1f}%</b></td>')
+        if has_hs:
+            hs_pre, hs_post = pre['health_score'].median(), post['health_score'].median()
+            hs_delta = hs_post - hs_pre
+            hs_color = '#157f3b' if hs_delta > 0 else '#c0392b'
+            rows_html += (f'<td>{hs_pre:.1f}</td><td>{hs_post:.1f}</td>'
+                          f'<td style="color:{hs_color}"><b>{"+" if hs_delta>=0 else ""}'
+                          f'{hs_delta:.1f}</b></td>')
+        rows_html += '</tr>\n'
+
+    if not rows_html:
+        return ('<p style="color:#888">（保養前後在相同負載區間內無重疊資料，'
+                '無法比較——可能保養後負載範圍與保養前不同）</p>')
+
+    hs_head = ('<th>HS前</th><th>HS後</th><th>HS變化</th>') if has_hs else ''
+    return f"""
+<table class="stats">
+  <thead>
+    <tr><th>{load_col} 區間</th><th>n前</th><th>n後</th>
+        <th>accOA前</th><th>accOA後</th><th>accOA改善</th>{hs_head}</tr>
+  </thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<p style="font-size:0.85em;color:#666">
+  accOA 改善 = (前−後)/前；綠色↓代表振動下降（保養有效）。
+  {'HS 變化 = 後−前；綠色 + 代表健康分數回升。' if has_hs else ''}
+  分箱以「{load_col}」四分位切分，確保前後在<b>相同負載區間</b>下比較。
+</p>"""
+
+
 def _build_html(device_id: str, df: pd.DataFrame,
                 img_ts: str, img_sc: str | None,
                 current_col: str | None,
-                threshold: float) -> str:
+                threshold: float,
+                maint_events: list | None = None) -> str:
     date_range = (f"{df['datetime'].min().strftime('%Y-%m-%d')} ~ "
                   f"{df['datetime'].max().strftime('%Y-%m-%d')}")
 
@@ -252,11 +450,29 @@ def _build_html(device_id: str, df: pd.DataFrame,
                     if c and c in df.columns]
 
     stats_html = _stats_table_html(df, display_cols)
+
+    # 散佈圖標題依是否有保養切分而異
+    maint_events = maint_events or []
+    split_date = maint_events[-1][0] if maint_events else None
+    scatter_title = ('保養前後 × 電流散佈圖' if split_date else '電流 × 振動散佈圖')
     scatter_section = ''
     if img_sc:
         scatter_section = f"""
-<h2>電流 × 振動散佈圖</h2>
+<h2>{scatter_title}</h2>
 <img src="data:image/png;base64,{img_sc}" style="max-width:100%">"""
+
+    # 保養資訊 + 有效性比較表
+    maint_section = ''
+    if maint_events:
+        events_str = '、'.join(f"{dt.strftime('%Y-%m-%d')}（{name}）"
+                              for dt, name in maint_events)
+        load_col = _pick_load_col(df, current_col)
+        eff_table = _maintenance_effect_table(df, load_col, split_date)
+        maint_section = f"""
+<h2>保養有效性分析</h2>
+<p>保養紀錄：<b>{events_str}</b><br>
+以最近一次保養（{split_date.strftime('%Y-%m-%d')}）為界，比較相同負載區間下的振動變化。</p>
+{eff_table}"""
 
     filter_note = (f'電流 > {threshold} A（有電流資料）'
                    if current_col else f'Total vRMS > {settings.VTRMS_ON_THRESHOLD} mm/s')
@@ -303,6 +519,8 @@ def _build_html(device_id: str, df: pd.DataFrame,
 <h2>時序圖</h2>
 <img src="data:image/png;base64,{img_ts}" style="max-width:100%">
 
+{maint_section}
+
 {scatter_section}
 
 <h2>統計摘要</h2>
@@ -348,7 +566,8 @@ def export_device(device_id: str,
                   tag_map: pd.DataFrame,
                   output_dir: str,
                   current_type: str,
-                  threshold: float) -> bool:
+                  threshold: float,
+                  maint_log: dict | None = None) -> bool:
     logger.info(f"\n{'='*55}")
     logger.info(f"  {device_id}")
     logger.info(f"{'='*55}")
@@ -414,6 +633,30 @@ def export_device(device_id: str,
         logger.warning(f"{device_id}: 開機篩選後無資料，跳過")
         return False
 
+    # ── 合併 health_score（若 output/scores/ 已有評分結果）──
+    hs = load_health_score(device_id)
+    if hs is not None:
+        df_vib = pd.merge_asof(
+            df_vib.sort_values('datetime'),
+            hs.sort_values('datetime'),
+            on='datetime', tolerance=MERGE_TOL, direction='nearest',
+        )
+        n_hs = df_vib['health_score'].notna().sum()
+        logger.info(f"  health_score 對齊：{n_hs}/{len(df_vib)} 筆")
+    else:
+        logger.info(f"  無 {device_id}_scores.csv，HTML 不含健康分數"
+                    f"（可先跑 test_model.py 產生）")
+
+    # ── 保養事件（用基底名查；套用到 M1/M2 兩個量測點）──
+    maint_events = []
+    if maint_log:
+        maint_events = maint_log.get(device_base, [])
+        # 只保留落在資料期間內的保養日期
+        dmin, dmax = df_vib['datetime'].min(), df_vib['datetime'].max()
+        maint_events = [(dt, nm) for dt, nm in maint_events if dmin <= dt <= dmax]
+        if maint_events:
+            logger.info(f"  保養事件：{[dt.strftime('%Y-%m-%d') for dt, _ in maint_events]}")
+
     # ── CSV 匯出 ──
     os.makedirs(output_dir, exist_ok=True)
     csv_path = os.path.join(output_dir, f"{device_id}.csv")
@@ -422,11 +665,13 @@ def export_device(device_id: str,
     logger.info(f"  CSV → {csv_path}  ({len(df_vib)} 筆)")
 
     # ── 圖表 ──
-    img_ts = _plot_timeseries(df_vib, device_id, current_col)
-    img_sc = _plot_scatter(df_vib, device_id, current_col)
+    split_date = maint_events[-1][0] if maint_events else None
+    img_ts = _plot_timeseries(df_vib, device_id, current_col, maint_events)
+    img_sc = _plot_scatter(df_vib, device_id, current_col, split_date)
 
     # ── HTML 匯出 ──
-    html = _build_html(device_id, df_vib, img_ts, img_sc, current_col, threshold)
+    html = _build_html(device_id, df_vib, img_ts, img_sc,
+                       current_col, threshold, maint_events)
     html_path = os.path.join(output_dir, f"{device_id}.html")
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
@@ -446,6 +691,8 @@ def main():
                         help=f'電流開機下限（A），預設 {settings.CURRENT_ON_THRESHOLD}')
     parser.add_argument('--current-type', default=DEFAULT_CURRENT_TYPE,
                         help=f'tag_mapping 中電流的 variable_type，預設「{DEFAULT_CURRENT_TYPE}」')
+    parser.add_argument('--maintenance', default=MAINTENANCE_PATH,
+                        help=f'保養紀錄 CSV，預設「{MAINTENANCE_PATH}」')
     args = parser.parse_args()
 
     vib_data = load_vibration('Vibration_Data')
@@ -453,8 +700,9 @@ def main():
         logger.error("找不到振動資料，請確認 Vibration_Data/ 資料夾")
         sys.exit(1)
 
-    df_other = load_other_data(OTHER_DATA_DIR)
-    tag_map  = load_tag_mapping(TAG_MAPPING_PATH)
+    df_other  = load_other_data(OTHER_DATA_DIR)
+    tag_map   = load_tag_mapping(TAG_MAPPING_PATH)
+    maint_log = load_maintenance_log(args.maintenance)
 
     if df_other.empty:
         logger.warning("Other_Data/ 無資料，將只匯出振動欄位（無電流）")
@@ -467,7 +715,7 @@ def main():
             continue
         ok = export_device(
             device_id, df_raw, df_other, tag_map,
-            OUTPUT_DIR, args.current_type, args.threshold,
+            OUTPUT_DIR, args.current_type, args.threshold, maint_log,
         )
         if ok:
             success += 1
