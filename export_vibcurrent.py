@@ -390,7 +390,18 @@ def _maintenance_effect_table(df: pd.DataFrame, load_col: str | None,
         return '<p style="color:#888">（負載值變異不足，無法分箱）</p>'
 
     data['_period'] = np.where(data['datetime'] < split_date, '前', '後')
-    has_hs = 'health_score' in data.columns and data['health_score'].notna().any()
+    has_hs  = 'health_score' in data.columns and data['health_score'].notna().any()
+    has_rms = 'Total_vRMS' in data.columns and data['Total_vRMS'].notna().any()
+
+    def _imp(pre_val, post_val):
+        """回傳 (改善幅度%, arrow, color)"""
+        if pre_val and not np.isnan(pre_val):
+            pct = (pre_val - post_val) / pre_val * 100
+        else:
+            pct = float('nan')
+        arrow = '↓' if pct > 0 else '↑'
+        color = '#157f3b' if pct > 0 else '#c0392b'
+        return pct, arrow, color
 
     rows_html = ''
     for b in data['_bin'].cat.categories:
@@ -398,16 +409,24 @@ def _maintenance_effect_table(df: pd.DataFrame, load_col: str | None,
         pre, post = sub[sub['_period'] == '前'], sub[sub['_period'] == '後']
         if pre.empty or post.empty:
             continue
-        acc_pre, acc_post = pre['accOA'].median(), post['accOA'].median()
-        acc_imp = (acc_pre - acc_post) / acc_pre * 100 if acc_pre else float('nan')
-        arrow = '↓' if acc_imp > 0 else '↑'
-        imp_color = '#157f3b' if acc_imp > 0 else '#c0392b'
 
         bin_label = f'{b.left:.1f} ~ {b.right:.1f}'
-        rows_html += (f'<tr><td>{bin_label}</td>'
-                      f'<td>{len(pre)}</td><td>{len(post)}</td>'
-                      f'<td>{acc_pre:.4f}</td><td>{acc_post:.4f}</td>'
-                      f'<td style="color:{imp_color}"><b>{arrow}{abs(acc_imp):.1f}%</b></td>')
+        rows_html += f'<tr><td>{bin_label}</td><td>{len(pre)}</td><td>{len(post)}</td>'
+
+        # accOA
+        acc_pre, acc_post = pre['accOA'].median(), post['accOA'].median()
+        pct, arrow, color = _imp(acc_pre, acc_post)
+        rows_html += (f'<td>{acc_pre:.4f}</td><td>{acc_post:.4f}</td>'
+                      f'<td style="color:{color}"><b>{arrow}{abs(pct):.1f}%</b></td>')
+
+        # Total_vRMS
+        if has_rms:
+            rms_pre, rms_post = pre['Total_vRMS'].median(), post['Total_vRMS'].median()
+            pct_r, arrow_r, color_r = _imp(rms_pre, rms_post)
+            rows_html += (f'<td>{rms_pre:.4f}</td><td>{rms_post:.4f}</td>'
+                          f'<td style="color:{color_r}"><b>{arrow_r}{abs(pct_r):.1f}%</b></td>')
+
+        # Health Score
         if has_hs:
             hs_pre, hs_post = pre['health_score'].median(), post['health_score'].median()
             hs_delta = hs_post - hs_pre
@@ -415,23 +434,26 @@ def _maintenance_effect_table(df: pd.DataFrame, load_col: str | None,
             rows_html += (f'<td>{hs_pre:.1f}</td><td>{hs_post:.1f}</td>'
                           f'<td style="color:{hs_color}"><b>{"+" if hs_delta>=0 else ""}'
                           f'{hs_delta:.1f}</b></td>')
+
         rows_html += '</tr>\n'
 
     if not rows_html:
         return ('<p style="color:#888">（保養前後在相同負載區間內無重疊資料，'
                 '無法比較——可能保養後負載範圍與保養前不同）</p>')
 
-    hs_head = ('<th>HS前</th><th>HS後</th><th>HS變化</th>') if has_hs else ''
+    rms_head = '<th>RMS前</th><th>RMS後</th><th>RMS改善</th>' if has_rms else ''
+    hs_head  = '<th>HS前</th><th>HS後</th><th>HS變化</th>'   if has_hs  else ''
     return f"""
 <table class="stats">
   <thead>
     <tr><th>{load_col} 區間</th><th>n前</th><th>n後</th>
-        <th>accOA前</th><th>accOA後</th><th>accOA改善</th>{hs_head}</tr>
+        <th>accOA前</th><th>accOA後</th><th>accOA改善</th>
+        {rms_head}{hs_head}</tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
 <p style="font-size:0.85em;color:#666">
-  accOA 改善 = (前−後)/前；綠色↓代表振動下降（保養有效）。
+  改善 = (前−後)/前；綠色↓代表振動下降（保養有效），紅色↑代表上升。
   {'HS 變化 = 後−前；綠色 + 代表健康分數回升。' if has_hs else ''}
   分箱以「{load_col}」四分位切分，確保前後在<b>相同負載區間</b>下比較。
 </p>"""
