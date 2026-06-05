@@ -461,6 +461,17 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
     logger.info(f"  保養分析分箱方式：{bin_method}")
 
     data['_period'] = np.where(data['datetime'] < split_date, '前', '後')
+    n_pre  = (data['_period'] == '前').sum()
+    n_post = (data['_period'] == '後').sum()
+    dmin, dmax = data['datetime'].min(), data['datetime'].max()
+    logger.info(f"  保養比較：split={split_date.date()} | "
+                f"資料範圍 {dmin.date()}~{dmax.date()} | "
+                f"保養前 {n_pre} 筆 / 保養後 {n_post} 筆")
+    if n_post == 0:
+        return (f'<p style="color:#c0392b">⚠ 保養日期（{split_date.date()}）在資料結束之後，'
+                f'資料最新至 {dmax.date()}，無保養後資料可比較。'
+                f'請確認 maintenance_log.csv 的日期是否正確。</p>')
+
     has_rms  = 'Total_vRMS' in data.columns and data['Total_vRMS'].notna().any()
     has_curr = bool(current_col and current_col in data.columns
                     and data[current_col].notna().any())
@@ -522,8 +533,19 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
         rows_html += '</tr>\n'
 
     if not rows_html:
-        return ('<p style="color:#888">（保養前後在相同分組區間內無重疊資料，'
-                '請確認保養前後的操作頻率範圍是否重疊）</p>')
+        # 診斷：看看每個 bin 的前後分佈
+        diag = []
+        for b in sorted(data['_bin'].unique()):
+            sub = data[data['_bin'] == b]
+            pre_n  = (sub['_period'] == '前').sum()
+            post_n = (sub['_period'] == '後').sum()
+            label  = f'{b.left:.1f}~{b.right:.1f}' if hasattr(b, 'left') else f'{b}'
+            diag.append(f'{label}（前{pre_n}/後{post_n}）')
+        diag_str = '、'.join(diag)
+        logger.warning(f"  保養比較無有效行：各bin分佈 = {diag_str}")
+        return (f'<p style="color:#c0392b">⚠ 每個{group_label}區間的保養前後資料無法配對。'
+                f'各區間前/後筆數：{diag_str}。<br>'
+                f'可能原因：保養前後的操作頻率範圍不重疊，或某一側資料量不足。</p>')
 
     rms_head  = '<th>RMS前</th><th>RMS後</th><th>RMS改善</th>'          if has_rms  else ''
     curr_head = f'<th>電流前(A)</th><th>電流後(A)</th><th>電流差異</th>' if has_curr else ''
@@ -733,10 +755,17 @@ def export_device(device_id: str,
                        f"請確認 tag_mapping 的 device_id 值與振動 devicename 一致")
 
     # ── 開機篩選 ──
+    # 有電流的列用電流門檻；電流 NaN（SCADA 資料結束後）改用 vRMS 門檻，
+    # 確保 SCADA 期間結束後的新振動資料不被誤殺。
     if current_col and current_col in df_vib.columns and df_vib[current_col].notna().any():
-        mask = df_vib[current_col] > threshold
-        logger.info(f"  開機篩選（{current_col} > {threshold} A）："
-                    f"{mask.sum()}/{len(df_vib)} 筆通過")
+        has_curr_mask = df_vib[current_col].notna()
+        curr_on  = has_curr_mask & (df_vib[current_col] > threshold)
+        vrms_on  = ~has_curr_mask & (df_vib['Total_vRMS'] > settings.VTRMS_ON_THRESHOLD)
+        mask = curr_on | vrms_on
+        n_curr = curr_on.sum(); n_vrms = vrms_on.sum()
+        logger.info(f"  開機篩選：電流 {n_curr} 筆（>{threshold} A）"
+                    f" + vRMS fallback {n_vrms} 筆（SCADA 結束後）"
+                    f" = 共 {mask.sum()}/{len(df_vib)} 筆")
         df_vib = df_vib[mask].reset_index(drop=True)
     else:
         mask = df_vib['Total_vRMS'] > settings.VTRMS_ON_THRESHOLD
