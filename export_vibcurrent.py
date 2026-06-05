@@ -60,8 +60,11 @@ SCORE_DIR        = 'output/scores'
 OUTPUT_DIR       = 'output/export'
 DEFAULT_CURRENT_TYPE = '電流'
 
-# 保養前後比較的負載基準欄（優先序）：先功率、再電流
-LOAD_COL_KEYWORDS = ('輸入功率', 'power', '功率')
+# 保養前後比較的分組基準欄（優先序）：頻率 > 功率 > 電流
+# 頻率最能確保「相同操作點」下的比較
+FREQ_COL_KEYWORDS    = ('頻率', 'freq', 'hz', 'frequency')
+LOAD_COL_KEYWORDS    = ('輸入功率', 'power', '功率')
+CURRENT_COL_KEYWORDS = ('電流', 'current', '安培', 'amp')
 
 _FONT_READY = False
 
@@ -262,15 +265,18 @@ def _plot_scatter(df: pd.DataFrame, device_id: str,
                   current_col: str | None,
                   split_date: pd.Timestamp | None = None) -> str | None:
     """
-    電流 vs 振動散佈圖（2 格：Total_vRMS / accOA）。
-      有 split_date（最近一次保養）→ 保養前(灰) vs 保養後(橘) 分群，各畫趨勢線；
-                                     相同電流下橘線整體較低 = 保養有效。
-      無 split_date → 以時間早晚著色（早=藍、近=紅）。
+    散佈圖：頻率（若有）+ 電流 vs 振動（Total_vRMS / accOA）。
+    有 split_date → 保養前(灰) vs 保養後(橘) 分群；無 → 時間著色。
+    頻率列放在最上方，讓「相同操作點」的比較一目瞭然。
     """
     _setup_font()
-    if not current_col or current_col not in df.columns:
-        return None
-    if df[current_col].notna().sum() < 10:
+
+    freq_col = _find_col_by_keywords(df, FREQ_COL_KEYWORDS)
+    has_freq = bool(freq_col and df[freq_col].notna().sum() >= 10)
+    has_curr = bool(current_col and current_col in df.columns
+                    and df[current_col].notna().sum() >= 10)
+
+    if not has_freq and not has_curr:
         return None
 
     vib_targets = [c for c in ['Total_vRMS', 'accOA']
@@ -278,9 +284,16 @@ def _plot_scatter(df: pd.DataFrame, device_id: str,
     if not vib_targets:
         return None
 
+    # x 軸來源：頻率優先，若都有則兩列都畫
+    x_sources = []
+    if has_freq:
+        x_sources.append((freq_col, 'Hz'))
+    if has_curr:
+        x_sources.append((current_col, 'A'))
+
+    nrows = len(x_sources)
     ncols = len(vib_targets)
-    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
-    axes = list(np.atleast_1d(axes))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows), squeeze=False)
     use_split = split_date is not None
 
     if not use_split:
@@ -294,43 +307,47 @@ def _plot_scatter(df: pd.DataFrame, device_id: str,
             xr = np.linspace(x.min(), x.max(), 200)
             ax.plot(xr, np.poly1d(z)(xr), color=color, lw=2, ls='--')
 
-    for ax, ycol in zip(axes, vib_targets):
-        valid = df[[current_col, ycol, 'datetime']].dropna()
-        if len(valid) < 5:
-            ax.set_visible(False)
-            continue
-        x = valid[current_col].values
-        y = valid[ycol].values
+    for ri, (xcol, xunit) in enumerate(x_sources):
+        for ci, ycol in enumerate(vib_targets):
+            ax = axes[ri][ci]
+            valid = df[[xcol, ycol, 'datetime']].dropna()
+            if len(valid) < 5:
+                ax.set_visible(False)
+                continue
+            x = valid[xcol].values
+            y = valid[ycol].values
 
-        if use_split:
-            pre  = valid['datetime'] < split_date
-            post = ~pre
-            ax.scatter(x[pre.values],  y[pre.values],
-                       c='gray',   s=12, alpha=0.45, label=f'保養前 (n={pre.sum()})')
-            ax.scatter(x[post.values], y[post.values],
-                       c='darkorange', s=12, alpha=0.55, label=f'保養後 (n={post.sum()})')
-            if pre.sum()  >= 2:
-                _trend(ax, x[pre.values],  y[pre.values],  'dimgray')
-            if post.sum() >= 2:
-                _trend(ax, x[post.values], y[post.values], 'orangered')
-            ax.legend(fontsize=8, loc='best')
-            ax.set_title(f'{current_col} vs {ycol}', fontsize=10)
-        else:
-            tn = time_norm[valid.index]
-            sc = ax.scatter(x, y, c=tn, cmap='coolwarm_r', s=12, alpha=0.5)
-            plt.colorbar(sc, ax=ax, label='早 → 近', fraction=0.04, pad=0.02)
-            _trend(ax, x, y, 'black')
-            r = np.corrcoef(x, y)[0, 1]
-            ax.set_title(f'{current_col} vs {ycol}\nPearson r = {r:.3f}  (n={len(valid)})',
-                         fontsize=10)
+            if use_split:
+                pre  = valid['datetime'] < split_date
+                post = ~pre
+                ax.scatter(x[pre.values],  y[pre.values],
+                           c='gray',       s=12, alpha=0.45, label=f'保養前 (n={pre.sum()})')
+                ax.scatter(x[post.values], y[post.values],
+                           c='darkorange', s=12, alpha=0.55, label=f'保養後 (n={post.sum()})')
+                if pre.sum()  >= 2:
+                    _trend(ax, x[pre.values],  y[pre.values],  'dimgray')
+                if post.sum() >= 2:
+                    _trend(ax, x[post.values], y[post.values], 'orangered')
+                ax.legend(fontsize=8, loc='best')
+                ax.set_title(f'{xcol} vs {ycol}', fontsize=10)
+            else:
+                tn = time_norm[valid.index]
+                sc = ax.scatter(x, y, c=tn, cmap='coolwarm_r', s=12, alpha=0.5)
+                plt.colorbar(sc, ax=ax, label='早 → 近', fraction=0.04, pad=0.02)
+                _trend(ax, x, y, 'black')
+                r = np.corrcoef(x, y)[0, 1]
+                ax.set_title(f'{xcol} vs {ycol}\nPearson r = {r:.3f}  (n={len(valid)})',
+                             fontsize=10)
 
-        ax.set_xlabel(f'{current_col} (A)', fontsize=9)
-        ax.set_ylabel(ycol, fontsize=9)
-        ax.grid(True, alpha=0.3, linestyle='--')
+            ax.set_xlabel(f'{xcol} ({xunit})', fontsize=9)
+            ax.set_ylabel(ycol, fontsize=9)
+            ax.grid(True, alpha=0.3, linestyle='--')
 
     sub = ('（灰=保養前  橘=保養後；相同電流下橘點較低 = 有效）' if use_split
            else '（藍=早期  紅=近期）')
-    fig.suptitle(f"{device_id}  —  電流 vs 振動散佈圖 {sub}", fontsize=12, y=1.01)
+    row_labels = ' / '.join(f'{xc}({xu})' for xc, xu in x_sources)
+    fig.suptitle(f"{device_id}  —  {row_labels} vs 振動散佈圖 {sub}",
+                 fontsize=12, y=1.01)
     plt.tight_layout()
     return _fig_to_b64(fig)
 
@@ -360,48 +377,65 @@ def _stats_table_html(df: pd.DataFrame, cols: list[str]) -> str:
 </table>"""
 
 
-def _pick_load_col(df: pd.DataFrame, current_col: str | None) -> str | None:
-    """挑選負載基準欄：優先功率（輸入功率/power），否則電流。"""
+def _find_col_by_keywords(df: pd.DataFrame, keywords: tuple) -> str | None:
+    """依關鍵字清單找第一個有足夠資料的欄位（不分大小寫）。"""
     for c in df.columns:
-        if any(kw.lower() in c.lower() for kw in LOAD_COL_KEYWORDS):
+        if any(kw.lower() in c.lower() for kw in keywords):
             if df[c].notna().sum() >= 10:
                 return c
+    return None
+
+
+def _pick_group_col(df: pd.DataFrame, current_col: str | None) -> str | None:
+    """
+    挑選保養分析的「分組基準欄」：頻率 > 功率 > 電流。
+    頻率是 VFD 最直接的操作點指標，確保相同操作條件下的比較。
+    """
+    freq = _find_col_by_keywords(df, FREQ_COL_KEYWORDS)
+    if freq:
+        return freq
+    load = _find_col_by_keywords(df, LOAD_COL_KEYWORDS)
+    if load:
+        return load
     return current_col
 
 
-def _maintenance_effect_table(df: pd.DataFrame, load_col: str | None,
+def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
+                              current_col: str | None,
                               split_date: pd.Timestamp, n_bins: int = 4) -> str:
     """
-    相同負載下的保養前後比較表。
-    以 load_col（功率優先，否則電流）分箱，每箱用相同邊界比較
-    保養前/後的 accOA、health_score 中位數。
+    相同操作點下的保養前後比較表。
+    以 group_col（頻率優先 > 功率 > 電流）分箱，前後共用相同區間，
+    比較各箱的 accOA、Total_vRMS、電流（確認負載一致）、health_score 中位數。
     """
-    if load_col is None or load_col not in df.columns:
-        return '<p style="color:#888">（無負載欄位，無法進行相同負載比較）</p>'
+    if group_col is None or group_col not in df.columns:
+        return '<p style="color:#888">（無頻率/負載欄位，無法進行分組比較）</p>'
 
-    data = df[df[load_col].notna()].copy()
+    data = df[df[group_col].notna()].copy()
     if len(data) < 20:
         return '<p style="color:#888">（資料量不足，無法分箱比較）</p>'
 
-    # 整體分箱 → 前後共用相同負載區間（這是「相同功率」的關鍵）
+    is_freq = any(kw.lower() in group_col.lower() for kw in FREQ_COL_KEYWORDS)
+    group_label = f'頻率（{group_col}）' if is_freq else group_col
+
+    # 整體分箱 → 前後共用相同邊界（這是「相同操作點」的關鍵）
     try:
-        data['_bin'] = pd.qcut(data[load_col], q=n_bins, duplicates='drop')
+        data['_bin'] = pd.qcut(data[group_col], q=n_bins, duplicates='drop')
     except ValueError:
-        return '<p style="color:#888">（負載值變異不足，無法分箱）</p>'
+        return '<p style="color:#888">（分組欄位值變異不足，無法分箱）</p>'
 
     data['_period'] = np.where(data['datetime'] < split_date, '前', '後')
-    has_hs  = 'health_score' in data.columns and data['health_score'].notna().any()
-    has_rms = 'Total_vRMS' in data.columns and data['Total_vRMS'].notna().any()
+    has_rms  = 'Total_vRMS' in data.columns and data['Total_vRMS'].notna().any()
+    has_curr = bool(current_col and current_col in data.columns
+                    and data[current_col].notna().any())
+    has_hs   = 'health_score' in data.columns and data['health_score'].notna().any()
 
     def _imp(pre_val, post_val):
-        """回傳 (改善幅度%, arrow, color)"""
         if pre_val and not np.isnan(pre_val):
             pct = (pre_val - post_val) / pre_val * 100
         else:
             pct = float('nan')
-        arrow = '↓' if pct > 0 else '↑'
-        color = '#157f3b' if pct > 0 else '#c0392b'
-        return pct, arrow, color
+        return pct, ('↓' if pct > 0 else '↑'), ('#157f3b' if pct > 0 else '#c0392b')
 
     rows_html = ''
     for b in data['_bin'].cat.categories:
@@ -426,6 +460,16 @@ def _maintenance_effect_table(df: pd.DataFrame, load_col: str | None,
             rows_html += (f'<td>{rms_pre:.4f}</td><td>{rms_post:.4f}</td>'
                           f'<td style="color:{color_r}"><b>{arrow_r}{abs(pct_r):.1f}%</b></td>')
 
+        # 電流（僅顯示中位數，確認前後負載是否真的相近）
+        if has_curr:
+            curr_pre  = pre[current_col].median()
+            curr_post = post[current_col].median()
+            diff_pct  = abs(curr_pre - curr_post) / curr_pre * 100 if curr_pre else float('nan')
+            curr_color = '#888' if diff_pct < 10 else '#c0392b'
+            rows_html += (f'<td>{curr_pre:.1f}</td><td>{curr_post:.1f}</td>'
+                          f'<td style="color:{curr_color}">'
+                          f'{"≈" if diff_pct < 10 else "⚠"}{diff_pct:.1f}%</td>')
+
         # Health Score
         if has_hs:
             hs_pre, hs_post = pre['health_score'].median(), post['health_score'].median()
@@ -438,24 +482,29 @@ def _maintenance_effect_table(df: pd.DataFrame, load_col: str | None,
         rows_html += '</tr>\n'
 
     if not rows_html:
-        return ('<p style="color:#888">（保養前後在相同負載區間內無重疊資料，'
-                '無法比較——可能保養後負載範圍與保養前不同）</p>')
+        return ('<p style="color:#888">（保養前後在相同分組區間內無重疊資料，'
+                '請確認保養前後的操作頻率範圍是否重疊）</p>')
 
-    rms_head = '<th>RMS前</th><th>RMS後</th><th>RMS改善</th>' if has_rms else ''
-    hs_head  = '<th>HS前</th><th>HS後</th><th>HS變化</th>'   if has_hs  else ''
+    rms_head  = '<th>RMS前</th><th>RMS後</th><th>RMS改善</th>'          if has_rms  else ''
+    curr_head = f'<th>電流前(A)</th><th>電流後(A)</th><th>電流差異</th>' if has_curr else ''
+    hs_head   = '<th>HS前</th><th>HS後</th><th>HS變化</th>'              if has_hs   else ''
+
+    curr_note = ('電流差異 &lt;10% 顯示灰色（負載相近，比較有效），⚠ 代表電流差異較大需注意。'
+                 if has_curr else '')
+
     return f"""
 <table class="stats">
   <thead>
-    <tr><th>{load_col} 區間</th><th>n前</th><th>n後</th>
+    <tr><th>{group_label} 區間</th><th>n前</th><th>n後</th>
         <th>accOA前</th><th>accOA後</th><th>accOA改善</th>
-        {rms_head}{hs_head}</tr>
+        {rms_head}{curr_head}{hs_head}</tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
 <p style="font-size:0.85em;color:#666">
-  改善 = (前−後)/前；綠色↓代表振動下降（保養有效），紅色↑代表上升。
+  改善 = (前−後)/前；綠色↓振動下降（有效），紅色↑上升。{curr_note}
   {'HS 變化 = 後−前；綠色 + 代表健康分數回升。' if has_hs else ''}
-  分箱以「{load_col}」四分位切分，確保前後在<b>相同負載區間</b>下比較。
+  分箱以「{group_col}」四分位切分，確保前後在<b>相同操作頻率</b>下比較。
 </p>"""
 
 
@@ -476,7 +525,7 @@ def _build_html(device_id: str, df: pd.DataFrame,
     # 散佈圖標題依是否有保養切分而異
     maint_events = maint_events or []
     split_date = maint_events[-1][0] if maint_events else None
-    scatter_title = ('保養前後 × 電流散佈圖' if split_date else '電流 × 振動散佈圖')
+    scatter_title = ('保養前後 × 頻率/電流散佈圖' if split_date else '頻率/電流 × 振動散佈圖')
     scatter_section = ''
     if img_sc:
         scatter_section = f"""
@@ -488,12 +537,16 @@ def _build_html(device_id: str, df: pd.DataFrame,
     if maint_events:
         events_str = '、'.join(f"{dt.strftime('%Y-%m-%d')}（{name}）"
                               for dt, name in maint_events)
-        load_col = _pick_load_col(df, current_col)
-        eff_table = _maintenance_effect_table(df, load_col, split_date)
+        group_col = _pick_group_col(df, current_col)
+        is_freq   = bool(group_col and any(kw.lower() in group_col.lower()
+                                           for kw in FREQ_COL_KEYWORDS))
+        group_desc = '頻率' if is_freq else '負載'
+        eff_table = _maintenance_effect_table(df, group_col, current_col, split_date)
         maint_section = f"""
-<h2>保養有效性分析</h2>
+<h2>保養有效性分析（相同{group_desc}分組）</h2>
 <p>保養紀錄：<b>{events_str}</b><br>
-以最近一次保養（{split_date.strftime('%Y-%m-%d')}）為界，比較相同負載區間下的振動變化。</p>
+以最近一次保養（{split_date.strftime('%Y-%m-%d')}）為界，
+在<b>相同{group_desc}區間</b>下比較振動變化；電流欄顯示前後負載是否相近。</p>
 {eff_table}"""
 
     filter_note = (f'電流 > {threshold} A（有電流資料）'
