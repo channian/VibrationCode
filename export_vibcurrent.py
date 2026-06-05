@@ -734,9 +734,11 @@ def export_device(device_id: str,
             scada_cols = [c for c in df_wide.columns if c != 'datetime']
             logger.info(f"  SCADA 欄位（variable_type）：{scada_cols}")
 
-            # 時間重疊確認
+            # 時間重疊確認 + 詳細診斷
             vib_range   = (df_vib['datetime'].min(), df_vib['datetime'].max())
             scada_range = (df_wide['datetime'].min(), df_wide['datetime'].max())
+            logger.info(f"  SCADA 原始時間範圍：{scada_range[0].date()} ~ {scada_range[1].date()} "
+                        f"（{len(df_wide)} 筆）")
             if vib_range[0] <= scada_range[1] and scada_range[0] <= vib_range[1]:
                 df_vib = merge_vib_scada(df_vib, df_wide)
                 current_col = _resolve_current_col(scada_cols, current_type)
@@ -744,8 +746,22 @@ def export_device(device_id: str,
                     logger.warning(f"  找不到電流欄位（指定 current_type='{current_type}'）；"
                                    f"現有 variable_type：{scada_cols}。"
                                    f"請用 --current-type 指定正確名稱")
-                elif current_col != current_type:
-                    logger.info(f"  電流欄位以部分比對找到：'{current_col}'")
+                else:
+                    if current_col != current_type:
+                        logger.info(f"  電流欄位以部分比對找到：'{current_col}'")
+                    # ── merge 後診斷：確認電流資料是否完整對齊 ──
+                    valid_curr = df_vib[current_col].notna()
+                    if valid_curr.any():
+                        curr_max = df_vib.loc[valid_curr, 'datetime'].max()
+                        curr_pct = valid_curr.mean() * 100
+                        logger.info(f"  電流對齊：{valid_curr.sum()}/{len(df_vib)} 筆（{curr_pct:.1f}%）"
+                                    f"，有效電流最晚至 {curr_max.date()}")
+                        if curr_max < vib_range[1] - pd.Timedelta(days=3):
+                            logger.warning(
+                                f"  ⚠ 電流資料在 {curr_max.date()} 後斷掉，"
+                                f"但振動資料還有到 {vib_range[1].date()}。"
+                                f"請確認 Other_Data 的新 CSV 時間格式是否與舊資料一致。"
+                            )
             else:
                 logger.warning(f"{device_id}: 振動 {vib_range[0].date()}~{vib_range[1].date()} "
                                f"與 SCADA {scada_range[0].date()}~{scada_range[1].date()} "
