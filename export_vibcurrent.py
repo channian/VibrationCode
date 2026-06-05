@@ -477,8 +477,13 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
                     and data[current_col].notna().any())
     has_hs   = 'health_score' in data.columns and data['health_score'].notna().any()
 
+    def _med(series) -> float:
+        """dropna 後再算中位數，避免 Mean of empty slice RuntimeWarning。"""
+        v = series.dropna()
+        return float(v.median()) if not v.empty else float('nan')
+
     def _imp(pre_val, post_val):
-        if pre_val and not np.isnan(pre_val):
+        if not np.isnan(pre_val) and pre_val != 0:
             pct = (pre_val - post_val) / pre_val * 100
         else:
             pct = float('nan')
@@ -499,36 +504,52 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
         rows_html += f'<tr><td>{bin_label}</td><td>{len(pre)}</td><td>{len(post)}</td>'
 
         # accOA
-        acc_pre, acc_post = pre['accOA'].median(), post['accOA'].median()
+        acc_pre, acc_post = _med(pre['accOA']), _med(post['accOA'])
         pct, arrow, color = _imp(acc_pre, acc_post)
-        rows_html += (f'<td>{acc_pre:.4f}</td><td>{acc_post:.4f}</td>'
-                      f'<td style="color:{color}"><b>{arrow}{abs(pct):.1f}%</b></td>')
+        acc_pre_s  = f'{acc_pre:.4f}'  if not np.isnan(acc_pre)  else '—'
+        acc_post_s = f'{acc_post:.4f}' if not np.isnan(acc_post) else '—'
+        pct_s = f'{arrow}{abs(pct):.1f}%' if not np.isnan(pct) else '—'
+        rows_html += (f'<td>{acc_pre_s}</td><td>{acc_post_s}</td>'
+                      f'<td style="color:{color}"><b>{pct_s}</b></td>')
 
         # Total_vRMS
         if has_rms:
-            rms_pre, rms_post = pre['Total_vRMS'].median(), post['Total_vRMS'].median()
+            rms_pre, rms_post = _med(pre['Total_vRMS']), _med(post['Total_vRMS'])
             pct_r, arrow_r, color_r = _imp(rms_pre, rms_post)
-            rows_html += (f'<td>{rms_pre:.4f}</td><td>{rms_post:.4f}</td>'
-                          f'<td style="color:{color_r}"><b>{arrow_r}{abs(pct_r):.1f}%</b></td>')
+            rms_pre_s  = f'{rms_pre:.4f}'  if not np.isnan(rms_pre)  else '—'
+            rms_post_s = f'{rms_post:.4f}' if not np.isnan(rms_post) else '—'
+            pct_r_s = f'{arrow_r}{abs(pct_r):.1f}%' if not np.isnan(pct_r) else '—'
+            rows_html += (f'<td>{rms_pre_s}</td><td>{rms_post_s}</td>'
+                          f'<td style="color:{color_r}"><b>{pct_r_s}</b></td>')
 
-        # 電流（僅顯示中位數，確認前後負載是否真的相近）
+        # 電流（確認前後負載是否相近）
         if has_curr:
-            curr_pre  = pre[current_col].median()
-            curr_post = post[current_col].median()
-            diff_pct  = abs(curr_pre - curr_post) / curr_pre * 100 if curr_pre else float('nan')
-            curr_color = '#888' if diff_pct < 10 else '#c0392b'
-            rows_html += (f'<td>{curr_pre:.1f}</td><td>{curr_post:.1f}</td>'
-                          f'<td style="color:{curr_color}">'
-                          f'{"≈" if diff_pct < 10 else "⚠"}{diff_pct:.1f}%</td>')
+            curr_pre  = _med(pre[current_col])
+            curr_post = _med(post[current_col])
+            if not np.isnan(curr_pre) and curr_pre != 0 and not np.isnan(curr_post):
+                diff_pct  = abs(curr_pre - curr_post) / curr_pre * 100
+                curr_color = '#888' if diff_pct < 10 else '#c0392b'
+                diff_s = f'{"≈" if diff_pct < 10 else "⚠"}{diff_pct:.1f}%'
+            else:
+                diff_s, curr_color = '—', '#888'
+            curr_pre_s  = f'{curr_pre:.1f}'  if not np.isnan(curr_pre)  else '—'
+            curr_post_s = f'{curr_post:.1f}' if not np.isnan(curr_post) else '—'
+            rows_html += (f'<td>{curr_pre_s}</td><td>{curr_post_s}</td>'
+                          f'<td style="color:{curr_color}">{diff_s}</td>')
 
         # Health Score
         if has_hs:
-            hs_pre, hs_post = pre['health_score'].median(), post['health_score'].median()
-            hs_delta = hs_post - hs_pre
-            hs_color = '#157f3b' if hs_delta > 0 else '#c0392b'
-            rows_html += (f'<td>{hs_pre:.1f}</td><td>{hs_post:.1f}</td>'
-                          f'<td style="color:{hs_color}"><b>{"+" if hs_delta>=0 else ""}'
-                          f'{hs_delta:.1f}</b></td>')
+            hs_pre, hs_post = _med(pre['health_score']), _med(post['health_score'])
+            if not np.isnan(hs_pre) and not np.isnan(hs_post):
+                hs_delta = hs_post - hs_pre
+                hs_color = '#157f3b' if hs_delta > 0 else '#c0392b'
+                hs_s = f'{"+" if hs_delta >= 0 else ""}{hs_delta:.1f}'
+            else:
+                hs_delta, hs_color, hs_s = float('nan'), '#888', '—'
+            hs_pre_s  = f'{hs_pre:.1f}'  if not np.isnan(hs_pre)  else '—'
+            hs_post_s = f'{hs_post:.1f}' if not np.isnan(hs_post) else '—'
+            rows_html += (f'<td>{hs_pre_s}</td><td>{hs_post_s}</td>'
+                          f'<td style="color:{hs_color}"><b>{hs_s}</b></td>')
 
         rows_html += '</tr>\n'
 
