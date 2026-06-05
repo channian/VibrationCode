@@ -490,7 +490,9 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
         return pct, ('↓' if pct > 0 else '↑'), ('#157f3b' if pct > 0 else '#c0392b')
 
     rows_html = ''
-    for b in sorted(data['_bin'].unique()):
+    bins = sorted((b for b in data['_bin'].unique() if pd.notna(b)),
+                  key=lambda b: b.left if hasattr(b, 'left') else b)
+    for b in bins:
         sub = data[data['_bin'] == b]
         pre, post = sub[sub['_period'] == '前'], sub[sub['_period'] == '後']
         if pre.empty or post.empty:
