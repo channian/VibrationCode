@@ -302,10 +302,20 @@ def _plot_scatter(df: pd.DataFrame, device_id: str,
         time_norm = ((df['datetime'] - t_min).dt.total_seconds() / t_span).values
 
     def _trend(ax, x, y, color):
-        if len(x) >= 2:
-            z = np.polyfit(x, y, 1)
+        if len(x) < 2:
+            return
+        mask = np.isfinite(x) & np.isfinite(y)
+        x, y = x[mask], y[mask]
+        if len(x) < 2 or np.std(x) < 1e-10:
+            return
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                z = np.polyfit(x, y, 1)
             xr = np.linspace(x.min(), x.max(), 200)
             ax.plot(xr, np.poly1d(z)(xr), color=color, lw=2, ls='--')
+        except Exception:
+            pass
 
     for ri, (xcol, xunit) in enumerate(x_sources):
         for ci, ycol in enumerate(vib_targets):
@@ -419,10 +429,36 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
     group_label = f'頻率（{group_col}）' if is_freq else group_col
 
     # 整體分箱 → 前後共用相同邊界（這是「相同操作點」的關鍵）
+    # 策略 1：等樣本四分位
+    binned = False
+    bin_method = ''
     try:
-        data['_bin'] = pd.qcut(data[group_col], q=n_bins, duplicates='drop')
+        result = pd.qcut(data[group_col], q=n_bins, duplicates='drop')
+        if result.notna().sum() >= 10:          # qcut 有時對常數序列產出全 NaN
+            data['_bin'] = result
+            binned = True
+            bin_method = f'四分位（q={n_bins}）'
     except ValueError:
-        return '<p style="color:#888">（分組欄位值變異不足，無法分箱）</p>'
+        pass
+
+    # 策略 2（頻率專用）：round 到最近 5Hz 分組（適合固定幾個操作點的 VFD）
+    if not binned and is_freq:
+        step = 5.0
+        data['_bin'] = (data[group_col] / step).round() * step
+        n_unique = data['_bin'].nunique()
+        if n_unique >= 2:
+            binned = True
+            bin_method = f'每 {step}Hz 固定分組（{n_unique} 組）'
+        else:
+            data['_bin'] = 0
+            bin_method = f'頻率幾乎固定（{data[group_col].median():.1f} Hz），無法分組'
+
+    # 策略 3：fallback 單一 bin（仍輸出整體比較）
+    if not binned:
+        data['_bin'] = 0
+        bin_method = '無法分箱（全部視為同一組）'
+
+    logger.info(f"  保養分析分箱方式：{bin_method}")
 
     data['_period'] = np.where(data['datetime'] < split_date, '前', '後')
     has_rms  = 'Total_vRMS' in data.columns and data['Total_vRMS'].notna().any()
@@ -438,13 +474,17 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
         return pct, ('↓' if pct > 0 else '↑'), ('#157f3b' if pct > 0 else '#c0392b')
 
     rows_html = ''
-    for b in data['_bin'].cat.categories:
+    for b in sorted(data['_bin'].unique()):
         sub = data[data['_bin'] == b]
         pre, post = sub[sub['_period'] == '前'], sub[sub['_period'] == '後']
         if pre.empty or post.empty:
             continue
 
-        bin_label = f'{b.left:.1f} ~ {b.right:.1f}'
+        # Interval 型態顯示區間，數值型態（round分組）直接顯示
+        if hasattr(b, 'left'):
+            bin_label = f'{b.left:.1f} ~ {b.right:.1f}'
+        else:
+            bin_label = f'{b:.1f} Hz' if is_freq else f'{b:.1f}'
         rows_html += f'<tr><td>{bin_label}</td><td>{len(pre)}</td><td>{len(post)}</td>'
 
         # accOA
@@ -504,7 +544,7 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
 <p style="font-size:0.85em;color:#666">
   改善 = (前−後)/前；綠色↓振動下降（有效），紅色↑上升。{curr_note}
   {'HS 變化 = 後−前；綠色 + 代表健康分數回升。' if has_hs else ''}
-  分箱以「{group_col}」四分位切分，確保前後在<b>相同操作頻率</b>下比較。
+  分組依據：「{group_col}」，方式：{bin_method}。
 </p>"""
 
 
