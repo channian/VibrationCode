@@ -31,6 +31,7 @@ from src.filters import apply_all_filters
 from src.baseline_detector import resolve_baseline
 from src.health_model import VFDEdgeHealthModel
 from src.reporter import generate_report, generate_device_summary
+from src.scada_loader import load_other_data, load_tag_mapping, pivot_scada, merge_vib_scada
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,27 +58,28 @@ def _print_diagnose(device_id: str, df_scored: pd.DataFrame,
     print(f"  診斷報告：{device_id}")
     print(SEP)
 
-    # 1. Bin 邊界（電流工況分層）
-    print("\n【1】Load Bin 邊界（電流 A）")
+    # 1. Bin 邊界（工況分層）
+    bin_col  = getattr(model, '_bin_col', None) or 'current_A'
+    bin_unit = 'Hz' if any(k in bin_col.lower() for k in ('freq', 'hz', '頻率')) else 'A'
+    print(f"\n【1】Load Bin 邊界（{bin_col}  單位:{bin_unit}）")
     if model._bin_edges is not None:
         edges = model._bin_edges
         for i in range(len(edges) - 1):
-            print(f"  Bin {i}: {edges[i]:.2f} ~ {edges[i+1]:.2f} A")
-        # 評分期電流是否超出訓練範圍
-        if 'current_A' in df_scored.columns:
-            cur_min = df_scored['current_A'].min()
-            cur_max = df_scored['current_A'].max()
-            out_low  = cur_min < edges[0]
-            out_high = cur_max > edges[-1]
+            print(f"  Bin {i}: {edges[i]:.2f} ~ {edges[i+1]:.2f} {bin_unit}")
+        if bin_col in df_scored.columns:
+            col_min = df_scored[bin_col].min()
+            col_max = df_scored[bin_col].max()
+            out_low  = col_min < edges[0]
+            out_high = col_max > edges[-1]
             if out_low or out_high:
-                print(f"  ⚠️  評分期電流範圍 {cur_min:.1f}~{cur_max:.1f} A "
+                print(f"  ⚠️  評分期 {bin_col} 範圍 {col_min:.1f}~{col_max:.1f} {bin_unit} "
                       f"{'部分低於' if out_low else ''}{'部分高於' if out_high else ''}"
-                      f"訓練範圍 {edges[0]:.1f}~{edges[-1]:.1f} A\n"
+                      f"訓練範圍 {edges[0]:.1f}~{edges[-1]:.1f} {bin_unit}\n"
                       f"     → 超出範圍的資料強制分到邊界 Bin，負載補償可能失效")
             else:
-                print(f"  ✅ 評分期電流 {cur_min:.1f}~{cur_max:.1f} A 在訓練範圍內")
+                print(f"  ✅ 評分期 {bin_col} {col_min:.1f}~{col_max:.1f} {bin_unit} 在訓練範圍內")
     else:
-        print("  無電流資料，使用單一 Bin（不分層）")
+        print("  無工況欄位，使用單一 Bin（不分層）")
 
     # 2. 各 Bin 訓練參數
     print("\n【2】各 Bin 訓練參數")
@@ -169,6 +171,16 @@ def main():
         logger.error("沒有振動資料，請先把 CSV 放進 Vibration_Data/")
         sys.exit(1)
 
+    # ── SCADA 頻率資料（Other_Data + tag_mapping）─────────────
+    df_other = pd.DataFrame()
+    tag_map  = pd.DataFrame()
+    if os.path.exists('Other_Data') and os.path.exists('tag_mapping.csv'):
+        df_other = load_other_data('Other_Data')
+        tag_map  = load_tag_mapping('tag_mapping.csv')
+        if not df_other.empty:
+            logger.info(f"SCADA 已載入：{len(df_other):,} 筆，"
+                        f"{df_other['tagname'].nunique()} 個 tagname")
+
     name_to_tag = {}
     name_to_row = {}
     if not mapping.empty:
@@ -198,9 +210,24 @@ def main():
             logger.warning(f"{device_id}: 清洗後無有效資料，跳過")
             continue
 
+        # ── SCADA 頻率合併（清洗後、基準期偵測前）──────────────
+        df_merged = df_clean
+        if not df_other.empty and not tag_map.empty:
+            dev_tags = tag_map[tag_map['device_id'] == device_base]
+            if not dev_tags.empty:
+                df_dev_scada = df_other[df_other['tagname'].isin(dev_tags['tagname'].tolist())]
+                if not df_dev_scada.empty:
+                    try:
+                        df_wide   = pivot_scada(df_dev_scada, dev_tags)
+                        df_merged = merge_vib_scada(df_clean, df_wide)
+                        scada_cols = [c for c in df_wide.columns if c != 'datetime']
+                        logger.info(f"  SCADA 欄位已合併：{scada_cols}")
+                    except Exception as e:
+                        logger.warning(f"  SCADA 合併失敗，繼續不含 SCADA：{e}")
+
         # 基準期（自動偵測 Rank 1）
         df_baseline, is_manual = resolve_baseline(
-            df_clean,
+            df_merged,
             mapping_row,
             device_id=device_id,
             output_dir=CANDIDATE_DIR,
@@ -209,7 +236,7 @@ def main():
             logger.error(f"{device_id}: 無法取得基準期，跳過")
             continue
 
-        # 訓練
+        # 訓練（自動偵測頻率欄位 → 電流 → 單一 bin）
         try:
             model = VFDEdgeHealthModel()
             model.train(df_baseline)
@@ -219,7 +246,7 @@ def main():
 
         # 全量推論
         try:
-            df_scored = model.predict(df_clean)
+            df_scored = model.predict(df_merged)
         except Exception as e:
             logger.error(f"{device_id}: 推論失敗 — {e}")
             continue
@@ -230,10 +257,13 @@ def main():
 
         position = df_raw['position'].iloc[0]
 
-        # 輸出分數 CSV
+        # 輸出分數 CSV（動態加入 bin_col，如頻率欄位）
         out_cols = ['datetime', 'device_id', 'position', 'load_bin',
                     'Health_Score', 'health_score_smooth', 'alert_level',
                     'Total_vRMS', 'accOA', 'Crest_Factor', 'current_A']
+        bin_col = getattr(model, '_bin_col', None)
+        if bin_col and bin_col not in out_cols:
+            out_cols.append(bin_col)
         df_scored['device_id'] = device_id
         df_scored['position']  = position
         out_df = df_scored[[c for c in out_cols if c in df_scored.columns]]
@@ -241,7 +271,7 @@ def main():
         score_path = os.path.join(SCORE_DIR, f"{device_id}_scores.csv")
         out_df.to_csv(score_path, index=False)
 
-        # 統計摘要
+        # 統計摘要（df_baseline 的 datetime 比對 df_scored）
         baseline_avg = df_scored.loc[
             df_scored['datetime'].isin(df_baseline['datetime']), 'Health_Score'
         ].mean()

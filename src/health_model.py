@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 
 FEATURES = settings.FEATURES  # ['Total_vRMS', 'accOA', 'Crest_Factor']
 
+# 頻率欄位關鍵字（優先於電流做工況分層）
+_FREQ_KEYWORDS = ('頻率', 'freq', 'hz', 'frequency')
+
+
+def _detect_bin_col(df: pd.DataFrame) -> str | None:
+    """自動偵測分層欄位：頻率相關欄位優先，其次 current_A。"""
+    for col in df.columns:
+        if any(kw.lower() in col.lower() for kw in _FREQ_KEYWORDS):
+            if df[col].notna().sum() >= 10:
+                return col
+    if 'current_A' in df.columns and df['current_A'].notna().sum() >= 10:
+        return 'current_A'
+    return None
+
 
 # ──────────────────────────────────────────────────────────
 # 內部工具
@@ -102,11 +116,12 @@ class VFDEdgeHealthModel:
     VFD 設備振動健康評估模型 v2。
 
     Attributes:
-        load_bins       : 目標分層數（有電流時使用）
+        load_bins       : 目標分層數（有分層依據時使用）
         min_bin_samples : 每層最低樣本數，不足則合併
         _bins           : list[dict] 每層的模型參數
-        _bin_edges      : 電流分層邊界（pd.qcut 產出）
-        _has_current    : 訓練時是否有電流資料
+        _bin_col        : 分層依據欄位名稱（頻率 > 電流，None = 不分層）
+        _bin_edges      : 工況分層邊界（pd.qcut 產出）
+        _has_current    : backward compat 旗標（_bin_col is not None 時為 True）
         _features       : 實際使用的特徵欄位（訓練時確認存在的子集）
     """
 
@@ -115,20 +130,30 @@ class VFDEdgeHealthModel:
         self.load_bins       = load_bins
         self.min_bin_samples = min_bin_samples
         self._bins: list[dict] = []
+        self._bin_col: str | None = None
         self._bin_edges      = None
-        self._has_current    = False
+        self._has_current    = False   # backward compat
         self._features: list[str] = []
+
+    def __setstate__(self, state: dict) -> None:
+        """舊版 pickle 補齊 _bin_col（backward compat）。"""
+        self.__dict__.update(state)
+        if not hasattr(self, '_bin_col'):
+            self._bin_col = 'current_A' if getattr(self, '_has_current', False) else None
 
     # ── 訓練 ────────────────────────────────────────────────
 
-    def train(self, df_baseline: pd.DataFrame) -> None:
+    def train(self, df_baseline: pd.DataFrame,
+              bin_col: str | None = None) -> None:
         """
         以基準期資料訓練模型。
 
         Args:
             df_baseline: 已清洗的基準期 DataFrame
                          必有 FEATURES 欄位（允許部分 NaN）；
-                         選填 current_A 欄位（無則不分層）
+                         選填工況欄位（頻率或電流，無則不分層）
+            bin_col    : 明確指定分層欄位；若為 None 則自動偵測
+                         （頻率關鍵字欄位優先，其次 current_A）
         """
         if df_baseline.empty:
             raise ValueError("train(): df_baseline is empty")
@@ -138,19 +163,22 @@ class VFDEdgeHealthModel:
         if not self._features:
             raise ValueError(f"train(): none of {FEATURES} found in df_baseline")
 
-        self._has_current = (
-            'current_A' in df_baseline.columns
-            and df_baseline['current_A'].notna().any()
-        )
+        # 決定分層欄位
+        if bin_col and bin_col in df_baseline.columns and df_baseline[bin_col].notna().any():
+            self._bin_col = bin_col
+        else:
+            self._bin_col = _detect_bin_col(df_baseline)
+        self._has_current = self._bin_col is not None   # backward compat
 
-        # ── 電流分層 ────────────────────────────────────────
-        if self._has_current:
-            df_labeled, self._bin_edges = self._bin_by_current(df_baseline)
+        # ── 工況分層 ────────────────────────────────────────
+        if self._bin_col:
+            df_labeled, self._bin_edges = self._bin_by_col(df_baseline, self._bin_col)
+            logger.info(f"train: 分層依據欄位 = {self._bin_col!r}")
         else:
             df_labeled = df_baseline.copy()
             df_labeled['_bin'] = 0
             self._bin_edges = None
-            logger.info("train: no current data — using single bin")
+            logger.info("train: 無工況欄位 — 使用單一 bin")
 
         # ── 每層訓練 ────────────────────────────────────────
         self._bins = []
@@ -215,7 +243,7 @@ class VFDEdgeHealthModel:
         df = df.copy()
 
         # 分配 bin
-        if self._has_current and self._bin_edges is not None:
+        if self._bin_col and self._bin_edges is not None:
             df['load_bin'] = self._assign_bin(df)
         else:
             df['load_bin'] = 0
@@ -282,30 +310,28 @@ class VFDEdgeHealthModel:
 
     # ── 內部輔助 ────────────────────────────────────────────
 
-    def _bin_by_current(self, df: pd.DataFrame) -> tuple[pd.DataFrame, object]:
+    def _bin_by_col(self, df: pd.DataFrame, col: str) -> tuple[pd.DataFrame, object]:
         """
-        以 pd.qcut 等樣本數分層。
+        以 pd.qcut 等樣本數對指定欄位分層。
         若樣本不足則自動降低分層數，直到每層 >= min_bin_samples。
         """
-        cur = df['current_A'].dropna()
         n_bins = self.load_bins
 
         while n_bins >= 1:
             try:
                 labels, bin_edges = pd.qcut(
-                    df['current_A'],
+                    df[col],
                     q=n_bins,
                     labels=False,
                     retbins=True,
                     duplicates='drop',
                 )
-                # 確認每層都有足夠樣本
                 counts = labels.value_counts()
                 if counts.min() >= self.min_bin_samples:
                     df = df.copy()
                     df['_bin'] = labels.astype('Int64').fillna(0).astype(int)
                     logger.info(
-                        f"train: current binning → {n_bins} bin(s) "
+                        f"train: {col!r} binning → {n_bins} bin(s) "
                         f"(counts: {dict(counts.sort_index())})"
                     )
                     return df, bin_edges
@@ -313,10 +339,8 @@ class VFDEdgeHealthModel:
                 logger.debug(f"qcut n_bins={n_bins} failed: {e}")
             n_bins -= 1
 
-        # 退回單一 bin
         logger.warning(
-            f"train: all binning attempts failed — falling back to single bin "
-            f"(total samples: {len(df)})"
+            f"train: 所有分層嘗試失敗，退回單一 bin（總樣本：{len(df)}）"
         )
         df = df.copy()
         df['_bin'] = 0
@@ -324,19 +348,18 @@ class VFDEdgeHealthModel:
 
     def _assign_bin(self, df: pd.DataFrame) -> pd.Series:
         """
-        將推論資料的 current_A 分配到訓練時的 bin。
-        無電流 / 超出範圍 → bin 0。
+        將推論資料的 _bin_col 分配到訓練時的 bin。
+        無資料 / 超出範圍 → bin 0。
         """
-        if self._bin_edges is None or 'current_A' not in df.columns:
+        if self._bin_edges is None or not self._bin_col or self._bin_col not in df.columns:
             return pd.Series(0, index=df.index)
 
         bins = pd.cut(
-            df['current_A'],
+            df[self._bin_col],
             bins=self._bin_edges,
             labels=False,
             include_lowest=True,
         )
-        # 訓練 bin_edges 的最大 bin id
         max_bin = len(self._bin_edges) - 2
         result = bins.astype('Int64').fillna(0).astype(int).clip(0, max_bin)
         return result
