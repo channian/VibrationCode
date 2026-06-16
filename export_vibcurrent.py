@@ -6,7 +6,7 @@ export_vibcurrent.py — 振動 + 電流 資料匯出（CSV + 靜態 HTML）
   output/export/{device_id}.csv   — 對齊後的完整數值表
   output/export/{device_id}.html  — 靜態報告（時序圖 + 散佈圖 + 統計表）
 
-若 output/scores/{device_id}_scores.csv 存在，會一併納入 health_score；
+健康分數直接取自 Vibration_Data CSV 的 HealthScore 欄位；
 若 maintenance_log.csv 存在，會標示保養日期並做「相同負載下保養前後比較」。
 
 執行方式：
@@ -56,7 +56,6 @@ warnings.filterwarnings('ignore', message='Glyph.*missing', category=UserWarning
 OTHER_DATA_DIR   = 'Other_Data'
 TAG_MAPPING_PATH = 'tag_mapping.csv'
 MAINTENANCE_PATH = 'maintenance_log.csv'
-SCORE_DIR        = 'output/scores'
 OUTPUT_DIR       = 'output/export'
 DEFAULT_CURRENT_TYPE = '電流'
 
@@ -125,25 +124,6 @@ def load_maintenance_log(path: str) -> dict:
     logger.info(f"保養紀錄：{len(log)} 台設備，共 {sum(len(v) for v in log.values())} 筆")
     return log
 
-
-def load_health_score(device_id: str, score_dir: str = SCORE_DIR) -> pd.DataFrame | None:
-    """
-    讀取 output/scores/{device_id}_scores.csv 的 health_score。
-    回傳 df[['datetime', 'health_score']]，不存在則回傳 None。
-    """
-    path = os.path.join(score_dir, f"{device_id}_scores.csv")
-    if not os.path.exists(path):
-        return None
-    try:
-        df = safe_read_csv(path)
-    except Exception as e:
-        logger.warning(f"{device_id}: health_score 讀取失敗 — {e}")
-        return None
-    if 'datetime' not in df.columns or 'health_score' not in df.columns:
-        return None
-    df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
-    out = df[['datetime', 'health_score']].dropna(subset=['datetime'])
-    return out if not out.empty else None
 
 
 # ── 圖表工具 ─────────────────────────────────────────────────
@@ -816,19 +796,13 @@ def export_device(device_id: str,
         logger.warning(f"{device_id}: 開機篩選後無資料，跳過")
         return False
 
-    # ── 合併 health_score（若 output/scores/ 已有評分結果）──
-    hs = load_health_score(device_id)
-    if hs is not None:
-        df_vib = pd.merge_asof(
-            df_vib.sort_values('datetime'),
-            hs.sort_values('datetime'),
-            on='datetime', tolerance=MERGE_TOL, direction='nearest',
-        )
+    # ── HealthScore（直接來自 Vibration_Data CSV 欄位）──
+    if 'HealthScore' in df_vib.columns and 'health_score' not in df_vib.columns:
+        df_vib = df_vib.rename(columns={'HealthScore': 'health_score'})
         n_hs = df_vib['health_score'].notna().sum()
-        logger.info(f"  health_score 對齊：{n_hs}/{len(df_vib)} 筆")
-    else:
-        logger.info(f"  無 {device_id}_scores.csv，HTML 不含健康分數"
-                    f"（可先跑 test_model.py 產生）")
+        logger.info(f"  HealthScore（振動CSV）：{n_hs}/{len(df_vib)} 筆")
+    elif 'health_score' not in df_vib.columns:
+        logger.info(f"  Vibration_Data 無 HealthScore 欄位，HTML 不含健康分數")
 
     # ── 保養事件（用基底名查；套用到 M1/M2 兩個量測點）──
     maint_events = []
