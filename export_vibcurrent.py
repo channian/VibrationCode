@@ -65,6 +65,9 @@ FREQ_COL_KEYWORDS    = ('頻率', 'freq', 'hz', 'frequency')
 LOAD_COL_KEYWORDS    = ('輸入功率', 'power', '功率')
 CURRENT_COL_KEYWORDS = ('電流', 'current', '安培', 'amp')
 
+# 振動衍生特徵欄位前綴（排除於 SCADA 欄位自動偵測，避免 accmeanpeakfreq 誤判為頻率）
+_VIB_COL_PREFIXES = ('acc', 'total_v', 'crest_', 'health', 'load_bin', 'alert_')
+
 _FONT_READY = False
 
 
@@ -212,7 +215,12 @@ def _plot_timeseries(df: pd.DataFrame, device_id: str,
         ax2.set_ylabel(f'{current_col} (A)', color='crimson')
         ax2.tick_params(axis='y', labelcolor='crimson')
         ax2.grid(True, alpha=0.3)
-        freq_col = next((c for c in df.columns if '頻率' in c or 'freq' in c.lower()), None)
+        freq_col = next(
+            (c for c in df.columns
+             if ('頻率' in c or 'freq' in c.lower())
+             and not any(c.lower().startswith(p) for p in _VIB_COL_PREFIXES)),
+            None
+        )
         if freq_col:
             ax2r = ax2.twinx()
             ax2r.plot(df['datetime'], df[freq_col],
@@ -368,8 +376,10 @@ def _stats_table_html(df: pd.DataFrame, cols: list[str]) -> str:
 
 
 def _find_col_by_keywords(df: pd.DataFrame, keywords: tuple) -> str | None:
-    """依關鍵字清單找第一個有足夠資料的欄位（不分大小寫）。"""
+    """依關鍵字清單找第一個有足夠資料的 SCADA 欄位（排除振動衍生特徵欄位）。"""
     for c in df.columns:
+        if any(c.lower().startswith(p) for p in _VIB_COL_PREFIXES):
+            continue  # 跳過振動特徵欄位（如 accmeanpeakfreq）
         if any(kw.lower() in c.lower() for kw in keywords):
             if df[c].notna().sum() >= 10:
                 return c

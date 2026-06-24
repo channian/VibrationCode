@@ -31,10 +31,23 @@ FEATURES = settings.FEATURES  # ['Total_vRMS', 'accOA', 'Crest_Factor']
 # 頻率欄位關鍵字（優先於電流做工況分層）
 _FREQ_KEYWORDS = ('頻率', 'freq', 'hz', 'frequency')
 
+# 振動衍生特徵欄位前綴（排除於工況欄位自動偵測，避免 accmeanpeakfreq 誤判）
+_VIB_COL_PREFIXES = ('acc', 'total_v', 'crest_', 'health', 'load_bin', 'alert_')
+
+
+def _is_vib_col(col: str) -> bool:
+    """判斷欄位是否屬於振動衍生特徵，不應被誤判為 SCADA 工況欄位。"""
+    col_l = col.lower()
+    return col in FEATURES or any(col_l.startswith(p) for p in _VIB_COL_PREFIXES)
+
 
 def _detect_bin_col(df: pd.DataFrame) -> str | None:
-    """自動偵測分層欄位：頻率相關欄位優先，其次 current_A。"""
+    """自動偵測分層欄位：頻率相關欄位優先，其次 current_A。
+    振動衍生特徵欄位（如 accmeanpeakfreq）會被排除在外。
+    """
     for col in df.columns:
+        if _is_vib_col(col):
+            continue  # 跳過振動特徵欄位
         if any(kw.lower() in col.lower() for kw in _FREQ_KEYWORDS):
             if df[col].notna().sum() >= 10:
                 return col
