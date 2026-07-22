@@ -66,7 +66,12 @@ LOAD_COL_KEYWORDS    = ('輸入功率', 'power', '功率')
 CURRENT_COL_KEYWORDS = ('電流', 'current', '安培', 'amp')
 
 # 振動衍生特徵欄位前綴（排除於 SCADA 欄位自動偵測，避免 accmeanpeakfreq 誤判為頻率）
-_VIB_COL_PREFIXES = ('acc', 'total_v', 'crest_', 'health', 'load_bin', 'alert_')
+_VIB_COL_PREFIXES = ('acc', 'total_v', 'crest_', 'health', 'load_bin', 'alert_', 'vel')
+
+# 顯示/比較用的振動指標（原始感測器彙整欄位，非三軸分量）
+# 注意：compute_derived() 內部仍會算 Total_vRMS / Crest_Factor 供開機判斷與突波過濾使用，
+# 這裡只是「報表要顯示/比較哪些欄位」，不影響清洗管線
+DISPLAY_METRICS = ['velRMS', 'velOA', 'accRMS', 'accOA']
 
 _FONT_READY = False
 
@@ -171,17 +176,18 @@ def _plot_timeseries(df: pd.DataFrame, device_id: str,
                      current_col: str | None,
                      maint_events: list | None = None) -> str:
     """
-    時序圖（最多 3 列）：
-      ① Total_vRMS [+ accOA 次軸]
-      ② 電流（若有）[+ 頻率 次軸（若有）]
-      ③ health_score（若有）
+    時序圖：
+      ① 速度：velRMS [+ velOA 次軸]
+      ② 加速度：accRMS [+ accOA 次軸]
+      ③ 電流（若有）[+ 頻率 次軸（若有）]
+      ④ health_score（若有）
     各列以紅虛線標示保養日期。
     """
     _setup_font()
     maint_events = maint_events or []
     has_current = bool(current_col and current_col in df.columns and df[current_col].notna().any())
     has_health  = bool('health_score' in df.columns and df['health_score'].notna().any())
-    nrows = 1 + int(has_current) + int(has_health)
+    nrows = 2 + int(has_current) + int(has_health)
 
     fig, axes = plt.subplots(nrows, 1, figsize=(13, 3.6 * nrows), sharex=False)
     if nrows == 1:
@@ -189,25 +195,43 @@ def _plot_timeseries(df: pd.DataFrame, device_id: str,
     axes = list(np.atleast_1d(axes))
     ai = 0
 
-    # ── ① 振動 ──
+    # ── ① 速度 ──
     ax1 = axes[ai]; ai += 1
-    if 'Total_vRMS' in df.columns:
-        ax1.plot(df['datetime'], df['Total_vRMS'],
-                 color='steelblue', lw=1, label='Total vRMS (mm/s)')
-    ax1.set_ylabel('Total vRMS (mm/s)', color='steelblue')
+    if 'velRMS' in df.columns:
+        ax1.plot(df['datetime'], df['velRMS'],
+                 color='steelblue', lw=1, label='velRMS (mm/s)')
+    ax1.set_ylabel('velRMS (mm/s)', color='steelblue')
     ax1.tick_params(axis='y', labelcolor='steelblue')
     ax1.grid(True, alpha=0.3)
-    if 'accOA' in df.columns:
+    if 'velOA' in df.columns:
         ax1r = ax1.twinx()
-        ax1r.plot(df['datetime'], df['accOA'],
-                  color='darkorange', lw=0.8, alpha=0.7, label='accOA (g)')
-        ax1r.set_ylabel('accOA (g)', color='darkorange')
+        ax1r.plot(df['datetime'], df['velOA'],
+                  color='darkorange', lw=0.8, alpha=0.7, label='velOA (mm/s)')
+        ax1r.set_ylabel('velOA (mm/s)', color='darkorange')
         ax1r.tick_params(axis='y', labelcolor='darkorange')
-    ax1.set_title(f"{device_id}  —  振動時序", fontsize=11)
+    ax1.set_title(f"{device_id}  —  速度時序", fontsize=11)
     _mark_maintenance(ax1, maint_events)
     _x_fmt(ax1, df['datetime'])
 
-    # ── ② 電流 ──
+    # ── ② 加速度 ──
+    ax2v = axes[ai]; ai += 1
+    if 'accRMS' in df.columns:
+        ax2v.plot(df['datetime'], df['accRMS'],
+                  color='steelblue', lw=1, label='accRMS (g)')
+    ax2v.set_ylabel('accRMS (g)', color='steelblue')
+    ax2v.tick_params(axis='y', labelcolor='steelblue')
+    ax2v.grid(True, alpha=0.3)
+    if 'accOA' in df.columns:
+        ax2vr = ax2v.twinx()
+        ax2vr.plot(df['datetime'], df['accOA'],
+                   color='darkorange', lw=0.8, alpha=0.7, label='accOA (g)')
+        ax2vr.set_ylabel('accOA (g)', color='darkorange')
+        ax2vr.tick_params(axis='y', labelcolor='darkorange')
+    ax2v.set_title(f"{device_id}  —  加速度時序", fontsize=11)
+    _mark_maintenance(ax2v, maint_events)
+    _x_fmt(ax2v, df['datetime'])
+
+    # ── ③ 電流 ──
     if has_current:
         ax2 = axes[ai]; ai += 1
         ax2.plot(df['datetime'], df[current_col],
@@ -231,7 +255,7 @@ def _plot_timeseries(df: pd.DataFrame, device_id: str,
         _mark_maintenance(ax2, maint_events)
         _x_fmt(ax2, df['datetime'])
 
-    # ── ③ 健康分數 ──
+    # ── ④ 健康分數 ──
     if has_health:
         ax3 = axes[ai]; ai += 1
         ax3.plot(df['datetime'], df['health_score'],
@@ -267,7 +291,7 @@ def _plot_scatter(df: pd.DataFrame, device_id: str,
     if not has_freq and not has_curr:
         return None
 
-    vib_targets = [c for c in ['Total_vRMS', 'accOA']
+    vib_targets = [c for c in DISPLAY_METRICS
                    if c in df.columns and df[c].notna().any()]
     if not vib_targets:
         return None
@@ -406,7 +430,7 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
     """
     相同操作點下的保養前後比較表。
     以 group_col（頻率優先 > 功率 > 電流）分箱，前後共用相同區間，
-    比較各箱的 accOA、Total_vRMS、電流（確認負載一致）、health_score 中位數。
+    比較各箱的 velRMS/velOA/accRMS/accOA、電流（確認負載一致）、health_score 中位數。
     """
     if group_col is None or group_col not in df.columns:
         return '<p style="color:#888">（無頻率/負載欄位，無法進行分組比較）</p>'
@@ -462,7 +486,7 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
                 f'資料最新至 {dmax.date()}，無保養後資料可比較。'
                 f'請確認 maintenance_log.csv 的日期是否正確。</p>')
 
-    has_rms  = 'Total_vRMS' in data.columns and data['Total_vRMS'].notna().any()
+    vib_cols = [c for c in DISPLAY_METRICS if c in data.columns and data[c].notna().any()]
     has_curr = bool(current_col and current_col in data.columns
                     and data[current_col].notna().any())
     has_hs   = 'health_score' in data.columns and data['health_score'].notna().any()
@@ -495,24 +519,15 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
             bin_label = f'{b:.1f} Hz' if is_freq else f'{b:.1f}'
         rows_html += f'<tr><td>{bin_label}</td><td>{len(pre)}</td><td>{len(post)}</td>'
 
-        # accOA
-        acc_pre, acc_post = _med(pre['accOA']), _med(post['accOA'])
-        pct, arrow, color = _imp(acc_pre, acc_post)
-        acc_pre_s  = f'{acc_pre:.4f}'  if not np.isnan(acc_pre)  else '—'
-        acc_post_s = f'{acc_post:.4f}' if not np.isnan(acc_post) else '—'
-        pct_s = f'{arrow}{abs(pct):.1f}%' if not np.isnan(pct) else '—'
-        rows_html += (f'<td>{acc_pre_s}</td><td>{acc_post_s}</td>'
-                      f'<td style="color:{color}"><b>{pct_s}</b></td>')
-
-        # Total_vRMS
-        if has_rms:
-            rms_pre, rms_post = _med(pre['Total_vRMS']), _med(post['Total_vRMS'])
-            pct_r, arrow_r, color_r = _imp(rms_pre, rms_post)
-            rms_pre_s  = f'{rms_pre:.4f}'  if not np.isnan(rms_pre)  else '—'
-            rms_post_s = f'{rms_post:.4f}' if not np.isnan(rms_post) else '—'
-            pct_r_s = f'{arrow_r}{abs(pct_r):.1f}%' if not np.isnan(pct_r) else '—'
-            rows_html += (f'<td>{rms_pre_s}</td><td>{rms_post_s}</td>'
-                          f'<td style="color:{color_r}"><b>{pct_r_s}</b></td>')
+        # velRMS / velOA / accRMS / accOA
+        for vc in vib_cols:
+            v_pre, v_post = _med(pre[vc]), _med(post[vc])
+            pct, arrow, color = _imp(v_pre, v_post)
+            v_pre_s  = f'{v_pre:.4f}'  if not np.isnan(v_pre)  else '—'
+            v_post_s = f'{v_post:.4f}' if not np.isnan(v_post) else '—'
+            pct_s = f'{arrow}{abs(pct):.1f}%' if not np.isnan(pct) else '—'
+            rows_html += (f'<td>{v_pre_s}</td><td>{v_post_s}</td>'
+                          f'<td style="color:{color}"><b>{pct_s}</b></td>')
 
         # 電流（確認前後負載是否相近）
         if has_curr:
@@ -560,7 +575,7 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
                 f'各區間前/後筆數：{diag_str}。<br>'
                 f'可能原因：保養前後的操作頻率範圍不重疊，或某一側資料量不足。</p>')
 
-    rms_head  = '<th>RMS前</th><th>RMS後</th><th>RMS改善</th>'          if has_rms  else ''
+    vib_head  = ''.join(f'<th>{vc}前</th><th>{vc}後</th><th>{vc}改善</th>' for vc in vib_cols)
     curr_head = f'<th>電流前(A)</th><th>電流後(A)</th><th>電流差異</th>' if has_curr else ''
     hs_head   = '<th>HS前</th><th>HS後</th><th>HS變化</th>'              if has_hs   else ''
 
@@ -571,8 +586,7 @@ def _maintenance_effect_table(df: pd.DataFrame, group_col: str | None,
 <table class="stats">
   <thead>
     <tr><th>{group_label} 區間</th><th>n前</th><th>n後</th>
-        <th>accOA前</th><th>accOA後</th><th>accOA改善</th>
-        {rms_head}{curr_head}{hs_head}</tr>
+        {vib_head}{curr_head}{hs_head}</tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
@@ -592,7 +606,7 @@ def _build_html(device_id: str, df: pd.DataFrame,
                   f"{df['datetime'].max().strftime('%Y-%m-%d')}")
 
     display_cols = [c for c in
-                    ['Total_vRMS', 'accOA', 'Crest_Factor', 'health_score', current_col]
+                    DISPLAY_METRICS + ['health_score', current_col]
                     if c and c in df.columns]
 
     stats_html = _stats_table_html(df, display_cols)
