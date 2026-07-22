@@ -128,6 +128,29 @@ def _resolve_col(cols: list, keywords: tuple) -> str | None:
     return None
 
 
+# ── 檔案寫入保護（Windows 常見：目標檔案被 Excel 等程式開著鎖住）────
+
+def _safe_write_csv(df: pd.DataFrame, path: str) -> bool:
+    try:
+        df.to_csv(path, index=False)
+        return True
+    except PermissionError:
+        logger.error(f"  ✗ 無法寫入 {path}（檔案可能被其他程式開著，例如 Excel）。"
+                    f"請關閉該檔案後重跑，已跳過此檔案。")
+        return False
+
+
+def _safe_write_text(text: str, path: str) -> bool:
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return True
+    except PermissionError:
+        logger.error(f"  ✗ 無法寫入 {path}（檔案可能被其他程式開著，例如瀏覽器）。"
+                    f"請關閉該檔案後重跑，已跳過此檔案。")
+        return False
+
+
 # ── tagname 對應 ─────────────────────────────────────────────
 
 def _tagname_for(dev_tags: pd.DataFrame, variable_type: str) -> str | None:
@@ -325,7 +348,7 @@ def analyze_device(device_id: str, df_other: pd.DataFrame, tag_map: pd.DataFrame
            if gap_frames else pd.DataFrame(columns=['tag', 'gap_start', 'gap_end', 'gap_hours']))
 
     gaps_path = os.path.join(output_dir, f"{device_id}_gaps.csv")
-    gaps.to_csv(gaps_path, index=False)
+    _safe_write_csv(gaps, gaps_path)
     if not gaps.empty:
         total_gap_hr = gaps['gap_hours'].sum()
         logger.warning(f"  ⚠ 偵測到 {len(gaps)} 段資料缺漏，合計 {total_gap_hr:.1f} 小時，"
@@ -349,8 +372,8 @@ def analyze_device(device_id: str, df_other: pd.DataFrame, tag_map: pd.DataFrame
                 f"{daily['datetime'].max().date()}）")
 
     csv_path = os.path.join(output_dir, f"{device_id}_daily.csv")
-    daily.to_csv(csv_path, index=False)
-    logger.info(f"  每日比功率 CSV → {csv_path}")
+    if _safe_write_csv(daily, csv_path):
+        logger.info(f"  每日比功率 CSV → {csv_path}")
 
     # ── 保養事件 ──
     maint_events = maint_log.get(device_id, [])
@@ -419,9 +442,8 @@ def analyze_device(device_id: str, df_other: pd.DataFrame, tag_map: pd.DataFrame
     img_ts = plot_timeseries(daily, device_id, maint_events)
     html = _build_html(device_id, daily, img_ts, comparison_html, gaps_html)
     html_path = os.path.join(output_dir, f"{device_id}_report.html")
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(html)
-    logger.info(f"  HTML → {html_path}")
+    if _safe_write_text(html, html_path):
+        logger.info(f"  HTML → {html_path}")
     return True
 
 
