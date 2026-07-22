@@ -84,13 +84,14 @@ def load_metrics(path: str) -> pd.DataFrame:
 
 
 def compare(before: pd.DataFrame, after: pd.DataFrame) -> pd.DataFrame:
-    """依欄位計算保養前後統計量與變化率（%）。變化率 = (後-前)/前 × 100。"""
+    """依欄位計算保養前後統計量、差異與變化率（%）。差異 = 後-前，變化率 = 差異/前 × 100。"""
     rows = []
     for m in METRICS:
         b = before[m].dropna()
         a = after[m].dropna()
         b_mean, a_mean = float(b.mean()), float(a.mean())
-        pct = (a_mean - b_mean) / b_mean * 100 if b_mean else float('nan')
+        diff = a_mean - b_mean
+        pct = diff / b_mean * 100 if b_mean else float('nan')
         rows.append({
             '欄位':        m,
             '保養前_筆數':  len(b),
@@ -101,9 +102,17 @@ def compare(before: pd.DataFrame, after: pd.DataFrame) -> pd.DataFrame:
             '保養後_平均':  round(a_mean, 5),
             '保養後_中位數': round(float(a.median()), 5),
             '保養後_標準差': round(float(a.std()), 5),
+            '差異':        round(diff, 5),
             '變化率(%)':    round(pct, 1),
         })
     return pd.DataFrame(rows)
+
+
+def build_diff_table(cmp_df: pd.DataFrame) -> pd.DataFrame:
+    """從完整彙整表擷取精簡版差異表（欄位/保養前/保養後/差異/變化率），方便直接貼進報告或投影片。"""
+    diff_df = cmp_df[['欄位', '保養前_平均', '保養後_平均', '差異', '變化率(%)']].copy()
+    diff_df = diff_df.rename(columns={'保養前_平均': '保養前', '保養後_平均': '保養後'})
+    return diff_df
 
 
 # ── 圖表 ────────────────────────────────────────────────────
@@ -158,7 +167,13 @@ def main():
     cmp_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     logger.info(f"彙整表 → {csv_path}")
 
+    diff_df = build_diff_table(cmp_df)
+    diff_path = os.path.join(OUTPUT_DIR, f"{args.label}_diff.csv")
+    diff_df.to_csv(diff_path, index=False, encoding='utf-8-sig')
+    logger.info(f"差異表 → {diff_path}")
+
     print('\n' + cmp_df.to_string(index=False))
+    print('\n' + diff_df.to_string(index=False))
 
     png_path = os.path.join(OUTPUT_DIR, f"{args.label}_compare.png")
     plot_compare(cmp_df, args.label, png_path)
