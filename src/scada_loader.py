@@ -170,3 +170,60 @@ def merge_vib_scada(df_vib: pd.DataFrame,
     matched = merged[scada_cols].notna().any(axis=1).sum() if scada_cols else 0
     logger.info(f"  merge_asof: vib {len(vib)} 筆，SCADA 對齊 {matched} 筆")
     return merged
+
+
+# ── 累積值處理（用電量／流量／運轉時數等 counter 型欄位）──────
+
+def diff_cumulative(df_wide: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """
+    對累積式欄位（用電量、流量、運轉時數等）逐筆差分，取得區間增量。
+
+    負值 diff（計數器歸零/重置）視為異常，該筆增量捨棄（設為 NaN），
+    避免把「重置」誤算成負消耗。
+
+    新增欄位：d_{col}（區間增量，NaN 表示該筆無法計算 — 首筆或重置後）
+    """
+    df = df_wide.sort_values('datetime').reset_index(drop=True).copy()
+    for col in cols:
+        if col not in df.columns:
+            logger.warning(f"diff_cumulative: 找不到欄位 {col!r}，跳過")
+            continue
+        delta = df[col].diff()
+        n_reset = int((delta < 0).sum())
+        if n_reset:
+            logger.warning(f"  {col!r}: 偵測到 {n_reset} 次計數器歸零/重置，該筆增量已捨棄")
+        df[f'd_{col}'] = delta.where(delta >= 0)
+    return df
+
+
+def detect_data_gaps(df_wide: pd.DataFrame,
+                     expected_interval_min: float = 2.0,
+                     gap_factor: float = 3.0) -> pd.DataFrame:
+    """
+    掃描 datetime 欄位，找出明顯大於預期取樣間隔的斷點（資料缺漏時段）。
+
+    Args:
+        expected_interval_min: 預期取樣間隔（分鐘）
+        gap_factor: 間隔超過 expected_interval_min * gap_factor 才算缺漏
+
+    Returns:
+        DataFrame[gap_start, gap_end, gap_hours]，依缺漏長度由大到小排序
+    """
+    dt = df_wide['datetime'].dropna().sort_values().reset_index(drop=True)
+    if len(dt) < 2:
+        return pd.DataFrame(columns=['gap_start', 'gap_end', 'gap_hours'])
+
+    diff_min = dt.diff().dt.total_seconds() / 60.0
+    threshold = expected_interval_min * gap_factor
+    gap_idx = diff_min[diff_min > threshold].index
+
+    rows = [{
+        'gap_start': dt.iloc[i - 1],
+        'gap_end':   dt.iloc[i],
+        'gap_hours': round(diff_min.iloc[i] / 60.0, 2),
+    } for i in gap_idx]
+
+    result = pd.DataFrame(rows, columns=['gap_start', 'gap_end', 'gap_hours'])
+    if not result.empty:
+        result = result.sort_values('gap_hours', ascending=False).reset_index(drop=True)
+    return result
