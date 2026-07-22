@@ -9,9 +9,12 @@ analyze_health_score.py — 全設備 HealthScore 平均分數與趨勢分析
     python analyze_health_score.py
     python analyze_health_score.py --device ZP1_2_M1
     python analyze_health_score.py --recent-days 30   # 近期窗口天數，預設 30
+    python analyze_health_score.py --daily-days 60    # 全設備每日平均天數，預設 60
 
 輸出：
     output/health_score/all_devices_summary.csv
+    output/health_score/all_devices_valid_scores.csv  — 全設備原始有效分數時序
+    output/health_score/daily_fleet_average.csv        — 過去 N 天，每天全部設備的平均分數
     output/health_score/trend_grid.png     — 全設備小圖矩陣（時序 + 趨勢線）
     output/health_score/report.html
 """
@@ -244,6 +247,76 @@ def plot_mean_bar(results: list[dict]) -> str:
     return _fig_to_b64(fig)
 
 
+# ── 全設備每日平均 ───────────────────────────────────────────
+
+def build_daily_fleet_average(results: list[dict], days: int) -> pd.DataFrame:
+    """
+    過去 N 天，每天「全部設備」的平均分數。
+
+    先算各設備當天自己的平均，再對設備數取平均（每台設備權重相同），
+    避免採樣頻率較高的設備稀釋/主導當天的整體分數。
+    天數窗口以全體資料中最新的日期為基準（不是系統當前日期）。
+
+    Returns:
+        DataFrame[date, avg_score, n_devices]
+    """
+    per_device_daily = []
+    for r in results:
+        s = r['_valid_series'].copy()
+        s['date'] = s['datetime'].dt.floor('D')
+        daily = s.groupby('date')['score'].mean().rename(r['device_id'])
+        per_device_daily.append(daily)
+
+    wide = pd.concat(per_device_daily, axis=1).sort_index()
+
+    max_date = wide.index.max()
+    cutoff = max_date - pd.Timedelta(days=days - 1)
+    wide = wide[wide.index >= cutoff]
+
+    out = pd.DataFrame({
+        'date':      wide.index,
+        'avg_score': wide.mean(axis=1, skipna=True).round(2).values,
+        'n_devices': wide.notna().sum(axis=1).values,
+    })
+    return out.reset_index(drop=True)
+
+
+def plot_daily_fleet(daily_df: pd.DataFrame, total_devices: int, path: str) -> None:
+    """過去 N 天全設備平均分數折線圖（上）+ 當天回報設備數（下，診斷用）。"""
+    _setup_font()
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6), sharex=True,
+                                   gridspec_kw={'height_ratios': [3, 1]})
+
+    ax1.plot(daily_df['date'], daily_df['avg_score'], color='seagreen', lw=1.3, marker='o', markersize=3)
+    ax1.axhline(settings.ALERT_NORMAL, color='gray', ls=':', lw=0.8, alpha=0.7,
+               label=f"Normal({settings.ALERT_NORMAL})")
+    ax1.axhline(settings.ALERT_WARNING, color='darkorange', ls=':', lw=0.8, alpha=0.7,
+               label=f"Warning({settings.ALERT_WARNING})")
+    ax1.set_ylim(0, 105)
+    ax1.set_ylabel('全設備平均 HealthScore')
+    ax1.set_title(f'過去 {len(daily_df)} 天  全設備每日平均分數', fontsize=12)
+    ax1.legend(fontsize=8, loc='lower left')
+    ax1.grid(True, alpha=0.3)
+
+    ax2.bar(daily_df['date'], daily_df['n_devices'], color='steelblue', alpha=0.6, width=0.8)
+    ax2.axhline(total_devices, color='crimson', ls='--', lw=0.8, alpha=0.7)
+    ax2.set_ylabel('當天回報設備數', fontsize=9)
+    ax2.set_ylim(0, total_devices + 1)
+    ax2.grid(True, alpha=0.3)
+
+    fmt = mdates.DateFormatter('%Y/%m/%d')
+    ax2.xaxis.set_major_formatter(fmt)
+    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha='right')
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        fig.savefig(path, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"全設備每日平均圖 → {path}")
+
+
 # ── HTML ────────────────────────────────────────────────────
 
 def _summary_table_html(results: list[dict]) -> str:
@@ -278,9 +351,11 @@ def _summary_table_html(results: list[dict]) -> str:
 </table>"""
 
 
-def build_report(results: list[dict], img_bar: str, img_grid_path: str, recent_days: int) -> str:
+def build_report(results: list[dict], img_bar: str, img_grid_path: str,
+                 img_daily_path: str, daily_days: int) -> str:
     summary_html = _summary_table_html(results)
     grid_b64 = base64.b64encode(open(img_grid_path, 'rb').read()).decode('utf-8')
+    daily_b64 = base64.b64encode(open(img_daily_path, 'rb').read()).decode('utf-8')
 
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -315,6 +390,11 @@ def build_report(results: list[dict], img_bar: str, img_grid_path: str, recent_d
 <h2>設備彙整表</h2>
 {summary_html}
 
+<h2>過去 {daily_days} 天　全設備每日平均分數</h2>
+<p>先算各設備當天自己的平均，再對設備數取平均（每台設備權重相同），避免採樣頻率較高的
+設備稀釋整體分數；下方回報設備數可用來檢查某天分數異常是否為資料涵蓋率不足所致。</p>
+<img src="data:image/png;base64,{daily_b64}">
+
 <h2>各設備趨勢圖</h2>
 <img src="data:image/png;base64,{grid_b64}">
 
@@ -330,6 +410,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default=None, help='只分析指定 device_id')
     parser.add_argument('--recent-days', type=int, default=30, help='近期窗口天數，預設 30')
+    parser.add_argument('--daily-days', type=int, default=60, help='全設備每日平均天數，預設 60')
     args = parser.parse_args()
 
     vib_data = load_vibration('Vibration_Data')
@@ -372,11 +453,19 @@ def main():
     detail_df.to_csv(detail_path, index=False, encoding='utf-8-sig')
     logger.info(f"原始有效分數時序 → {detail_path}（{len(detail_df)} 筆，已排除 0 分/缺值）")
 
+    daily_df = build_daily_fleet_average(results, args.daily_days)
+    daily_path = os.path.join(OUTPUT_DIR, 'daily_fleet_average.csv')
+    daily_df.to_csv(daily_path, index=False, encoding='utf-8-sig')
+    logger.info(f"全設備每日平均 → {daily_path}（{len(daily_df)} 天）")
+
+    daily_img_path = os.path.join(OUTPUT_DIR, 'daily_fleet_average.png')
+    plot_daily_fleet(daily_df, len(results), daily_img_path)
+
     grid_path = os.path.join(OUTPUT_DIR, 'trend_grid.png')
     plot_trend_grid(results, grid_path)
 
     img_bar = plot_mean_bar(results)
-    html = build_report(results, img_bar, grid_path, args.recent_days)
+    html = build_report(results, img_bar, grid_path, daily_img_path, args.daily_days)
     html_path = os.path.join(OUTPUT_DIR, 'report.html')
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
