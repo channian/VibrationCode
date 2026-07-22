@@ -362,6 +362,16 @@ def main():
     summary_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     logger.info(f"彙整表 → {csv_path}")
 
+    detail_frames = []
+    for r in results:
+        s = r['_valid_series'].copy()
+        s.insert(0, 'device_id', r['device_id'])
+        detail_frames.append(s)
+    detail_df = pd.concat(detail_frames, ignore_index=True)
+    detail_path = os.path.join(OUTPUT_DIR, 'all_devices_valid_scores.csv')
+    detail_df.to_csv(detail_path, index=False, encoding='utf-8-sig')
+    logger.info(f"原始有效分數時序 → {detail_path}（{len(detail_df)} 筆，已排除 0 分/缺值）")
+
     grid_path = os.path.join(OUTPUT_DIR, 'trend_grid.png')
     plot_trend_grid(results, grid_path)
 
