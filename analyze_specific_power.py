@@ -39,8 +39,8 @@ from matplotlib import font_manager
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.data_loader import safe_read_csv
-from src.scada_loader import (load_other_data, load_tag_mapping, pivot_scada,
-                               diff_cumulative, detect_data_gaps)
+from src.scada_loader import (load_other_data, load_tag_mapping,
+                               daily_sum_by_tag, detect_data_gaps)
 from config import settings
 
 logging.basicConfig(
@@ -62,8 +62,6 @@ CURRENT_KEYWORDS = ('電流', 'current', '安培', 'amp')
 KWH_KEYWORDS     = ('用電量', '度數', 'kwh', 'energy', '電能')
 FLOW_KEYWORDS    = ('流量', 'flow', 'nm3', 'nm³', 'cmm')
 RUNHR_KEYWORDS   = ('運轉時數', '運轉小時', 'runhour', 'runtime', 'run_hour', 'runhr')
-
-RUN_DELTA_EPS = 1e-6   # 判斷 d_運轉時數 > 0 的浮點誤差容忍值
 
 _FONT_READY = False
 
@@ -130,72 +128,66 @@ def _resolve_col(cols: list, keywords: tuple) -> str | None:
     return None
 
 
+# ── tagname 對應 ─────────────────────────────────────────────
+
+def _tagname_for(dev_tags: pd.DataFrame, variable_type: str) -> str | None:
+    """依 variable_type 找對應的 tagname；同一 variable_type 對應多個 tagname 時取第一個並警告。"""
+    names = dev_tags.loc[dev_tags['variable_type'] == variable_type, 'tagname'].tolist()
+    if len(names) > 1:
+        logger.warning(f"  variable_type={variable_type!r} 對應多個 tagname {names}，"
+                       f"僅使用第一個：{names[0]!r}")
+    return names[0] if names else None
+
+
 # ── 每日比功率計算 ───────────────────────────────────────────
 
-def compute_daily_specific_power(df_wide: pd.DataFrame,
-                                 current_col: str | None,
-                                 kwh_col: str,
-                                 flow_col: str,
-                                 runhr_col: str | None) -> tuple[pd.DataFrame, dict]:
+def compute_daily_specific_power(df_dev: pd.DataFrame,
+                                 kwh_tag: str,
+                                 flow_tag: str,
+                                 runhr_tag: str | None) -> tuple[pd.DataFrame, dict]:
     """
-    篩出運轉狀態區間，逐日加總 ΔFlow / ΔkWh，計算每日比功率。
+    每個 tag 各自在自己的原始時間軸上差分＋依日期加總，最後才合併成每日比功率。
 
-    運轉狀態判斷優先序：
-      1) 有運轉時數欄位 → d_運轉時數 > 0
-      2) 無運轉時數欄位 → 電流 > settings.CURRENT_ON_THRESHOLD
+    不做跨 tag 逐筆對齊（不 pivot 成寬表再逐列篩選），因為真實 SCADA 歷史
+    資料庫裡不同 tag 通常各自獨立的時間戳，逐列對齊會導致大量欄位互相 NaN。
+
+    比功率 = 當日總流量增量 ÷ 當日總用電量增量。
+    注意：此處用電量為「全天用電」（含待機/卸載功耗），未依運轉狀態濾除
+    ——因為若要濾除待機用電，需要用電量與運轉時數逐筆對齊，而這正是上述
+    時間戳不同步問題無法可靠做到的部分。運轉時數改為輔助對照欄位，
+    保養前後若運轉時數差異很大，代表比功率變化可能混雜用氣需求變化。
 
     Returns:
-        (daily_df, diag) — daily_df 欄位：date, flow_sum, kwh_sum,
+        (daily_df, diag) — daily_df 欄位：date, datetime, flow_sum, kwh_sum,
                             specific_power, running_hours
-                            diag：診斷資訊字典（運轉判斷方式、電流交叉驗證等）
+                            diag：診斷資訊字典
     """
     diag: dict = {}
 
-    cum_cols = [kwh_col, flow_col] + ([runhr_col] if runhr_col else [])
-    df = diff_cumulative(df_wide, cum_cols)
+    daily_kwh  = daily_sum_by_tag(df_dev, kwh_tag)
+    daily_flow = daily_sum_by_tag(df_dev, flow_tag)
+    daily_runhr = daily_sum_by_tag(df_dev, runhr_tag) if runhr_tag else None
 
-    if runhr_col:
-        mask_run = df[f'd_{runhr_col}'] > RUN_DELTA_EPS
-        diag['run_detect_method'] = f'運轉時數（d_{runhr_col} > 0）'
-        if current_col and current_col in df.columns:
-            mask_curr = df[current_col] > settings.CURRENT_ON_THRESHOLD
-            both_valid = mask_run.notna() & mask_curr.notna()
-            mismatch = (mask_run.fillna(False) != mask_curr.fillna(False)) & both_valid
-            diag['run_current_mismatch_pct'] = (
-                round(100 * mismatch.sum() / both_valid.sum(), 1) if both_valid.sum() else None
-            )
-    elif current_col and current_col in df.columns:
-        mask_run = df[current_col] > settings.CURRENT_ON_THRESHOLD
-        diag['run_detect_method'] = f'電流（{current_col} > {settings.CURRENT_ON_THRESHOLD} A，無運轉時數欄位可交叉驗證）'
-    else:
-        raise ValueError("compute_daily_specific_power: 無運轉時數也無電流欄位，無法判斷運轉狀態")
+    if daily_kwh.empty or daily_flow.empty:
+        raise ValueError("compute_daily_specific_power: 用電量或流量無有效資料")
 
-    df['_running'] = mask_run.fillna(False)
-    diag['running_rows'] = int(df['_running'].sum())
-    diag['total_rows'] = len(df)
+    idx = daily_kwh.index.union(daily_flow.index)
+    if daily_runhr is not None:
+        idx = idx.union(daily_runhr.index)
+    idx = sorted(idx)
 
-    df_run = df[df['_running']].copy()
-    if df_run.empty:
-        raise ValueError("compute_daily_specific_power: 運轉狀態篩選後無資料")
-
-    df_run['date'] = df_run['datetime'].dt.date
-    agg = {f'd_{flow_col}': 'sum', f'd_{kwh_col}': 'sum'}
-    if runhr_col:
-        agg[f'd_{runhr_col}'] = 'sum'
-    daily = df_run.groupby('date').agg(agg).reset_index()
-
-    rename = {f'd_{flow_col}': 'flow_sum', f'd_{kwh_col}': 'kwh_sum'}
-    if runhr_col:
-        rename[f'd_{runhr_col}'] = 'running_hours'
-    daily = daily.rename(columns=rename)
-    if 'running_hours' not in daily.columns:
-        # 無運轉時數欄位時，用運轉筆數 × 取樣間隔粗估運轉時數（僅供參考）
-        counts = df_run.groupby('date').size()
-        daily['running_hours'] = daily['date'].map(counts) * np.nan  # 無法可靠估算，留空
-
+    daily = pd.DataFrame({'date': idx})
+    daily['kwh_sum']  = daily['date'].map(daily_kwh)
+    daily['flow_sum'] = daily['date'].map(daily_flow)
+    daily['running_hours'] = daily['date'].map(daily_runhr) if daily_runhr is not None else np.nan
     daily['specific_power'] = daily['flow_sum'] / daily['kwh_sum'].replace(0, np.nan)
     daily['datetime'] = pd.to_datetime(daily['date'])
-    return daily.sort_values('datetime').reset_index(drop=True), diag
+    daily = daily.sort_values('datetime').reset_index(drop=True)
+
+    diag['n_days']         = len(daily)
+    diag['n_missing_kwh']  = int(daily['kwh_sum'].isna().sum())
+    diag['n_missing_flow'] = int(daily['flow_sum'].isna().sum())
+    return daily, diag
 
 
 # ── 圖表 ────────────────────────────────────────────────────
@@ -299,50 +291,62 @@ def analyze_device(device_id: str, df_other: pd.DataFrame, tag_map: pd.DataFrame
         logger.warning(f"{device_id}: Other_Data 中找不到 tagname {tagnames}")
         return False
 
-    wide = pivot_scada(df_dev, dev_tags)
-    cols = [c for c in wide.columns if c != 'datetime']
-    logger.info(f"  SCADA 欄位（variable_type）：{cols}")
+    var_types = dev_tags['variable_type'].unique().tolist()
+    logger.info(f"  variable_type：{var_types}")
 
-    current_col = _resolve_col(cols, CURRENT_KEYWORDS)
-    kwh_col     = _resolve_col(cols, KWH_KEYWORDS)
-    flow_col    = _resolve_col(cols, FLOW_KEYWORDS)
-    runhr_col   = _resolve_col(cols, RUNHR_KEYWORDS)
+    current_type = _resolve_col(var_types, CURRENT_KEYWORDS)
+    kwh_type     = _resolve_col(var_types, KWH_KEYWORDS)
+    flow_type    = _resolve_col(var_types, FLOW_KEYWORDS)
+    runhr_type   = _resolve_col(var_types, RUNHR_KEYWORDS)
 
-    logger.info(f"  電流={current_col} / 用電量={kwh_col} / 流量={flow_col} / 運轉時數={runhr_col}")
+    logger.info(f"  電流={current_type} / 用電量={kwh_type} / 流量={flow_type} / 運轉時數={runhr_type}")
 
-    if kwh_col is None or flow_col is None:
+    if kwh_type is None or flow_type is None:
         logger.warning(f"{device_id}: 缺少用電量或流量欄位，無法計算比功率 "
-                       f"(kwh_col={kwh_col}, flow_col={flow_col})")
+                       f"(kwh={kwh_type}, flow={flow_type})")
         return False
 
-    # ── 資料缺漏偵測 ──
-    gaps = detect_data_gaps(wide)
+    kwh_tag   = _tagname_for(dev_tags, kwh_type)
+    flow_tag  = _tagname_for(dev_tags, flow_type)
+    runhr_tag = _tagname_for(dev_tags, runhr_type) if runhr_type else None
+
+    # ── 資料缺漏偵測（各 tag 各自的時間軸分開偵測，避免掩蓋單一 tag 斷線）──
     os.makedirs(output_dir, exist_ok=True)
+    gap_frames = []
+    for label, tag in [('用電量', kwh_tag), ('流量', flow_tag)] + (
+        [('運轉時數', runhr_tag)] if runhr_tag else []
+    ):
+        sub = df_dev[df_dev['tagname'] == tag][['datetime']]
+        g = detect_data_gaps(sub)
+        if not g.empty:
+            g.insert(0, 'tag', label)
+            gap_frames.append(g)
+    gaps = (pd.concat(gap_frames, ignore_index=True)
+           if gap_frames else pd.DataFrame(columns=['tag', 'gap_start', 'gap_end', 'gap_hours']))
+
     gaps_path = os.path.join(output_dir, f"{device_id}_gaps.csv")
     gaps.to_csv(gaps_path, index=False)
     if not gaps.empty:
         total_gap_hr = gaps['gap_hours'].sum()
         logger.warning(f"  ⚠ 偵測到 {len(gaps)} 段資料缺漏，合計 {total_gap_hr:.1f} 小時，"
                        f"明細 → {gaps_path}")
-        top = gaps.head(3)
-        for _, r in top.iterrows():
-            logger.warning(f"    {r['gap_start']} ~ {r['gap_end']}（{r['gap_hours']:.1f} hr）")
+        for _, r in gaps.head(3).iterrows():
+            logger.warning(f"    [{r['tag']}] {r['gap_start']} ~ {r['gap_end']}（{r['gap_hours']:.1f} hr）")
     else:
         logger.info(f"  未偵測到明顯資料缺漏")
 
     # ── 每日比功率 ──
     try:
-        daily, diag = compute_daily_specific_power(wide, current_col, kwh_col, flow_col, runhr_col)
+        daily, diag = compute_daily_specific_power(df_dev, kwh_tag, flow_tag, runhr_tag)
     except ValueError as e:
         logger.warning(f"{device_id}: {e}")
         return False
 
-    logger.info(f"  運轉狀態判斷：{diag.get('run_detect_method')}")
-    if diag.get('run_current_mismatch_pct') is not None:
-        logger.info(f"  運轉時數 vs 電流門檻 判斷不一致比例：{diag['run_current_mismatch_pct']}%"
-                    f"（差異大時建議向資料源確認『運轉時數』是否含卸載時間）")
-    logger.info(f"  運轉狀態資料：{diag['running_rows']}/{diag['total_rows']} 筆，"
-                f"共 {len(daily)} 天有效資料")
+    if diag['n_missing_kwh'] or diag['n_missing_flow']:
+        logger.warning(f"  ⚠ {diag['n_days']} 天中，有 {diag['n_missing_kwh']} 天無用電量資料、"
+                       f"{diag['n_missing_flow']} 天無流量資料（比功率為 NaN，已從比較中排除）")
+    logger.info(f"  共 {diag['n_days']} 天資料（{daily['datetime'].min().date()} ~ "
+                f"{daily['datetime'].max().date()}）")
 
     csv_path = os.path.join(output_dir, f"{device_id}_daily.csv")
     daily.to_csv(csv_path, index=False)
@@ -390,24 +394,27 @@ def analyze_device(device_id: str, df_other: pd.DataFrame, tag_map: pd.DataFrame
 </table>
 {runhr_note}
 {cost_note}
-<p style="font-size:0.85em;color:#666">比功率 = 流量 ÷ 用電量（僅計運轉狀態區間），數字越高代表效率越好。</p>"""
+<p style="font-size:0.85em;color:#666">比功率 = 流量 ÷ 用電量（含待機/卸載用電，未依運轉狀態濾除——
+原始資料各 tag 時間戳未同步，無法可靠逐筆比對運轉狀態；
+請搭配上方「每日運轉時數」判斷保養前後用氣型態是否一致），數字越高代表效率越好。</p>"""
     else:
         comparison_html = '<p style="color:#888">（此設備於資料期間內無保養紀錄，無法比較）</p>'
 
     gaps_html = ''
     if not gaps.empty:
         rows = ''.join(
-            f"<tr><td>{r['gap_start']}</td><td>{r['gap_end']}</td><td>{r['gap_hours']:.1f}</td></tr>"
+            f"<tr><td>{r['tag']}</td><td>{r['gap_start']}</td><td>{r['gap_end']}</td><td>{r['gap_hours']:.1f}</td></tr>"
             for _, r in gaps.head(20).iterrows()
         )
         gaps_html = f"""
 <h2>資料缺漏時段</h2>
 <table class="stats">
-  <thead><tr><th>起</th><th>迄</th><th>時長 (hr)</th></tr></thead>
+  <thead><tr><th>欄位</th><th>起</th><th>迄</th><th>時長 (hr)</th></tr></thead>
   <tbody>{rows}</tbody>
 </table>
-<p style="font-size:0.85em;color:#666">共 {len(gaps)} 段，合計 {gaps['gap_hours'].sum():.1f} 小時。
-缺漏時段內比功率無法計算，已自動排除，不影響其他日期的統計。</p>"""
+<p style="font-size:0.85em;color:#666">共 {len(gaps)} 段，合計 {gaps['gap_hours'].sum():.1f} 小時，
+各欄位（用電量／流量／運轉時數）分開偵測，因為各 tag 斷線時間不一定相同。
+缺漏當天若導致該日總量無法計算，比功率會是 NaN，已自動排除，不影響其他日期的統計。</p>"""
 
     img_ts = plot_timeseries(daily, device_id, maint_events)
     html = _build_html(device_id, daily, img_ts, comparison_html, gaps_html)
@@ -455,7 +462,7 @@ def _build_html(device_id: str, daily: pd.DataFrame, img_ts: str,
   <tr><th>設備 ID</th><td>{device_id}</td>
       <th>資料期間</th><td>{date_range}</td></tr>
   <tr><th>有效天數</th><td>{len(daily)}</td>
-      <th>比功率定義</th><td>流量 ÷ 用電量（僅運轉狀態區間）</td></tr>
+      <th>比功率定義</th><td>流量 ÷ 用電量（全天，含待機用電）</td></tr>
 </table>
 </div>
 

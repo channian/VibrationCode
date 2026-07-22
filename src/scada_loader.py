@@ -173,27 +173,46 @@ def merge_vib_scada(df_vib: pd.DataFrame,
 
 
 # ── 累積值處理（用電量／流量／運轉時數等 counter 型欄位）──────
+#
+# 重要：不同 tag 在真實 SCADA/歷史資料庫中，通常是各自獨立的時間軸
+# （各自的 scan rate、各自的時間戳，彼此不會剛好對齊）。若先 pivot 成
+# 寬表再逐列 diff，同一列裡其他 tag 的值多半是 NaN，會導致差分與加總
+# 大量失真（甚至全部變 0）。因此差分一律在單一 tag 的原始（long format）
+# 時間軸上進行，彼此獨立，最後才依日期加總合併。
 
-def diff_cumulative(df_wide: pd.DataFrame, cols: list) -> pd.DataFrame:
+def diff_by_tag(df_long: pd.DataFrame, tagname: str) -> pd.DataFrame:
     """
-    對累積式欄位（用電量、流量、運轉時數等）逐筆差分，取得區間增量。
+    對單一 tagname 的原始時序（未 pivot）逐筆差分，取得區間增量。
 
-    負值 diff（計數器歸零/重置）視為異常，該筆增量捨棄（設為 NaN），
-    避免把「重置」誤算成負消耗。
+    負值 diff（計數器歸零/重置）視為異常，該筆增量捨棄（設為 NaN）。
 
-    新增欄位：d_{col}（區間增量，NaN 表示該筆無法計算 — 首筆或重置後）
+    Returns:
+        DataFrame[datetime, delta]（該 tag 自己的時間戳 + 與上一筆的差值）
     """
-    df = df_wide.sort_values('datetime').reset_index(drop=True).copy()
-    for col in cols:
-        if col not in df.columns:
-            logger.warning(f"diff_cumulative: 找不到欄位 {col!r}，跳過")
-            continue
-        delta = df[col].diff()
-        n_reset = int((delta < 0).sum())
-        if n_reset:
-            logger.warning(f"  {col!r}: 偵測到 {n_reset} 次計數器歸零/重置，該筆增量已捨棄")
-        df[f'd_{col}'] = delta.where(delta >= 0)
-    return df
+    sub = (df_long[df_long['tagname'] == tagname]
+           .sort_values('datetime').reset_index(drop=True))
+    if sub.empty:
+        return pd.DataFrame(columns=['datetime', 'delta'])
+    delta = sub['value'].diff()
+    n_reset = int((delta < 0).sum())
+    if n_reset:
+        logger.warning(f"  tagname={tagname!r}: 偵測到 {n_reset} 次計數器歸零/重置，該筆增量已捨棄")
+    return pd.DataFrame({'datetime': sub['datetime'], 'delta': delta.where(delta >= 0)})
+
+
+def daily_sum_by_tag(df_long: pd.DataFrame, tagname: str) -> pd.Series:
+    """
+    單一 tagname 差分後依日期加總。
+
+    Returns:
+        Series[date -> 當日總增量]；min_count=1 確保「該日完全無資料」回傳 NaN
+        而非誤導性的 0（pandas .sum() 對全 NaN 切片預設回傳 0）。
+    """
+    d = diff_by_tag(df_long, tagname)
+    if d.empty:
+        return pd.Series(dtype=float)
+    date = d['datetime'].dt.date
+    return d.groupby(date)['delta'].sum(min_count=1)
 
 
 def detect_data_gaps(df_wide: pd.DataFrame,
