@@ -77,6 +77,43 @@ def _setup_font() -> None:
     _FONT_READY = True
 
 
+# ── 檔案寫入保護（Windows 常見：目標檔案被 Excel/預覽視窗開著鎖住）────
+
+def _safe_write_csv(df: pd.DataFrame, path: str) -> bool:
+    try:
+        df.to_csv(path, index=False, encoding='utf-8-sig')
+        return True
+    except PermissionError:
+        logger.error(f"  ✗ 無法寫入 {path}（檔案可能被其他程式開著，例如 Excel）。"
+                    f"請關閉該檔案後重跑，已跳過此檔案。")
+        return False
+
+
+def _safe_write_text(text: str, path: str) -> bool:
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return True
+    except PermissionError:
+        logger.error(f"  ✗ 無法寫入 {path}（檔案可能被其他程式開著，例如瀏覽器）。"
+                    f"請關閉該檔案後重跑，已跳過此檔案。")
+        return False
+
+
+def _safe_savefig(fig, path: str, **kwargs) -> bool:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            fig.savefig(path, **kwargs)
+        return True
+    except PermissionError:
+        logger.error(f"  ✗ 無法寫入 {path}（檔案可能被其他程式開著，例如小畫家/圖片檢視器）。"
+                    f"請關閉該檔案後重跑，已跳過此圖檔。")
+        return False
+    finally:
+        plt.close(fig)
+
+
 def _alert_color(score: float) -> str:
     if np.isnan(score):
         return '#888'
@@ -215,11 +252,8 @@ def plot_trend_grid(results: list[dict], path: str) -> None:
     fig.suptitle('全設備 HealthScore 趨勢（灰線=Normal門檻，紅虛線=線性趨勢）', fontsize=12, y=1.01)
     plt.tight_layout()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        fig.savefig(path, dpi=140, bbox_inches='tight')
-    plt.close(fig)
-    logger.info(f"趨勢矩陣圖 → {path}")
+    if _safe_savefig(fig, path, dpi=140, bbox_inches='tight'):
+        logger.info(f"趨勢矩陣圖 → {path}")
 
 
 def _fig_to_b64(fig) -> str:
@@ -303,11 +337,8 @@ def plot_daily_per_device(daily_per_device: pd.DataFrame, results: list[dict], p
     fig.suptitle('各設備每日平均分數趨勢', fontsize=12, y=1.01)
     plt.tight_layout()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        fig.savefig(path, dpi=140, bbox_inches='tight')
-    plt.close(fig)
-    logger.info(f"各設備每日趨勢圖 → {path}")
+    if _safe_savefig(fig, path, dpi=140, bbox_inches='tight'):
+        logger.info(f"各設備每日趨勢圖 → {path}")
 
 
 def build_daily_fleet_average(results: list[dict], days: int) -> pd.DataFrame:
@@ -369,11 +400,8 @@ def plot_daily_fleet(daily_df: pd.DataFrame, total_devices: int, path: str) -> N
     plt.tight_layout()
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        fig.savefig(path, dpi=140, bbox_inches='tight')
-    plt.close(fig)
-    logger.info(f"全設備每日平均圖 → {path}")
+    if _safe_savefig(fig, path, dpi=140, bbox_inches='tight'):
+        logger.info(f"全設備每日平均圖 → {path}")
 
 
 # ── HTML ────────────────────────────────────────────────────
@@ -504,8 +532,8 @@ def main():
     csv_path = os.path.join(OUTPUT_DIR, 'all_devices_summary.csv')
     summary_df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith('_')} for r in results])
     summary_df = summary_df.sort_values('mean').reset_index(drop=True)
-    summary_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-    logger.info(f"彙整表 → {csv_path}")
+    if _safe_write_csv(summary_df, csv_path):
+        logger.info(f"彙整表 → {csv_path}")
 
     detail_frames = []
     for r in results:
@@ -514,21 +542,21 @@ def main():
         detail_frames.append(s)
     detail_df = pd.concat(detail_frames, ignore_index=True)
     detail_path = os.path.join(OUTPUT_DIR, 'all_devices_valid_scores.csv')
-    detail_df.to_csv(detail_path, index=False, encoding='utf-8-sig')
-    logger.info(f"原始有效分數時序 → {detail_path}（{len(detail_df)} 筆，已排除 0 分/缺值）")
+    if _safe_write_csv(detail_df, detail_path):
+        logger.info(f"原始有效分數時序 → {detail_path}（{len(detail_df)} 筆，已排除 0 分/缺值）")
 
     per_device_daily_df = build_daily_per_device(results)
     per_device_daily_path = os.path.join(OUTPUT_DIR, 'daily_per_device.csv')
-    per_device_daily_df.to_csv(per_device_daily_path, index=False, encoding='utf-8-sig')
-    logger.info(f"各設備每日平均 → {per_device_daily_path}（{len(per_device_daily_df)} 筆）")
+    if _safe_write_csv(per_device_daily_df, per_device_daily_path):
+        logger.info(f"各設備每日平均 → {per_device_daily_path}（{len(per_device_daily_df)} 筆）")
 
     per_device_daily_img_path = os.path.join(OUTPUT_DIR, 'daily_per_device_trend.png')
     plot_daily_per_device(per_device_daily_df, results, per_device_daily_img_path)
 
     daily_df = build_daily_fleet_average(results, args.daily_days)
     daily_path = os.path.join(OUTPUT_DIR, 'daily_fleet_average.csv')
-    daily_df.to_csv(daily_path, index=False, encoding='utf-8-sig')
-    logger.info(f"全設備每日平均 → {daily_path}（{len(daily_df)} 天）")
+    if _safe_write_csv(daily_df, daily_path):
+        logger.info(f"全設備每日平均 → {daily_path}（{len(daily_df)} 天）")
 
     daily_img_path = os.path.join(OUTPUT_DIR, 'daily_fleet_average.png')
     plot_daily_fleet(daily_df, len(results), daily_img_path)
@@ -540,9 +568,8 @@ def main():
     html = build_report(results, img_bar, grid_path, daily_img_path, args.daily_days,
                         per_device_daily_img_path)
     html_path = os.path.join(OUTPUT_DIR, 'report.html')
-    with open(html_path, 'w', encoding='utf-8') as f:
-        f.write(html)
-    logger.info(f"報告 → {html_path}")
+    if _safe_write_text(html, html_path):
+        logger.info(f"報告 → {html_path}")
 
     print(f"\n  完成：{len(results)} 台設備  →  {OUTPUT_DIR}/")
 
