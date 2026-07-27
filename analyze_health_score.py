@@ -14,8 +14,10 @@ analyze_health_score.py — 全設備 HealthScore 平均分數與趨勢分析
 輸出：
     output/health_score/all_devices_summary.csv
     output/health_score/all_devices_valid_scores.csv  — 全設備原始有效分數時序
+    output/health_score/daily_per_device.csv           — 每台設備的每日平均分數
+    output/health_score/daily_per_device_trend.png     — 每台設備每日平均分數趨勢圖
     output/health_score/daily_fleet_average.csv        — 過去 N 天，每天全部設備的平均分數
-    output/health_score/trend_grid.png     — 全設備小圖矩陣（時序 + 趨勢線）
+    output/health_score/trend_grid.png     — 全設備小圖矩陣（原始資料點 + 趨勢線）
     output/health_score/report.html
 """
 
@@ -247,7 +249,66 @@ def plot_mean_bar(results: list[dict]) -> str:
     return _fig_to_b64(fig)
 
 
-# ── 全設備每日平均 ───────────────────────────────────────────
+# ── 每日平均（單設備 / 全設備）──────────────────────────────
+
+def _device_daily_stats(r: dict) -> pd.DataFrame:
+    """單一設備的每日統計（僅用已排除 0 分/缺值的有效資料）。Returns: date, avg_score, n_valid。"""
+    s = r['_valid_series'].copy()
+    s['date'] = s['datetime'].dt.floor('D')
+    daily = s.groupby('date')['score'].agg(['mean', 'count']).reset_index()
+    daily.columns = ['date', 'avg_score', 'n_valid']
+    daily['avg_score'] = daily['avg_score'].round(2)
+    return daily
+
+
+def build_daily_per_device(results: list[dict]) -> pd.DataFrame:
+    """
+    每台設備的每日平均分數（long format）。
+
+    Returns:
+        DataFrame[device_id, date, avg_score, n_valid]
+    """
+    frames = []
+    for r in results:
+        daily = _device_daily_stats(r)
+        daily.insert(0, 'device_id', r['device_id'])
+        frames.append(daily)
+    return pd.concat(frames, ignore_index=True)
+
+
+def plot_daily_per_device(daily_per_device: pd.DataFrame, results: list[dict], path: str) -> None:
+    """全設備小圖矩陣：每台設備一張子圖，畫「每日平均分數」折線（比原始點更平滑，方便看趨勢）。"""
+    _setup_font()
+    n = len(results)
+    ncols = min(3, n)
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.6 * nrows), squeeze=False)
+
+    for i, r in enumerate(results):
+        ax = axes[i // ncols][i % ncols]
+        sub = daily_per_device[daily_per_device['device_id'] == r['device_id']].sort_values('date')
+        color = _alert_color(r['mean'])
+        ax.plot(sub['date'], sub['avg_score'], color='steelblue', lw=1.3, marker='o', markersize=3)
+        ax.axhline(settings.ALERT_NORMAL, color='gray', ls=':', lw=0.7, alpha=0.6)
+        ax.set_ylim(0, 105)
+        ax.set_title(f"{r['device_id']}  (平均{r['mean']:.0f}, {r['trend_label']})",
+                    fontsize=9.5, color=color)
+        ax.tick_params(axis='x', labelrotation=30, labelsize=7)
+        ax.tick_params(axis='y', labelsize=7)
+        ax.grid(True, alpha=0.3)
+
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+
+    fig.suptitle('各設備每日平均分數趨勢', fontsize=12, y=1.01)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        fig.savefig(path, dpi=140, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"各設備每日趨勢圖 → {path}")
+
 
 def build_daily_fleet_average(results: list[dict], days: int) -> pd.DataFrame:
     """
@@ -260,12 +321,10 @@ def build_daily_fleet_average(results: list[dict], days: int) -> pd.DataFrame:
     Returns:
         DataFrame[date, avg_score, n_devices]
     """
-    per_device_daily = []
-    for r in results:
-        s = r['_valid_series'].copy()
-        s['date'] = s['datetime'].dt.floor('D')
-        daily = s.groupby('date')['score'].mean().rename(r['device_id'])
-        per_device_daily.append(daily)
+    per_device_daily = [
+        _device_daily_stats(r).set_index('date')['avg_score'].rename(r['device_id'])
+        for r in results
+    ]
 
     wide = pd.concat(per_device_daily, axis=1).sort_index()
 
@@ -352,10 +411,11 @@ def _summary_table_html(results: list[dict]) -> str:
 
 
 def build_report(results: list[dict], img_bar: str, img_grid_path: str,
-                 img_daily_path: str, daily_days: int) -> str:
+                 img_daily_path: str, daily_days: int, img_daily_per_device_path: str) -> str:
     summary_html = _summary_table_html(results)
     grid_b64 = base64.b64encode(open(img_grid_path, 'rb').read()).decode('utf-8')
     daily_b64 = base64.b64encode(open(img_daily_path, 'rb').read()).decode('utf-8')
+    daily_pd_b64 = base64.b64encode(open(img_daily_per_device_path, 'rb').read()).decode('utf-8')
 
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -395,7 +455,11 @@ def build_report(results: list[dict], img_bar: str, img_grid_path: str,
 設備稀釋整體分數；下方回報設備數可用來檢查某天分數異常是否為資料涵蓋率不足所致。</p>
 <img src="data:image/png;base64,{daily_b64}">
 
-<h2>各設備趨勢圖</h2>
+<h2>各設備每日平均分數趨勢</h2>
+<p>各設備每日平均（比原始逐筆資料平滑，適合看每台設備自己的趨勢走向）。</p>
+<img src="data:image/png;base64,{daily_pd_b64}">
+
+<h2>各設備趨勢圖（原始有效資料點 + 回歸線）</h2>
 <img src="data:image/png;base64,{grid_b64}">
 
 <footer>產生時間：{pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp;
@@ -453,6 +517,14 @@ def main():
     detail_df.to_csv(detail_path, index=False, encoding='utf-8-sig')
     logger.info(f"原始有效分數時序 → {detail_path}（{len(detail_df)} 筆，已排除 0 分/缺值）")
 
+    per_device_daily_df = build_daily_per_device(results)
+    per_device_daily_path = os.path.join(OUTPUT_DIR, 'daily_per_device.csv')
+    per_device_daily_df.to_csv(per_device_daily_path, index=False, encoding='utf-8-sig')
+    logger.info(f"各設備每日平均 → {per_device_daily_path}（{len(per_device_daily_df)} 筆）")
+
+    per_device_daily_img_path = os.path.join(OUTPUT_DIR, 'daily_per_device_trend.png')
+    plot_daily_per_device(per_device_daily_df, results, per_device_daily_img_path)
+
     daily_df = build_daily_fleet_average(results, args.daily_days)
     daily_path = os.path.join(OUTPUT_DIR, 'daily_fleet_average.csv')
     daily_df.to_csv(daily_path, index=False, encoding='utf-8-sig')
@@ -465,7 +537,8 @@ def main():
     plot_trend_grid(results, grid_path)
 
     img_bar = plot_mean_bar(results)
-    html = build_report(results, img_bar, grid_path, daily_img_path, args.daily_days)
+    html = build_report(results, img_bar, grid_path, daily_img_path, args.daily_days,
+                        per_device_daily_img_path)
     html_path = os.path.join(OUTPUT_DIR, 'report.html')
     with open(html_path, 'w', encoding='utf-8') as f:
         f.write(html)
