@@ -115,8 +115,16 @@ class DeviationResult:
     top_contributors: list[str] = field(default_factory=list)
     note: str = ''
 
+    #: 是否真的算出了距離。**無資料可判定時必須設為 False。**
+    #: 若沿用預設的 distance=0.0 表示「未評估」，語意會與「完全貼合基準」
+    #: 混淆——備機從未運轉時，agent 可能寫成「偏離距離 0，狀態極佳」，
+    #: 但實際上根本沒有評估過。呼叫端一律先檢查此旗標。
+    computable: bool = True
+
     def describe(self) -> str:
         """產生給 agent 使用的中文摘要（僅陳述現象，不判定故障類型）。"""
+        if not self.computable:
+            return f'未評估（{self.note}）' if self.note else '未評估：無足夠資料'
         if not self.is_deviated:
             return '未偵測到顯著偏離'
         parts = [f'{k} {v:+.1f}σ' for k, v in

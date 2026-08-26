@@ -251,9 +251,15 @@ CREATE TABLE point_baseline (
     source       TEXT NOT NULL DEFAULT 'auto' CHECK (source IN ('auto','manual')),
     -- 各指標的基準統計（中位數與標準差，供 σ 分解與趨勢比較）
     stats        JSONB NOT NULL,
+    -- 基準是用多少可信（ok）小時算出來的。基準品質決定了所有相對比較的
+    -- 可信度，這個數字必須能被查詢與呈現，不可只存在於記憶體物件裡。
+    n_hours      INT  NOT NULL DEFAULT 0,
+    note         TEXT NOT NULL DEFAULT '',
     computed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (end_date >= start_date)
 );
+COMMENT ON COLUMN point_baseline.n_hours IS
+    '建立此基準所用的 ok 小時數；偏低時所有以此為準的 σ 比較都需標示信心度';
 COMMENT ON COLUMN point_baseline.stats IS
     '如 {"vel_rms":{"median":1.51,"std":0.08}, "acc_kurt":{"median":2.05,"std":0.11}, ...}';
 
