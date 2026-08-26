@@ -6,19 +6,45 @@
 
 ---
 
-## 一、目標與範圍
+## 一、系統定位與範圍
 
-### 功能需求
-1. **Dashboard** — 設備健康總覽
-2. **週報功能** — HTML 格式，含 agent 評論
-3. **異常事件回覆** — agent 依事件上下文產出回覆建議
+### 定位：篩選與預警，不是診斷
 
-### 分階段策略（因應時程壓力）
+公司已有**量測專家診斷系統**負責深入檢測。本系統使用低成本三軸 SENSOR 的例行監測資料，定位是**分流（triage）**：
+
+> **回答「哪幾台需要注意、有多急」，而不是「是什麼故障」。**
+> 判定需要進一步檢查後，由專家系統接手診斷。
+
+這個定位決定了兩件事：**只用既有處理後資料能可靠支撐的結論**，以及**agent 不得臆測故障類型**（見 §五之二護欄）。
+
+### 能力上限（明確界定，避免過度承諾）
+
+| ✅ 本系統可以可靠做到 | ❌ 本系統不做 |
+|---------------------|-------------|
+| ISO 10816 絕對位準分級（Zone A/B/C/D） | 判定故障類型（不平衡／對心不良／軸承） |
+| 趨勢劣化偵測與惡化速率 | 軸承特徵頻率（BPFO/BPFI/BSF）分析 |
+| 衝擊性上升偵測（Crest / Kurtosis） | 階次分析與諧波故障指紋 |
+| 頻譜重心位移（能量往高頻移動） | 根本原因判定 |
+| 多變量突變偵測 | 剩餘壽命預估 |
+| 感測器離線／資料品質／安裝異常 | |
+
+### 資料使用範圍（依上述定位收斂）
+
+| 群組 | 使用 | 理由 |
+|------|------|------|
+| **時域純量**（velRMS/velOA/accRMS/accOA/accCREST/accKURT/dispP2P 等） | ✅ **核心** | 已實測驗證定義與單位，物理意義明確 |
+| **頻譜摘要**（accMeanPeakFreq / accWeightedMeanFreq / TOP1FREQ） | ✅ **輔助趨勢** | 是穩健的純量，可偵測「能量往高頻移動」而**不需要辨識個別諧波** |
+| **諧波欄位**（accH01~H30、velH01~H10 的 FREQ/V/OA，共 480 欄） | ❌ **不使用** | `_V`/`_OA` 定義無法驗證（最佳假說仍 18.8% 變異）；FREQ 峰值搜尋容差 ±5 Hz，實測 H01 鎖到 25.9 Hz 而非 1X 的 28.5 Hz。**採信將導致誤判**，與「只做可靠的事」相牴觸 |
+| **TOP2~5 峰值** | ⚠️ 選用 | 可作為「主頻改變」的輔助訊號，但不做頻率身份判讀 |
+
+> **原 Phase 2（諧波診斷、raw 階次分析）取消。** raw 需工程師現場量測、前端無自動化，且該層次的診斷本就屬專家系統職責。既有的 480 個諧波欄位仍原樣保存於 Tier 2 檔案，未來若前端補上可驗證的定義再議。
+
+### 分階段策略
 
 | 階段 | 目標 | 內容 |
 |------|------|------|
-| **Phase 1** | **跑通 agent 驗證迴路** | 聚合管線、ISO 分級 + 趨勢規則、Finding 閉環追蹤、API（比照 HVM）、週報 HTML、簡易 Dashboard |
-| **Phase 2** | 診斷深化與正式資料源 | 諧波故障診斷、DB 正式接入、RAG 語料建置、Dashboard 完整化 |
+| **Phase 1** | **跑通 agent 驗證迴路** | 聚合管線、ISO 分級 + 趨勢規則、Finding 四階段工作流、API（比照 HVM）、週報 HTML |
+| **Phase 2** | 上線完備 | 電流 DB 接入、RAG 語料建置、Dashboard 完整化、SLA 與統計 |
 
 ---
 
@@ -342,14 +368,79 @@ Tier 2（檔案，完整保真）              Tier 1（DB，精選聚合）
 異常事件回覆（Dashboard 或 Agent 觸發）
   ① get_event_context/{finding_key}
   ② get_rag_search 找歷史類似案例與技術文獻
-  ③ 產出回覆建議
+  ③ 產出回覆建議（受 §8.2 護欄約束）
 ```
+
+### 異常事件的四階段簽核流程
+
+```
+  規則引擎建案
+       │  status = open
+       ▼
+  ① 設備工程師回覆        engineer_replied
+       │  （agent 提供回覆建議草稿供參考）
+       ▼
+  ② 工程師主管審核        supervisor_reviewed
+       │
+       ▼
+  ③ 專家複審              expert_reviewed
+       │
+       ▼
+  ④ 結案                  closed
+```
+
+| 狀態 | 說明 |
+|------|------|
+| `open` | 規則引擎建案，待設備工程師處理 |
+| `engineer_replied` | 設備工程師已回覆現場確認結果與處置 |
+| `supervisor_reviewed` | 工程師主管已審核 |
+| `expert_reviewed` | 專家已複審（可在此判定需否轉專家系統實測） |
+| `closed` | 結案 |
+| `auto_resolved` | 數值回歸門檻內，系統自動結案（不需走簽核鏈） |
+| `false_positive` | 判定為誤報，可於任一階段標記並結案 |
+
+**設計要點**：
+
+- 每一階段的回覆寫入 `finding_note`，含 `stage`（哪一關）、`author`、`role`
+- **各階段的停留時間需追蹤**，供週報彙整積壓情形（例如「3 件卡在主管審核超過 7 天」）
+- 若指標在簽核過程中**持續惡化**，`escalated_at` 標記並在週報拉高呈現，不因「處理中」而輕描淡寫（沿用 HVM 規則）
+- `auto_resolved` 與簽核鏈並行：數值回歸正常時自動結案，但若已進入簽核流程則保留紀錄供追溯
+- **這條簽核鏈本身就是 RAG 的語料來源**——每一關的回覆累積成歷史案例庫，是本系統長期價值的核心
 
 ---
 
-## 八、核心設計原則：LLM 不做數值判斷
+## 八、核心設計原則
 
-所有閾值判定、分級、異常偵測、故障假設，一律在**規則層**以確定性程式算完，agent 只負責解釋、關聯歷史案例、寫成人話。理由：可稽核、可重現、避免幻覺。此原則與 HVM 文件中「禁止用自己認知的一般業界門檻」一致。
+### 8.1 LLM 不做數值判斷
+
+所有閾值判定、分級、異常偵測，一律在**規則層**以確定性程式算完，agent 只負責解釋、關聯歷史案例、寫成人話。理由：可稽核、可重現、避免幻覺。此原則與 HVM 文件中「禁止用自己認知的一般業界門檻」一致。
+
+### 8.2 Agent 不得臆測故障類型（本案關鍵護欄）
+
+依 §一 的定位，本系統的資料**不足以支撐故障類型判定**。但 LLM 的天性就是會寫出「疑似對心不良」「軸承內環缺陷」這類具體結論——這些話語出現在週報上，一旦與專家系統的實測結果不符，**整個系統的可信度就毀了**。
+
+因此必須在 agent 的系統提示與 API 回傳內容中明確約束：
+
+| 禁止 | 允許 |
+|------|------|
+| 「疑似對心不良」 | 「整體振動位準上升，衝擊性指標未同步上升」 |
+| 「軸承內環缺陷」 | 「衝擊性指標（Crest/Kurtosis）持續上升，常見於軸承或潤滑劣化，本系統無法區分成因」 |
+| 「建議更換軸承」 | 「建議安排專家系統複測以確認成因」 |
+| 「剩餘壽命約 2 個月」 | 「以目前劣化速率，約 N 天後將觸及 Zone C 門檻（信心度：中）」 |
+
+**輸出格式為「觀察到的現象 + 建議的下一步」，不輸出「故障類型判定」。**
+
+實作上，API 回傳的每個 Finding 都附帶 `interpretation_limit` 欄位，明確標示該證據能支撐到什麼程度，agent 據此撰寫。RAG 檢索到的歷史案例可以引用（「去年 3 月類似樣態，工程師實際發現為聯軸器鬆脫」），但需標明為歷史案例而非本次判定。
+
+### 8.3 方向性提示的分寸
+
+在不指名故障的前提下，仍可提供有價值的方向性資訊：
+
+| 觀察樣態 | 可以這樣寫 |
+|---------|-----------|
+| velRMS 上升、Crest/Kurtosis 平穩 | 「整體位準上升但無衝擊性增強，傾向結構或負載面因素」 |
+| Crest + Kurtosis 同步上升、頻譜重心上移 | 「衝擊性與高頻能量同步增加，建議優先複測」 |
+| 僅單一指標跳動、其餘平穩 | 「單一指標變動，其餘穩定，建議先確認量測與安裝狀態」 |
 
 ---
 
@@ -426,20 +517,31 @@ raw_file(file_id PK, point_id FK, date, path, row_count, imported_at)
 scada_reading(tag_id, ts, value)
 tag_mapping(tag_id PK, device_id FK, variable_type, unit)
 
--- Finding 閉環追蹤（比照 HVM）
+-- Finding 閉環追蹤（比照 HVM，擴充四階段簽核）
 finding(
   finding_key PK,          -- {target_type}:{target}:{issue_type}
   device_id FK, point_id FK,
   target_type, target, issue_type, family,
-  title, detail, severity, peak_severity, status,
+  title, detail, severity, peak_severity,
+  status,                  -- open / engineer_replied / supervisor_reviewed
+                           -- / expert_reviewed / closed / auto_resolved / false_positive
+  stage_entered_at,        -- 進入目前階段的時間（供 SLA 與積壓統計）
   occurrence_count, first_seen_at, last_seen_at, days_open,
   baseline_value, current_value, value_unit,
+  interpretation_limit,    -- 該證據能支撐到什麼程度（供 agent 遵守 §8.2 護欄）
   expected_resolution_date, is_overdue, escalated_at,
+  needs_expert_measurement,-- 專家複審判定是否需轉專家系統實測
   source,                  -- 'rule_engine' / 'agent'
   resolved_at, resolved_by
 )
 
-finding_note(note_id PK, finding_key FK, created_at, author, note, is_human)
+finding_note(
+  note_id PK, finding_key FK, created_at,
+  stage,                   -- 對應簽核階段
+  author, role,            -- engineer / supervisor / expert / system / agent
+  note, action_taken, root_cause,
+  is_human
+)
 ```
 
 ---
@@ -481,8 +583,10 @@ Base URL : http://<主機>:8000/api/agent/tools
 | `ORIENTATION_CHANGE` | event | 軸能量分佈排列跳變 → 疑似重貼/換感測器 | — |
 | `SENSOR_OFFLINE` | event | 逾時無資料 | — |
 | `DATA_QUALITY` | event | 缺漏、零值、`n_samples_running` 不足 | — |
+| `SPECTRAL_SHIFT` | monotonic | `accWeightedMeanFreq` 重心持續上移 → 能量往高頻移動 | 否 |
 | `SENSOR_SATURATION` | event | accPEAK 逼近量程滿刻度 → 峰值類指標失真 | — |
 | `STANDBY_NO_RUNTIME` | event | 備機超過 N 天未運轉 → 建議試車（待確認是否已有試車排程） | — |
+| `ISO_CLASS_SUSPECT` | event | ISO 等級疑似誤填（見下） | — |
 
 **ISO 10816/20816 Zone 門檻（velRMS mm/s）**
 
@@ -493,7 +597,22 @@ Base URL : http://<主機>:8000/api/agent/tools
 | Class III（大型剛性基礎） | 1.8 | 4.5 | 11.2 |
 | Class IV（大型柔性基礎） | 2.8 | 7.1 | 18.0 |
 
-> **不可只靠 ISO 分級**：AHU 樣本 velRMS 僅 1.51 mm/s（Zone A/B），但 accCREST=16、accKURT=68.6 明顯異常，三軸在 682.3 Hz（≈24X）都有峰值。`IMPACT_RISE` 必須與 `ISO_ZONE` 並行，否則會完全漏掉這台。
+> **不可只靠 ISO 分級**：AHU 樣本 velRMS 僅 1.51 mm/s（Zone A/B），但 accCREST=16、accKURT=68.6 明顯異常。`IMPACT_RISE` 必須與 `ISO_ZONE` 並行，否則會完全漏掉這台。
+
+### ISO 等級誤填的處理（`ISO_CLASS_SUSPECT`）
+
+ISO 等級由工程師依 ISO 10816 自行分類，無法保證正確，而 Zone 判定完全建立在這個分類上。因此需要一道**合理性檢查**：
+
+**判準**：一台健康運轉的機器，其基準期 velRMS 中位數應落在所指派等級的 **Zone A 或低 Zone B**。若基準期中位數已經超過該等級的 **B/C 界**，則兩種可能——機器本來就有問題，或等級填錯。兩者都需要人工確認。
+
+| 情境 | 處理 |
+|------|------|
+| 基準期中位數 > 指派等級的 B/C 界 | 建立 `ISO_CLASS_SUSPECT` Finding，列出實測分佈與各等級門檻，請工程師複核 |
+| 未填等級（`ISO10816_code = 0`） | **不套用 Zone 判定**，僅以相對基準與趨勢規則監測，並在報告中標明「未分級」 |
+
+**設計原則**：Dashboard 與週報顯示 Zone 時，一律標註分類來源（`iso_class_source`）。分類存疑或未分級的設備，其 Zone 結論需明確標示信心度，避免誤導。
+
+> 由於 `ISO10816_code` 目前實測為 0（尚未設定），**Phase 1 初期預期多數設備走「未分級」路徑**，以相對基準與趨勢為主。ISO 絕對分級的價值需等台帳補齊後才能發揮。
 
 ---
 
@@ -501,25 +620,23 @@ Base URL : http://<主機>:8000/api/agent/tools
 
 > **§三之二 的實測已解決原先列為「最高優先」的多數項目**：加速度單位、量程、滾動窗口長度、合成方式、飽和疑慮、感測器方向偵測可行性。以下為尚未解決者。
 
+### 已因範圍收斂而消除
+
+原列的「前端 raw 擷取排程」「軸承型號」「`_V`/`_OA` 定義」三項，**隨諧波診斷取消而不再需要**（見 §一）。
+
 ### 阻擋 Phase 1
 
-1. **異常事件回覆的輸出去向** — 只顯示在 Dashboard、寫入 `finding_note`、還是要寄出？
-2. **備機清單與試車排程** — 工程師整理中；試車制度待確認，用以對齊 `STANDBY_NO_RUNTIME` 規則
-3. **ISO 機械等級的設定來源** — `ISO10816_code` 目前為 0（未設定）。需要各設備的額定功率與基礎型式才能套用 Zone 判定；在此之前 Phase 1 只能以相對基準與趨勢規則為主
-
-### 影響 Phase 2（可稍後）
-
-4. **前端是否支援排程觸發 raw 擷取** — 若可，建議每日每點 10 秒快照（35 GB/年），自行計算階次分析，不依賴定義不明的諧波欄位（見 §三之二）
-5. **軸承型號** — `Ball`/`Vane`/`Gear` 特徵頻率目前皆為 0。有軸承型號即可推算 BPFO/BPFI/BSF，是軸承故障診斷的前提
-6. **`_V` / `_OA` 的原始定義** — 若還找得到前端的技術文件或原始碼可補上；找不到也不影響，改用自行計算
+1. **備機清單與試車排程** — 工程師整理中；試車制度待確認，用以對齊 `STANDBY_NO_RUNTIME` 規則
+2. **簽核鏈的角色與權限對應** — 設備工程師／工程師主管／專家分別是哪些人？是否需與公司帳號系統整合？
+3. **各階段的 SLA 期望** — 每一關期望多久內處理完？用以設定積壓告警門檻
 
 ### 可平行進行
 
-7. 電流 DB 的種類與連線方式（Sensor 端 Phase 1 走檔案，暫不需要）
-8. RAG 語料現況
-9. Dashboard 技術標準與帳號整合
-10. 部署環境與 Python 版本
-11. API Key 發放管理方式
+4. 電流 DB 的種類與連線方式（Sensor 端 Phase 1 走檔案，暫不需要）
+5. RAG 語料現況（簽核鏈上線後會自行累積，初期可先只接技術文獻）
+6. Dashboard 技術標準與帳號整合 — 見另份《Dashboard 需求書》
+7. 部署環境與 Python 版本
+8. API Key 發放管理方式
 
 ### 已確立的事實（不再是假設，見 §三之二）
 
