@@ -129,6 +129,13 @@ COMMENT ON COLUMN measure_point.axis_energy_baseline IS
 CREATE TABLE measurement_agg (
     point_id            BIGINT      NOT NULL REFERENCES measure_point(point_id) ON DELETE CASCADE,
     ts_hour             TIMESTAMPTZ NOT NULL,
+    -- 資料狀態：三種情況必須明確區分，混為一談會讓趨勢圖與規則同時出錯
+    data_status         TEXT        NOT NULL CHECK (data_status IN (
+                          'ok',           -- 資料完整且運轉中
+                          'partial',      -- 有資料但筆數不足（斷斷續續）
+                          'no_data',      -- 該小時完全無資料（感測器斷線）
+                          'not_running')),-- 有資料但設備未運轉（正常狀態，非異常）
+    completeness        NUMERIC(5,4) NOT NULL DEFAULT 0,  -- n_samples_total / 3600
     n_samples_total     INT         NOT NULL,     -- 該小時原始筆數（每秒 1 筆，滿載 3600）
     n_samples_running   INT         NOT NULL,     -- 其中判定運轉中的筆數；0 = 未運轉
     -- 速度（mm/s）
@@ -164,12 +171,17 @@ CREATE TABLE measurement_agg (
 );
 COMMENT ON TABLE measurement_agg IS
     'Tier 1 每小時聚合。RMS/OA 類取運轉樣本平均，PEAK/CREST/KURT 類取最大值（衝擊事件不可被平均掉）';
-COMMENT ON COLUMN measurement_agg.n_samples_running IS
-    '0 表示該小時未運轉；所有異常規則須跳過此類列，沒資料不等於有故障';
+COMMENT ON COLUMN measurement_agg.data_status IS
+    '斷線（no_data）與未運轉（not_running）是完全不同的事：前者是設備異常需告警，'
+    '後者是正常狀態。趨勢圖不可跨 no_data 連線，規則不可對 not_running 判異常';
+COMMENT ON COLUMN measurement_agg.completeness IS
+    '資料完整度；partial 狀態的指標僅供參考，不應作為趨勢回歸與規則判定的依據';
 
 CREATE INDEX idx_agg_ts      ON measurement_agg(ts_hour DESC);
 CREATE INDEX idx_agg_running ON measurement_agg(point_id, ts_hour DESC)
-    WHERE n_samples_running > 0;
+    WHERE data_status = 'ok';
+CREATE INDEX idx_agg_gap     ON measurement_agg(point_id, ts_hour)
+    WHERE data_status IN ('no_data','partial');
 
 -- 每日 rollup（供週報與長期趨勢）
 CREATE TABLE measurement_daily (
