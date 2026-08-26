@@ -1,0 +1,651 @@
+<title>設備振動週報</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root {
+    --paper:      #F4F6F7;
+    --card:       #FFFFFF;
+    --band:       #E9EEF0;
+    --rule:       #D8E0E3;
+    --rule-soft:  #EAEFF1;
+    --ink:        #111A20;
+    --ink-2:      #3B4C57;
+    --ink-3:      #6B7C87;
+    --brand:      #23424F;
+    --ok:         #1F7A4D;
+    --ok-bg:      #E3F2E9;
+    --warn:       #8A5D00;
+    --warn-bg:    #FBEEDA;
+    --crit:       #A32F26;
+    --crit-bg:    #FAE5E2;
+    --lift:       0 1px 1px rgba(17,26,32,.05), 0 6px 18px -10px rgba(17,26,32,.18);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:      #0D1317;
+      --card:       #151F25;
+      --band:       #1A252C;
+      --rule:       #2A373F;
+      --rule-soft:  #202C33;
+      --ink:        #E6EDF1;
+      --ink-2:      #B4C3CC;
+      --ink-3:      #8496A2;
+      --brand:      #8FB4C4;
+      --ok:         #5CB88A;
+      --ok-bg:      #14301F;
+      --warn:       #D9A648;
+      --warn-bg:    #33260C;
+      --crit:       #E37C70;
+      --crit-bg:    #371915;
+      --lift:       0 1px 1px rgba(0,0,0,.4), 0 6px 18px -10px rgba(0,0,0,.7);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:      #0D1317;
+    --card:       #151F25;
+    --band:       #1A252C;
+    --rule:       #2A373F;
+    --rule-soft:  #202C33;
+    --ink:        #E6EDF1;
+    --ink-2:      #B4C3CC;
+    --ink-3:      #8496A2;
+    --brand:      #8FB4C4;
+    --ok:         #5CB88A;
+    --ok-bg:      #14301F;
+    --warn:       #D9A648;
+    --warn-bg:    #33260C;
+    --crit:       #E37C70;
+    --crit-bg:    #371915;
+    --lift:       0 1px 1px rgba(0,0,0,.4), 0 6px 18px -10px rgba(0,0,0,.7);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 0 20px 80px;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+    line-height: 1.8;
+    -webkit-font-smoothing: antialiased;
+  }
+  .sheet { max-width: 780px; margin: 0 auto; }
+
+  .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  /* ── 範例標記 ─────────────────────── */
+  .sample {
+    max-width: 780px;
+    margin: 0 auto;
+    background: var(--warn-bg);
+    color: var(--warn);
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    padding: 9px 14px;
+    font-size: .8rem;
+    margin-top: 20px;
+    line-height: 1.6;
+  }
+  .sample b { font-weight: 700; }
+
+  /* ── 報頭 ─────────────────────────── */
+  header { padding: 34px 0 22px; }
+  .masthead {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    border-bottom: 3px solid var(--ink);
+    padding-bottom: 12px;
+  }
+  .masthead h1 {
+    font-size: 1.35rem;
+    font-weight: 900;
+    letter-spacing: .02em;
+    margin: 0;
+  }
+  .period { font-size: .82rem; color: var(--ink-3); letter-spacing: .04em; }
+
+  .verdict {
+    margin-top: 24px;
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-left: 5px solid var(--warn);
+    border-radius: 3px;
+    box-shadow: var(--lift);
+    padding: 22px 24px;
+  }
+  .verdict .tag {
+    display: inline-block;
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .12em;
+    padding: 3px 9px;
+    border-radius: 2px;
+    background: var(--warn-bg);
+    color: var(--warn);
+    margin-bottom: 12px;
+  }
+  .verdict p {
+    margin: 0;
+    font-size: 1.08rem;
+    font-weight: 500;
+    line-height: 1.75;
+    text-wrap: pretty;
+  }
+
+  /* ── 數據列 ───────────────────────── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    margin-top: 18px;
+    overflow: hidden;
+  }
+  .stat { background: var(--card); padding: 14px 16px; }
+  .stat .n { font-size: 1.5rem; font-weight: 600; line-height: 1.2; display: block; }
+  .stat .l { font-size: .76rem; color: var(--ink-3); display: block; margin-top: 2px; }
+  .stat.c .n { color: var(--crit); }
+  .stat.w .n { color: var(--warn); }
+  .stat.g .n { color: var(--ok); }
+
+  /* ── 區段 ─────────────────────────── */
+  section { margin-top: 46px; }
+  .sechead {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    border-bottom: 1.5px solid var(--ink);
+    padding-bottom: 7px;
+    margin-bottom: 18px;
+  }
+  .sechead h2 { font-size: 1.06rem; font-weight: 700; margin: 0; letter-spacing: .01em; }
+  .sechead .count {
+    font-size: .82rem;
+    font-weight: 600;
+    color: var(--ink-3);
+  }
+  .sechead .src {
+    margin-left: auto;
+    font-size: .68rem;
+    letter-spacing: .06em;
+    color: var(--ink-3);
+    text-transform: uppercase;
+  }
+  .secnote { font-size: .86rem; color: var(--ink-3); margin: -6px 0 18px; }
+
+  /* ── 事項卡 ───────────────────────── */
+  .item {
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-left: 4px solid var(--rule);
+    border-radius: 3px;
+    box-shadow: var(--lift);
+    padding: 18px 20px;
+    margin-bottom: 12px;
+  }
+  .item.err { border-left-color: var(--crit); }
+  .item.warn { border-left-color: var(--warn); }
+  .item.ok { border-left-color: var(--ok); }
+
+  .row1 {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    flex-wrap: wrap;
+    margin-bottom: 7px;
+  }
+  .sev {
+    font-size: .66rem;
+    font-weight: 700;
+    letter-spacing: .1em;
+    padding: 2px 7px;
+    border-radius: 2px;
+  }
+  .sev.err { background: var(--crit-bg); color: var(--crit); }
+  .sev.warn { background: var(--warn-bg); color: var(--warn); }
+  .sev.ok { background: var(--ok-bg); color: var(--ok); }
+  .dev { font-size: .84rem; font-weight: 600; color: var(--ink-2); letter-spacing: .02em; }
+  .loc { font-size: .78rem; color: var(--ink-3); }
+
+  .flag {
+    font-size: .68rem;
+    font-weight: 700;
+    letter-spacing: .04em;
+    padding: 2px 7px;
+    border-radius: 2px;
+    border: 1px solid currentColor;
+  }
+  .flag.up { color: var(--crit); background: var(--crit-bg); }
+  .flag.late { color: var(--warn); background: var(--warn-bg); }
+
+  .item h3 { font-size: 1.02rem; font-weight: 700; margin: 0 0 8px; line-height: 1.55; }
+  .item p { margin: 0 0 10px; font-size: .94rem; color: var(--ink-2); line-height: 1.75; }
+  .item p:last-child { margin-bottom: 0; }
+
+  .evidence {
+    background: var(--band);
+    border-radius: 2px;
+    padding: 10px 13px;
+    font-size: .84rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 20px;
+    margin: 0 0 11px;
+  }
+  .evidence span { color: var(--ink-3); }
+  .evidence b { color: var(--ink); font-weight: 600; }
+
+  .limit {
+    font-size: .84rem;
+    color: var(--ink-3);
+    border-left: 2px solid var(--rule);
+    padding-left: 11px;
+    margin: 0 0 11px;
+    line-height: 1.7;
+  }
+
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px 16px;
+    font-size: .78rem;
+    color: var(--ink-3);
+    border-top: 1px solid var(--rule-soft);
+    padding-top: 9px;
+    margin-top: 11px;
+  }
+
+  .reply {
+    background: var(--band);
+    border-radius: 2px;
+    padding: 11px 13px;
+    margin-top: 11px;
+    font-size: .87rem;
+    line-height: 1.7;
+  }
+  .reply .who {
+    font-size: .73rem;
+    color: var(--ink-3);
+    display: block;
+    margin-bottom: 3px;
+    letter-spacing: .03em;
+  }
+  .reply .said { color: var(--ink-2); }
+
+  /* ── 資料品質 ─────────────────────── */
+  .quality {
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    box-shadow: var(--lift);
+    padding: 18px 20px;
+  }
+  .qbar {
+    display: flex;
+    height: 9px;
+    border-radius: 2px;
+    overflow: hidden;
+    margin: 12px 0 14px;
+    background: var(--rule);
+  }
+  .qbar i { display: block; height: 100%; }
+  .qlegend { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: .8rem; color: var(--ink-3); }
+  .qlegend b { color: var(--ink); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
+  .qlist { list-style: none; padding: 0; margin: 15px 0 0; border-top: 1px solid var(--rule-soft); }
+  .qlist li {
+    font-size: .88rem;
+    color: var(--ink-2);
+    padding: 9px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    line-height: 1.65;
+  }
+  .qlist li:last-child { border-bottom: none; }
+
+  /* ── 備註 ─────────────────────────── */
+  .notes {
+    background: var(--card);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 18px 20px;
+    box-shadow: var(--lift);
+  }
+  .notes p { margin: 0 0 12px; font-size: .94rem; color: var(--ink-2); line-height: 1.8; }
+  .notes p:last-child { margin-bottom: 0; }
+
+  footer {
+    margin-top: 46px;
+    padding-top: 16px;
+    border-top: 1px solid var(--rule);
+    font-size: .78rem;
+    color: var(--ink-3);
+    line-height: 1.7;
+  }
+
+  :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="sample">
+  <b>範例畫面</b>　以下設備代號、數值與工程師回覆皆為模擬內容，用於呈現週報版面與資訊結構，非實際量測結果。
+</div>
+
+<div class="sheet">
+
+<header>
+  <div class="masthead">
+    <h1>設備振動週報</h1>
+    <span class="period mono">2026-W35 · 08/24 – 08/30 · FAB7</span>
+  </div>
+
+  <div class="verdict">
+    <span class="tag">需關注</span>
+    <p>
+      本週新增 3 件事項。AC-1000C 的衝擊性指標已連續第 4 週上升且數值持續惡化，
+      目前卡在主管審核已逾期，建議本週內排除。另有 1 支感測器離線 4 天，該量測點本週無法評估。
+    </p>
+  </div>
+
+  <div class="stats">
+    <div class="stat c"><span class="n mono">2</span><span class="l">嚴重</span></div>
+    <div class="stat w"><span class="n mono">5</span><span class="l">需關注</span></div>
+    <div class="stat"><span class="n mono">4</span><span class="l">追蹤中</span></div>
+    <div class="stat g"><span class="n mono">2</span><span class="l">本週已解決</span></div>
+    <div class="stat"><span class="n mono">91.3%</span><span class="l">資料涵蓋率</span></div>
+  </div>
+</header>
+
+<section>
+  <div class="sechead">
+    <h2>資料品質</h2>
+    <span class="src">系統統計</span>
+  </div>
+  <p class="secnote">涵蓋率不足的量測點，其判定結果不具參考價值，本週報中已排除其結論。</p>
+
+  <div class="quality">
+    <div class="qbar">
+      <i style="width:83.1%;background:var(--ok)"></i>
+      <i style="width:8.2%;background:var(--ink-3)"></i>
+      <i style="width:5.4%;background:var(--warn)"></i>
+      <i style="width:3.3%;background:var(--crit)"></i>
+    </div>
+    <div class="qlegend">
+      <span><i class="dot" style="background:var(--ok)"></i>可分析 <b class="mono">83.1%</b></span>
+      <span><i class="dot" style="background:var(--ink-3)"></i>設備未運轉 <b class="mono">8.2%</b></span>
+      <span><i class="dot" style="background:var(--warn)"></i>資料不全 <b class="mono">5.4%</b></span>
+      <span><i class="dot" style="background:var(--crit)"></i>感測器斷線 <b class="mono">3.3%</b></span>
+    </div>
+    <ul class="qlist">
+      <li><b class="mono">EF-405 / M1</b>　自 08/22 14:00 起無資料，已連續 <b class="mono">4 天</b>。本週該點所有指標未評估。</li>
+      <li><b class="mono">CWP-203 / M2</b>　08/26 有 <b class="mono">12 小時</b>資料不全，該時段指標已標記為不可信。</li>
+      <li><b class="mono">P-Backup-02</b>　備機，本週運轉 <b class="mono">1.5 小時</b>。運轉樣本不足以建立基準，僅以離線與試車規則監測。</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>本週新發現</h2>
+    <span class="count mono">3 件</span>
+    <span class="src">系統依資料庫判定</span>
+  </div>
+
+  <article class="item err">
+    <div class="row1">
+      <span class="sev err">嚴重</span>
+      <span class="dev mono">AHU-601 / M1</span>
+      <span class="loc">FAB7 · 6F · 空調</span>
+    </div>
+    <h3>振動位準進入 ISO Zone C</h3>
+    <div class="evidence">
+      <span>velRMS <b class="mono">4.82 mm/s</b></span>
+      <span>基準 <b class="mono">1.51 mm/s</b></span>
+      <span>機械等級 <b class="mono">Class II</b></span>
+      <span>C 區門檻 <b class="mono">2.80 mm/s</b></span>
+    </div>
+    <p>整體振動位準較基準期上升約 3.2 倍，已超過 Class II 的 B/C 分界。同期衝擊性指標（Crest 2.9 → 3.1、Kurtosis 2.1 → 2.2）幾乎未變動。</p>
+    <p class="limit">本系統可判定位準已超標，但無法區分成因。建議先確認安裝固定與運轉負載是否有變化，必要時安排專家量測系統複測。</p>
+    <div class="meta">
+      <span>首次發現 <b class="mono">08/27</b></span>
+      <span>指派 陳姓工程師</span>
+      <span>回覆期限 <b class="mono">09/01</b></span>
+    </div>
+  </article>
+
+  <article class="item err">
+    <div class="row1">
+      <span class="sev err">嚴重</span>
+      <span class="dev mono">EF-405 / M1</span>
+      <span class="loc">FAB7 · 3F · 排風</span>
+    </div>
+    <h3>感測器離線超過 24 小時</h3>
+    <div class="evidence">
+      <span>最後回報 <b class="mono">08/22 14:00</b></span>
+      <span>已中斷 <b class="mono">4 天 2 小時</b></span>
+      <span>門檻 <b class="mono">24 小時</b></span>
+    </div>
+    <p>該量測點自 08/22 起完全無資料進入。斷線期間所有健康指標均無法評估，不代表設備狀態正常。</p>
+    <p class="limit">需現場確認感測器供電、通訊與安裝狀態。設備本身是否正常，需待資料恢復後才能判斷。</p>
+    <div class="meta">
+      <span>首次發現 <b class="mono">08/23</b></span>
+      <span>指派 林姓工程師</span>
+      <span>回覆期限 <b class="mono">08/28</b></span>
+    </div>
+  </article>
+
+  <article class="item warn">
+    <div class="row1">
+      <span class="sev warn">需關注</span>
+      <span class="dev mono">ZP1-2 / M2</span>
+      <span class="loc">FAB7 · B2F · 冰水</span>
+    </div>
+    <h3>三軸能量分佈相對基準偏移</h3>
+    <div class="evidence">
+      <span>主軸佔比 <b class="mono">0.72 → 0.58</b></span>
+      <span>次軸佔比 <b class="mono">0.19 → 0.34</b></span>
+      <span>偏移量 <b class="mono">0.15</b></span>
+      <span>門檻 <b class="mono">0.15</b></span>
+    </div>
+    <p>振動能量在三軸之間的分配比例出現變化，整體位準（velRMS 1.42 mm/s）仍在 Zone A。</p>
+    <p class="limit">此變化可能來自感測器重新安裝，也可能來自設備本身的振動方向改變，本系統無法區分。建議先確認該量測點近期是否有更換或重貼感測器。</p>
+    <div class="meta">
+      <span>首次發現 <b class="mono">08/25</b></span>
+      <span>指派 陳姓工程師</span>
+      <span>回覆期限 <b class="mono">08/30</b></span>
+    </div>
+  </article>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>追蹤中</h2>
+    <span class="count mono">4 件</span>
+    <span class="src">依簽核進度</span>
+  </div>
+
+  <article class="item err">
+    <div class="row1">
+      <span class="sev err">嚴重</span>
+      <span class="dev mono">AC-1000C / M1</span>
+      <span class="loc">K24 · 1F · 空壓</span>
+      <span class="flag up">情況惡化</span>
+      <span class="flag late">逾期 2 天</span>
+    </div>
+    <h3>衝擊性指標持續上升（第 4 次提出）</h3>
+    <div class="evidence">
+      <span>Crest <b class="mono">3.1 → 5.8</b></span>
+      <span>Kurtosis <b class="mono">3.2 → 6.1</b></span>
+      <span>偏離 <b class="mono">+3.4σ</b></span>
+      <span>首次發現 <b class="mono">08/01</b></span>
+    </div>
+    <p>
+      自 08/01 首次提出後數值未回落，本週 Crest 由上週的 5.1 再升至 5.8。
+      雖已進入簽核流程，但<strong>數值仍在惡化</strong>，既有處置可能來不及。
+    </p>
+    <p class="limit">衝擊性指標上升常見於軸承或潤滑劣化，本系統無法區分成因。已連續四週上升且持續惡化，建議優先安排專家量測系統實測確認。</p>
+    <div class="reply">
+      <span class="who">主管最後回覆 · 08/22 · 王主管</span>
+      <span class="said">已排定 09 月初停機檢查，在此之前維持監測。</span>
+    </div>
+    <div class="meta">
+      <span>已開啟 <b class="mono">26 天</b></span>
+      <span>目前階段 <b>待專家複審</b></span>
+      <span>停留 <b class="mono">7 天</b>（SLA 5 天）</span>
+    </div>
+  </article>
+
+  <article class="item warn">
+    <div class="row1">
+      <span class="sev warn">需關注</span>
+      <span class="dev mono">CWP-203 / M1</span>
+      <span class="loc">FAB7 · B1F · 冰水</span>
+    </div>
+    <h3>整體位準持續劣化（第 2 次提出）</h3>
+    <div class="evidence">
+      <span>velRMS <b class="mono">1.68 → 2.14 mm/s</b></span>
+      <span>劣化速率 <b class="mono">+12.4%/月</b></span>
+      <span>R² <b class="mono">0.71</b></span>
+      <span>信心度 <b>中</b></span>
+    </div>
+    <p>趨勢延續上週判定，速率大致持平。以目前速率推估，約 41 天後將觸及 Class II 的 B/C 分界（2.80 mm/s）。</p>
+    <div class="reply">
+      <span class="who">工程師回覆 · 08/25 · 陳姓工程師</span>
+      <span class="said">現場確認聯軸器護罩有輕微鬆動，已重新鎖固，持續觀察兩週。</span>
+    </div>
+    <div class="meta">
+      <span>已開啟 <b class="mono">18 天</b></span>
+      <span>目前階段 <b>待主管審核</b></span>
+      <span>停留 <b class="mono">2 天</b></span>
+    </div>
+  </article>
+
+  <article class="item warn">
+    <div class="row1">
+      <span class="sev warn">需關注</span>
+      <span class="dev mono">AHU-702 / M2</span>
+      <span class="loc">FAB7 · 7F · 空調</span>
+    </div>
+    <h3>ISO 機械等級疑似設定有誤（第 3 次提出）</h3>
+    <div class="evidence">
+      <span>基準期中位數 <b class="mono">2.51 mm/s</b></span>
+      <span>目前等級 <b class="mono">Class I</b></span>
+      <span>Class I 之 B/C 界 <b class="mono">1.80</b></span>
+      <span>Class II 之 B/C 界 <b class="mono">2.80</b></span>
+    </div>
+    <p>該設備在狀態最穩定的期間，位準中位數即已超過所屬等級的 B/C 分界。可能是等級設定有誤，也可能設備本身長期偏高。</p>
+    <p class="limit">等級一經更正，此設備過去的 Zone 判定結果都需要重新檢視。請工程師依 ISO 10816 複核額定功率與基礎型式後回覆。</p>
+    <div class="meta">
+      <span>已開啟 <b class="mono">21 天</b></span>
+      <span>目前階段 <b>待專家複審</b></span>
+      <span>停留 <b class="mono">3 天</b></span>
+    </div>
+  </article>
+
+  <article class="item warn">
+    <div class="row1">
+      <span class="sev warn">需關注</span>
+      <span class="dev mono">P-Backup-02 / M1</span>
+      <span class="loc">FAB7 · B1F · 冰水（備機）</span>
+    </div>
+    <h3>備機長期未運轉（第 5 次提出）</h3>
+    <div class="evidence">
+      <span>累計未運轉 <b class="mono">47 天</b></span>
+      <span>本週運轉 <b class="mono">1.5 小時</b></span>
+      <span>門檻 <b class="mono">30 天</b></span>
+    </div>
+    <p>本週雖有短暫運轉，但累計靜置時間仍超過門檻。運轉樣本不足以建立健康基準，此設備目前僅能以離線與試車規則監測。</p>
+    <div class="reply">
+      <span class="who">主管最後回覆 · 08/11 · 王主管</span>
+      <span class="said">已納入季度試車排程，10 月執行。</span>
+    </div>
+    <div class="meta">
+      <span>已開啟 <b class="mono">34 天</b></span>
+      <span>目前階段 <b>待專家複審</b></span>
+      <span>停留 <b class="mono">4 天</b></span>
+    </div>
+  </article>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>本週已解決</h2>
+    <span class="count mono">2 件</span>
+    <span class="src">系統自資料庫擷取</span>
+  </div>
+
+  <article class="item ok">
+    <div class="row1">
+      <span class="sev ok">已結案</span>
+      <span class="dev mono">CWP-105 / M1</span>
+      <span class="loc">FAB7 · B1F · 冰水</span>
+    </div>
+    <h3>速度整體值偏高　→　處置後回歸正常</h3>
+    <div class="evidence">
+      <span>velOA <b class="mono">3.24 → 1.38 mm/s</b></span>
+      <span>基準 <b class="mono">1.30 mm/s</b></span>
+      <span>歷時 <b class="mono">11 天</b></span>
+    </div>
+    <div class="reply">
+      <span class="who">結案紀錄 · 08/28 · 陳姓工程師</span>
+      <span class="said">現場查出底座固定螺栓鬆動，重新扭緊後數值回到基準水準。</span>
+    </div>
+  </article>
+
+  <article class="item ok">
+    <div class="row1">
+      <span class="sev ok">自動結案</span>
+      <span class="dev mono">AHU-303 / M2</span>
+      <span class="loc">FAB7 · 3F · 空調</span>
+    </div>
+    <h3>多變量偏離基準　→　數值自行回歸</h3>
+    <div class="evidence">
+      <span>偏離距離 <b class="mono">3.6 → 1.9</b></span>
+      <span>門檻 <b class="mono">3.0</b></span>
+      <span>歷時 <b class="mono">6 天</b></span>
+    </div>
+    <p>連續 3 日回到門檻內，由系統自動結案。該期間無人工處置紀錄，判斷為短期運轉條件變化所致。</p>
+  </article>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>觀察與建議</h2>
+    <span class="src">Agent 撰寫</span>
+  </div>
+  <div class="notes">
+    <p>
+      本週最需要注意的是 <b class="mono">AC-1000C</b>。它已是第四次提出，且與前三週不同的是，
+      這次數值在簽核進行中仍持續惡化——主管 08/22 回覆已排定 09 月初停機檢查，
+      但依目前上升速率，建議評估是否需要提前。
+    </p>
+    <p>
+      <b class="mono">EF-405</b> 的感測器已離線 4 天。要提醒的是，斷線期間該點所有指標都不會產生任何警示，
+      因此「本週沒有它的異常」不代表設備正常，只代表沒有資料。
+    </p>
+    <p>
+      <b class="mono">ZP1-2 / M2</b> 的軸能量分佈偏移，若近期確有更換或重貼感測器，此事項可逕行標記為誤報結案；
+      若無，則建議留意後續兩週是否持續偏移。
+    </p>
+    <p>
+      本週全廠可分析比例 83.1%，較上週的 89.6% 下降，主因為 EF-405 離線。
+      其餘設備的資料品質維持穩定。
+    </p>
+  </div>
+</section>
+
+<footer>
+  本報告由設備振動監測系統自動產生。異常判定、嚴重度分級與簽核狀態由規則引擎依現行門檻設定計算；
+  「觀察與建議」一節由 Agent 依上述判定結果撰寫，不含故障類型判定。
+  深度診斷請另行安排專家量測系統。
+</footer>
+
+</div>
