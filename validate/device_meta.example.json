@@ -1,0 +1,9 @@
+{
+  "_說明": "Analytic CSV 不含「是否備機」「ISO 等級是否已由工程師確認」這類台帳資訊，見 validate/README.md 的「需要準備什麼資料」一節。把下面的範例改成貴司實際設備代碼與台帳資訊即可；device_id 需與 Analytic CSV 的 Name 欄一致。",
+  "AHU-601": { "is_standby": false },
+  "CHW-PUMP-3": {
+    "is_standby": true,
+    "iso_machine_class": "II",
+    "iso_class_source": "frontend"
+  }
+}

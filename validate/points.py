@@ -159,7 +159,7 @@ def load_points(folder: str, pattern: str = '*.csv',
         source_files = [e[2] for e in entries]
         device_ctx = _build_device_context(device_id, meta, overrides.get(device_id))
 
-        merged['_position'] = _position_series(merged)
+        merged = merged.assign(_position=_position_series(merged))
         for position, sub in merged.groupby('_position', sort=True):
             points.append(PointSeries(
                 device=device_ctx,

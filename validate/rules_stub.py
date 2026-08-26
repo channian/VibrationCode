@@ -12,31 +12,32 @@ rules_stub.py — 13 條規則的可替換 stub 實作
 `validate/offline.py` 完全不需要改。
 
 **已經是真實模組、不是 stub 的部分**：`vibcore/metrics/iso.py`
-（ISO 分級）與 `vibcore/metrics/deviation.py`（Mahalanobis 偏離）在撰寫
-本檔當下已經存在且介面穩定，因此 `ISO_ZONE` / `ISO_CLASS_SUSPECT` /
-`STEP_CHANGE` 三條規則**直接呼叫這兩個真實模組**，不是自己重新發明一套
-簡化邏輯——這樣回測結果對這三條規則才有參考價值。若之後這兩個模組介面
+（ISO 分級）、`vibcore/metrics/deviation.py`（Mahalanobis 偏離）與
+`vibcore/metrics/trend.py`（線性趨勢）在撰寫本檔當下已經存在且介面穩定，
+因此 `ISO_ZONE` / `ISO_CLASS_SUSPECT` / `STEP_CHANGE` / `DEGRADE_TREND` /
+`SPECTRAL_SHIFT` 五條規則**直接呼叫這些真實模組**，不是自己重新發明一套
+簡化邏輯——這樣回測結果對這五條規則才有參考價值。若之後這些模組介面
 改變或暫時不可匯入，會自動退回本檔內建的簡化版（見各自函式內的
 try/except），確保框架不會因此打不通，但退回時的結果**僅供跑通驗證，
 不能拿來做真的門檻判斷**（報告會標註 `is_real=False`）。
 
-**其餘規則（VEL_HIGH、IMPACT_RISE、DEGRADE_TREND、SPECTRAL_SHIFT、
-AXIS_SHIFT、ORIENTATION_CHANGE、SENSOR_OFFLINE、DATA_QUALITY、
-SENSOR_SATURATION、STANDBY_NO_RUNTIME）目前沒有對應的 vibcore 模組**，
-以下全部是簡化 stub，邏輯直接寫在本檔、不去猜真實模組路徑（因為根本
-還沒人在寫）。每個函式的 docstring 都寫明簡化了什麼、真正的規則層完成
-後這裡的判準需要注意哪些差異。
+**其餘規則（VEL_HIGH、IMPACT_RISE、AXIS_SHIFT、ORIENTATION_CHANGE、
+SENSOR_OFFLINE、DATA_QUALITY、SENSOR_SATURATION、STANDBY_NO_RUNTIME）
+目前沒有對應的 vibcore 模組**，以下全部是簡化 stub，邏輯直接寫在本檔、
+不去猜真實模組路徑（因為根本還沒人在寫）。每個函式的 docstring 都寫明
+簡化了什麼、真正的規則層完成後這裡的判準需要注意哪些差異。
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Callable
 
 import numpy as np
 import pandas as pd
 
-from vibcore.config import DEFAULT_TREND, DataStatus, FULL_SCALE_MS2
+from vibcore.config import DEFAULT_TREND, DataStatus, FULL_SCALE_MS2, TrendConfig
 from vibcore.types import DeviationResult, RuleContext, RuleOutcome, TrendResult
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,18 @@ def _get_deviation_funcs():
 
 _fit_deviation_model, _evaluate_deviation, USING_REAL_DEVIATION = _get_deviation_funcs()
 
+
+def _get_trend_evaluator():
+    try:
+        from vibcore.metrics.trend import compute_trend
+        return compute_trend, True
+    except ImportError:
+        logger.warning("vibcore.metrics.trend 無法匯入，DEGRADE_TREND/SPECTRAL_SHIFT 使用內建簡化版")
+        return None, False
+
+
+_compute_trend, USING_REAL_TREND = _get_trend_evaluator()
+
 #: STEP_CHANGE 的候選特徵；實際會用哪些取交集（agg 有該欄且基準期有統計量）
 _STEP_CHANGE_FEATURES = ['vel_rms', 'acc_rms', 'acc_crest', 'acc_kurt', 'acc_weighted_mean_freq']
 
@@ -364,6 +377,25 @@ def rule_impact_rise(ctx: RuleContext) -> RuleOutcome:
                         evidence={'crest_sigma': crest_sigma, 'kurt_sigma': kurt_sigma})
 
 
+def _trend_asof(ctx: RuleContext, metric: str, cfg: TrendConfig) -> TrendResult:
+    """
+    以 `ctx.now` 為截止時間算趨勢——優先用真實模組 `vibcore.metrics.trend`
+    （以實際天數為 x 軸、有完整的涵蓋率把關，見該模組說明），不可用時退回
+    本檔的簡化線性回歸 `_linear_trend_stub`。
+
+    真實模組吃「整份 agg，自己篩 ok 列」，因此這裡只需要把 `ts_hour > now`
+    的列剪掉（模擬「這天規則引擎只看得到當下已入庫的資料」），不必自己
+    先篩 `data_status`。
+    """
+    agg_asof = ctx.agg[ctx.agg['ts_hour'] <= ctx.now]
+    if _compute_trend is not None:
+        return _compute_trend(agg_asof, metric, ctx.baseline, cfg=cfg)
+
+    ok = agg_asof[agg_asof['data_status'] == DataStatus.OK] if 'data_status' in agg_asof.columns else agg_asof
+    baseline_median = ctx.baseline.stats[metric].median if ctx.baseline and metric in ctx.baseline.stats else None
+    return _linear_trend_stub(ok, metric, ctx.now, cfg.min_days, cfg.min_points, cfg.min_r2, baseline_median)
+
+
 def rule_degrade_trend(ctx: RuleContext, metric: str = 'acc_rms') -> RuleOutcome:
     """
     回歸斜率持續惡化（單一代表性指標：acc_rms，整體加速度能量水準）。
@@ -372,52 +404,52 @@ def rule_degrade_trend(ctx: RuleContext, metric: str = 'acc_rms') -> RuleOutcome
     固定用 `acc_rms` 當代表，避免同一小時對同一設備因為多指標各自觸發
     而虛增 Finding 數量，回測時對「量級」判斷更保守（寧可少算不要多算）。
     """
-    ok = ctx.agg[ctx.agg['data_status'] == DataStatus.OK] if 'data_status' in ctx.agg.columns else ctx.agg
-    baseline_median = ctx.baseline.stats[metric].median if ctx.baseline and metric in ctx.baseline.stats else None
     min_days = int(ctx.params.get('min_days', DEFAULT_TREND.min_days))
     min_r2 = float(ctx.params.get('min_r2', DEFAULT_TREND.min_r2))
     slope_th = float(ctx.params.get('slope_pct_per_month', 10))
+    cfg = dataclasses.replace(DEFAULT_TREND, min_days=min_days, min_r2=min_r2)
 
-    trend = _linear_trend_stub(ok, metric, ctx.now, min_days, DEFAULT_TREND.min_points, min_r2, baseline_median)
+    trend = _trend_asof(ctx, metric, cfg)
     triggered = (trend.is_reliable and trend.direction == 'up'
+                 and not pd.isna(trend.slope_pct_per_month)
                  and abs(trend.slope_pct_per_month) >= slope_th)
     return RuleOutcome(triggered=triggered, rule_code='DEGRADE_TREND', issue_type='degradation_trend',
                         family='monotonic', severity='warn',
                         title=f'{metric} 持續劣化' if triggered else '',
-                        detail=f'斜率 {trend.slope_pct_per_month:+.1f}%/月，R²={trend.r2:.2f}，'
-                               f'span={trend.span_days:.0f} 天' if trend.n_points else trend.note,
+                        detail=(f'斜率 {trend.slope_pct_per_month:+.1f}%/月，R²={trend.r2:.2f}，'
+                                f'span={trend.span_days:.0f} 天') if trend.n_points >= 2 else trend.note,
                         current_value=trend.slope_pct_per_month, interpretation_limit=_TRIAGE_LIMIT,
-                        evidence={'metric': metric, 'r2': trend.r2, 'n_points': trend.n_points})
+                        evidence={'metric': metric, 'confidence': trend.confidence, 'n_points': trend.n_points})
 
 
 def rule_spectral_shift(ctx: RuleContext) -> RuleOutcome:
-    """accWeightedMeanFreq 相對基準持續上移（能量往高頻移動，不辨識個別諧波）。"""
+    """
+    accWeightedMeanFreq 相對基準持續上移（能量往高頻移動，不辨識個別諧波）。
+
+    `rule_config` 的 `shift_pct` 是「累計位移百分比」而非「每月變化率」，
+    但趨勢模組（無論真實版或 stub）算的是速率（`slope_pct_per_month`）；
+    這裡用 `速率 × (觀察天數 / 30)` 換算回累計位移，語意上等於「這段觀察期
+    以來，頻譜重心總共移動了多少百分比」。
+    """
     metric = 'acc_weighted_mean_freq'
     shift_pct_th = float(ctx.params.get('shift_pct', 15))
     min_days = int(ctx.params.get('min_days', DEFAULT_TREND.min_days))
+    cfg = dataclasses.replace(DEFAULT_TREND, min_days=min_days)
 
-    if ctx.baseline is None or metric not in ctx.baseline.stats:
-        return RuleOutcome.no_trigger('SPECTRAL_SHIFT', 'spectral_shift', 'monotonic')
-    baseline_median = ctx.baseline.stats[metric].median
-    if not baseline_median:
-        return RuleOutcome.no_trigger('SPECTRAL_SHIFT', 'spectral_shift', 'monotonic')
-
-    span_days = (ctx.now.date() - ctx.baseline.end_date).days
-    recent = _recent_ok(ctx.agg, ctx.now, window_days=7)
-    if recent.empty or metric not in recent.columns or span_days < min_days:
+    trend = _trend_asof(ctx, metric, cfg)
+    if not trend.is_reliable or pd.isna(trend.slope_pct_per_month) or trend.direction != 'up':
         return RuleOutcome.no_trigger('SPECTRAL_SHIFT', 'spectral_shift', 'monotonic')
 
-    recent_mean = float(recent[metric].dropna().mean()) if recent[metric].notna().any() else None
-    if recent_mean is None:
-        return RuleOutcome.no_trigger('SPECTRAL_SHIFT', 'spectral_shift', 'monotonic')
-
-    shift_pct_actual = (recent_mean - baseline_median) / baseline_median * 100
-    triggered = shift_pct_actual >= shift_pct_th
+    cumulative_shift_pct = trend.slope_pct_per_month * (trend.span_days / 30.0)
+    triggered = cumulative_shift_pct >= shift_pct_th
     return RuleOutcome(triggered=triggered, rule_code='SPECTRAL_SHIFT', issue_type='spectral_shift',
                         family='monotonic', severity='warn',
                         title='頻譜重心上移' if triggered else '',
-                        current_value=recent_mean, baseline_value=baseline_median, value_unit='Hz',
-                        interpretation_limit=_TRIAGE_LIMIT, evidence={'shift_pct': round(shift_pct_actual, 1)})
+                        detail=f'累計位移 {cumulative_shift_pct:+.1f}%，span={trend.span_days:.0f} 天',
+                        current_value=cumulative_shift_pct, value_unit='%',
+                        interpretation_limit=_TRIAGE_LIMIT,
+                        evidence={'cumulative_shift_pct': round(cumulative_shift_pct, 1),
+                                  'confidence': trend.confidence})
 
 
 def rule_axis_shift(ctx: RuleContext) -> RuleOutcome:

@@ -125,20 +125,40 @@ def _finding_stats_by_device(episodes_df: pd.DataFrame, result: BacktestResult) 
     return out.sort_values('n_episodes', ascending=False).reset_index(drop=True)
 
 
+def _device_span_weeks(result: BacktestResult) -> dict[str, float]:
+    """
+    每台設備**自己實際被監測到的期間**（週），而不是全批資料的共同期間。
+
+    合成測試資料就踩過這個坑：設備 A 只有 30 天資料、設備 B 有 55 天，
+    若密度分母一律用「全部設備裡最早到最晚」的共同區間，A 的密度會被
+    嚴重低估（分母比它實際被監測的時間長）。每台設備必須各自算自己的
+    觀測期間，密度數字才反映真實負荷。
+    """
+    spans: dict[str, list[pd.Timestamp]] = {}
+    for pc in result.point_contexts:
+        if pc.agg.empty:
+            continue
+        device_id = pc.point.device.device_id
+        lo, hi = pc.agg['ts_hour'].min(), pc.agg['ts_hour'].max()
+        bounds = spans.setdefault(device_id, [lo, hi])
+        bounds[0] = min(bounds[0], lo)
+        bounds[1] = max(bounds[1], hi)
+    return {d: span_weeks(lo, hi) for d, (lo, hi) in spans.items()}
+
+
 def _trigger_density(episodes_df: pd.DataFrame, result: BacktestResult) -> pd.DataFrame:
     """
     每台設備每週觸發密度——**判斷會不會誤報洪水的關鍵指標**。
 
-    分母用整批資料的回測期間（週），分子用該設備的事件數；沒有觸發過的
-    設備也要出現在表裡（值為 0），否則平均值會被「有問題的設備」帶偏，
-    看不出真實的全廠負荷。
+    分母是**該設備自己**的觀測期間（週），分子是該設備的事件數；沒有
+    觸發過的設備也要出現在表裡（值為 0），否則平均值會被「有問題的設備」
+    帶偏，看不出真實的全廠負荷。
     """
-    weeks = span_weeks(result.span_start, result.span_end)
+    device_weeks = _device_span_weeks(result)
     by_device = _finding_stats_by_device(episodes_df, result)
-    by_device['span_weeks'] = round(weeks, 2)
-    by_device['episodes_per_week'] = (
-        (by_device['n_episodes'] / weeks).round(3) if weeks else 0.0
-    )
+    by_device['span_weeks'] = by_device['device_id'].map(device_weeks).fillna(0.0).round(2)
+    by_device['episodes_per_week'] = by_device.apply(
+        lambda r: round(r['n_episodes'] / r['span_weeks'], 3) if r['span_weeks'] else 0.0, axis=1)
     return by_device[['device_id', 'device_name', 'n_episodes', 'span_weeks', 'episodes_per_week']] \
         .sort_values('episodes_per_week', ascending=False).reset_index(drop=True)
 
@@ -189,12 +209,15 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
     for _, d in density.head(10).iterrows():
         lines.append(f"  {d['device_id']:15s} {d['episodes_per_week']:.2f} 件/週"
                      f"（{d['n_episodes']} 件 / {d['span_weeks']:.1f} 週）")
+    # 全廠平均用「總事件數 / 各設備觀測週數總和」——每台設備觀測期間可能
+    # 不同（新裝設備、中途停用等），用單一共同期間當分母會系統性算錯
+    # （見 `_device_span_weeks` 說明），必須逐台加總分母才正確。
     fleet_total = density['n_episodes'].sum()
-    fleet_weeks = density['span_weeks'].iloc[0] if not density.empty else 0
+    fleet_device_weeks = density['span_weeks'].sum()
     fleet_devices = len(density) or 1
-    fleet_density = fleet_total / (fleet_devices * fleet_weeks) if fleet_weeks else 0
+    fleet_density = fleet_total / fleet_device_weeks if fleet_device_weeks else 0
     lines.append(f"  全廠平均：{fleet_density:.2f} 件/設備/週"
-                 f"（總計 {int(fleet_total)} 件 / {fleet_devices} 台設備 / {fleet_weeks:.1f} 週）")
+                 f"（總計 {int(fleet_total)} 件 / {fleet_devices} 台設備 / 觀測週數總和 {fleet_device_weeks:.1f} 週）")
     if fleet_density > 2:
         lines.append("  ⚠ 平均每台每週超過 2 件，四階段簽核可能很快就會塞爆，建議檢視門檻敏感度表後調鬆")
     lines.append('')

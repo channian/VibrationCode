@@ -71,9 +71,7 @@ def build_point_context(point: PointSeries, agg_cfg: AggregateConfig = DEFAULT_A
     if agg.empty:
         return PointContext(point=point, agg=agg, baseline=None, axis_baseline=None, eval_timestamps=[])
 
-    baseline = compute_baseline(agg, DEFAULT_TREND.min_days, DEFAULT_TREND.min_points)
-    if baseline is not None:
-        baseline.point_id = point.point_id
+    baseline = compute_baseline(agg, point.point_id)
     axis_baseline = compute_axis_energy_baseline(agg, DEFAULT_TREND.min_days)
 
     # 每個「有資料的日曆日」評估一次，取當天最後一筆 ts_hour 當作「現在」——
@@ -224,11 +222,21 @@ def sweep_threshold(point_contexts: list[PointContext],
     if fn is None:
         raise ValueError(f"未知規則代碼：{rule_code}")
     base_row = base_rule_configs[rule_code]
-    total_weeks = span_weeks(
-        min((pc.agg['ts_hour'].min() for pc in point_contexts if not pc.agg.empty), default=None),
-        max((pc.agg['ts_hour'].max() for pc in point_contexts if not pc.agg.empty), default=None),
-    )
-    n_devices_total = len({pc.point.device.device_id for pc in point_contexts}) or 1
+
+    # 分母用「各設備觀測週數總和」而非「共同期間 × 設備數」——設備各自的
+    # 資料起訖不一定相同（新裝設備、資料量不齊），用單一共同期間乘設備數
+    # 會系統性算錯每設備每週的密度（見 `validate/report.py` 的
+    # `_device_span_weeks` docstring，同樣的道理）。
+    device_spans: dict[str, list[pd.Timestamp]] = {}
+    for pc in point_contexts:
+        if pc.agg.empty:
+            continue
+        device_id = pc.point.device.device_id
+        lo, hi = pc.agg['ts_hour'].min(), pc.agg['ts_hour'].max()
+        bounds = device_spans.setdefault(device_id, [lo, hi])
+        bounds[0] = min(bounds[0], lo)
+        bounds[1] = max(bounds[1], hi)
+    total_device_weeks = sum(span_weeks(lo, hi) for lo, hi in device_spans.values())
 
     rows = []
     for v in values:
@@ -245,7 +253,7 @@ def sweep_threshold(point_contexts: list[PointContext],
             'param_value': v,
             'n_episodes': n_episodes,
             'n_devices_affected': n_devices_affected,
-            'episodes_per_device_per_week': round(n_episodes / (n_devices_total * total_weeks), 4)
-            if total_weeks else 0.0,
+            'episodes_per_device_per_week': round(n_episodes / total_device_weeks, 4)
+            if total_device_weeks else 0.0,
         })
     return pd.DataFrame(rows)
