@@ -98,6 +98,10 @@ CREATE TABLE device (
 COMMENT ON COLUMN device.iso_class_source IS
     'unset=未分級（不套 Zone 判定）；frontend=前端程式由工程師分類；manual_override=人工覆寫';
 COMMENT ON COLUMN device.is_standby IS '備機；未運轉不判異常，另受 STANDBY_NO_RUNTIME 規則監測';
+COMMENT ON COLUMN device.iso_machine_class IS
+    'ISO 10816 機械等級 I~IV，決定 iso_threshold 套用哪一組 Zone 門檻；為 NULL 時等同 iso_class_source=unset，不套用 Zone 判定';
+COMMENT ON COLUMN device.status IS
+    'active=正常監測中；inactive=暫停監測（不觸發新 Finding，但保留歷史資料）；decommissioned=已報廢（不再匯入新資料）';
 
 CREATE INDEX idx_device_owner   ON device(owner_user_id);
 CREATE INDEX idx_device_scope   ON device(building, floor, system_name);
@@ -184,6 +188,9 @@ CREATE INDEX idx_agg_gap     ON measurement_agg(point_id, ts_hour)
     WHERE data_status IN ('no_data','partial');
 
 -- 每日 rollup（供週報與長期趨勢）
+-- 各數值欄位定義與單位同 measurement_agg（vel_rms 為 mm/s、acc_* 為 m/s²、
+-- disp_p2p 為 mm），此處為當日彙整值，聚合方式（RMS 類平均／PEAK 類取最大）
+-- 亦與 measurement_agg 相同，這裡不重複列出。
 CREATE TABLE measurement_daily (
     point_id      BIGINT NOT NULL REFERENCES measure_point(point_id) ON DELETE CASCADE,
     date          DATE   NOT NULL,
@@ -201,6 +208,8 @@ CREATE TABLE measurement_daily (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (point_id, date)
 );
+COMMENT ON TABLE measurement_daily IS
+    '每日 rollup，供週報與長期趨勢使用；各數值欄位定義與單位同 measurement_agg，此處為當日彙整值';
 
 -- Tier 2 檔案索引（只記位置，不存內容）
 CREATE TABLE raw_file (
@@ -304,6 +313,8 @@ COMMENT ON COLUMN point_baseline.n_hours IS
     '建立此基準所用的 ok 小時數；偏低時所有以此為準的 σ 比較都需標示信心度';
 COMMENT ON COLUMN point_baseline.stats IS
     '如 {"vel_rms":{"median":1.51,"std":0.08}, "acc_kurt":{"median":2.05,"std":0.11}, ...}';
+COMMENT ON COLUMN point_baseline.source IS
+    'auto=由 detect_baseline() 自動掃描選定；manual=人工指定的基準期範圍';
 
 -- ISO 10816 / 20816 Zone 門檻（velRMS mm/s），可由管理員調整
 CREATE TABLE iso_threshold (
@@ -314,6 +325,13 @@ CREATE TABLE iso_threshold (
     cd_boundary   NUMERIC(8,3) NOT NULL,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+COMMENT ON COLUMN iso_threshold.ab_boundary IS
+    'Zone A/B 分界（velRMS mm/s）；低於此值為 Zone A（良好，新機或大修後的典型水準）';
+COMMENT ON COLUMN iso_threshold.bc_boundary IS
+    'Zone B/C 分界；超過即進入 Zone C（不宜長期運轉，ISO_ZONE 規則預設在此門檻觸發告警）';
+COMMENT ON COLUMN iso_threshold.cd_boundary IS
+    'Zone C/D 分界；超過即 Zone D（可能造成損壞，通常需立即處理）';
 
 INSERT INTO iso_threshold (machine_class, label, ab_boundary, bc_boundary, cd_boundary) VALUES
     ('I',   'Class I（< 15 kW）',        0.71,  1.80,  4.50),
@@ -333,6 +351,25 @@ CREATE TABLE rule_config (
     description TEXT,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+COMMENT ON TABLE rule_config IS
+    '規則設定；params 為各規則實際使用的門檻參數（JSONB），改這裡不需要改程式碼';
+COMMENT ON COLUMN rule_config.rule_code IS
+    '規則代碼，對應 vibcore/rules/ 內以 @register(rule_code) 註冊的判定函式';
+COMMENT ON COLUMN rule_config.family IS
+    '判準家族：oscillating=波動型（隨工況起伏會自行回落，需形態判準區分零星尖峰與持續超標）；'
+    'monotonic=單調累積型（不會自行回落，看趨勢斜率與到達門檻的時間）；'
+    'event=事件型（二元狀態或計數，如斷線／未運轉）；none=不適用三家族判準';
+COMMENT ON COLUMN rule_config.issue_type IS
+    '對應 finding.issue_type，與 target_type/target 一起組出 finding_key';
+COMMENT ON COLUMN rule_config.severity IS
+    '此規則觸發時預設的嚴重度；err=需立即處理，warn=需關注';
+COMMENT ON COLUMN rule_config.params IS
+    '規則判定用的門檻參數（σ、天數、百分比等），鍵名由各規則函式自行定義並讀取；'
+    '此表的值即為現行有效門檻，API 的 get_vibration_thresholds 直接回傳此表內容';
+COMMENT ON COLUMN rule_config.is_active IS
+    '停用時規則引擎會直接跳過此規則，不對任何設備產生此類 Finding';
+COMMENT ON COLUMN rule_config.description IS
+    '規則的中文說明，供管理介面與人工複核參考，不影響程式判定邏輯';
 
 INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, params, description) VALUES
     ('ISO_ZONE',           'ISO 位準分級',     'oscillating', 'iso_zone_exceed',  'err',
@@ -448,6 +485,15 @@ COMMENT ON COLUMN finding.interpretation_limit IS
     '明確標示此證據的解讀邊界，供 agent 遵守「不臆測故障類型」的護欄';
 COMMENT ON COLUMN finding.escalated_at IS
     '系統判定持續惡化；週報不可因狀態為「處理中」而輕描淡寫';
+COMMENT ON COLUMN finding.target_type IS
+    '判定對象層級：device=整台設備（如 STANDBY_NO_RUNTIME）；'
+    'point=特定量測點（多數規則屬此類）；global=全廠層級，不對應特定設備';
+COMMENT ON COLUMN finding.family IS
+    '沿用觸發規則的 rule_config.family（見該欄位說明）；獨立存一份是因為規則設定'
+    '未來可能異動，但既有 Finding 應保留當初觸發時的判準家族，不隨設定變更回溯改變';
+COMMENT ON COLUMN finding.source IS
+    '此 Finding 的建立來源：rule_engine=每日排程的規則引擎自動建立；'
+    'agent=由 Agent 產生（規劃中，尚未啟用）；manual=人工建立';
 
 CREATE INDEX idx_finding_open     ON finding(status, severity, stage_entered_at)
     WHERE status NOT IN ('closed','auto_resolved','false_positive');
