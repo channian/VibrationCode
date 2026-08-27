@@ -29,6 +29,8 @@ from typing import Any
 import psycopg2.extensions
 from psycopg2.extras import RealDictCursor
 
+from vibcore.db.repository import find_missing_ingestion, get_ingestion_audit
+
 logger = logging.getLogger(__name__)
 
 Connection = psycopg2.extensions.connection
@@ -60,6 +62,13 @@ _DEFAULT_STANDBY_DAYS = 30
 _GAP_NO_DATA_MIN_HOURS = 1
 _GAP_PARTIAL_MIN_HOURS = 1
 _GAP_LIST_MAX_ITEMS = 20
+
+#: 匯入稽核清單只列出真正需要人看的項目，同理設一個上限避免塞爆週報
+_INGEST_ISSUE_MAX_ITEMS = 30
+
+#: ingestion_log.status 中「排程確實跑過，但結果不理想」的三種狀態；
+#: 與「完全沒有紀錄」（find_missing_ingestion）合起來才是完整的系統面問題清單
+_INGEST_PROBLEM_STATUSES = ("failed", "partial", "no_file")
 
 
 def _as_aware(ts: Any) -> datetime:
@@ -387,6 +396,83 @@ def _get_standby_threshold_days(conn: Connection) -> int:
     return _DEFAULT_STANDBY_DAYS
 
 
+def _fetch_ingestion_audit(
+    conn: Connection, period_start: date, period_end: date
+) -> dict[str, Any]:
+    """
+    收集本期的匯入稽核資訊，供週報把「感測器斷線」與「匯入排程沒跑」分開呈現。
+
+    刻意獨立於 `_fetch_coverage_gaps` 之外，兩者互不交叉比對——原因見
+    `repository.find_missing_ingestion` 的設計說明：只要某量測點某天
+    `ingestion_log` 完全沒有紀錄，不論 `measurement_agg` 那天是否存在
+    `no_data` 列，都直接算系統面問題；反過來，`measurement_agg` 顯示
+    `no_data` 但 `ingestion_log` 確實有紀錄（不論好壞），代表排程當天
+    確實處理過這個量測點，那是設備面問題，交給 `_fetch_coverage_gaps`
+    的既有邏輯呈現，這裡不重複判定。兩條路徑天生正交，不需要互相比對
+    就能正確分流，也正因如此才能不遺漏「連一列聚合資料都不存在」的
+    整日缺漏（見 aggregate.py `_fill_gap_hours` 的已知限制）。
+    """
+    missing = find_missing_ingestion(conn, period_start, period_end)
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM measure_point WHERE is_active")
+        total_active_points = int(cur.fetchone()["n"])
+
+    # 逐日統計缺漏量測點數，找出「全廠都無匯入紀錄」的日子——那種日子
+    # 全廠的判定都不可信，不能只是清單裡多幾行字，必須在週報上特別標示。
+    missing_by_date: dict[date, int] = {}
+    for m in missing:
+        missing_by_date[m["date"]] = missing_by_date.get(m["date"], 0) + 1
+
+    missing_dates: list[dict[str, Any]] = []
+    all_missing_dates: list[date] = []
+    for d in sorted(missing_by_date):
+        cnt = missing_by_date[d]
+        all_missing = total_active_points > 0 and cnt >= total_active_points
+        missing_dates.append({
+            "date": d, "missing_count": cnt,
+            "total_points": total_active_points, "all_missing": all_missing,
+        })
+        if all_missing:
+            all_missing_dates.append(d)
+
+    issues: list[dict[str, Any]] = [
+        {
+            "date": m["date"],
+            "kind": "no_import",
+            "device_label": f'{m["device_id"]} / {m["position"]}' if m.get("position") else m["device_id"],
+            "location": _location_label(m),
+            "note": "",
+        }
+        for m in missing
+    ]
+
+    audit_df = get_ingestion_audit(conn, period_start, period_end)
+    has_logged_problem = False
+    if not audit_df.empty:
+        problem_mask = audit_df["status"].isin(_INGEST_PROBLEM_STATUSES)
+        has_logged_problem = bool(problem_mask.any())
+        for row in audit_df[problem_mask].to_dict("records"):
+            label = f'{row["device_id"]} / {row["position"]}' if row.get("position") else row["device_id"]
+            issues.append({
+                "date": row["ingest_date"],
+                "kind": row["status"],
+                "device_label": label,
+                "location": _location_label(row),
+                "note": row.get("note") or "",
+            })
+
+    issues.sort(key=lambda it: (it["date"], it["device_label"]))
+
+    return {
+        "has_missing": bool(missing) or has_logged_problem,
+        "total_missing": len(missing),
+        "issues": issues[:_INGEST_ISSUE_MAX_ITEMS],
+        "missing_dates": missing_dates,
+        "all_missing_dates": all_missing_dates,
+    }
+
+
 def _fetch_device_status_summary(conn: Connection) -> dict[str, Any]:
     """全廠設備狀態摘要（供頁首補充統計，不含個別事項明細）。"""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -416,7 +502,8 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
           "tracking_findings": [...],  # 本期之前就存在，未結案
           "resolved_findings": [...],  # 本期內結案，完全來自 DB
           "coverage": {...},           # 四態涵蓋率統計
-          "coverage_gaps": [...],      # 涵蓋率問題明細（斷線/資料不全/備機閒置）
+          "coverage_gaps": [...],      # 涵蓋率問題明細（斷線/資料不全/備機閒置，設備面）
+          "ingestion_audit": {...},    # 匯入稽核（排程沒跑，系統面；與上者刻意分開判定）
           "device_status_summary": {...},
           "stats": {"err_count","warn_count","tracking_count","resolved_count","affected_devices"},
         }
@@ -455,6 +542,7 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
 
     coverage = _fetch_coverage(conn, start, end)
     coverage_gaps = _fetch_coverage_gaps(conn, start, end, period_end)
+    ingestion_audit = _fetch_ingestion_audit(conn, period_start, period_end)
     device_status_summary = _fetch_device_status_summary(conn)
 
     affected_devices = {f["device_label"].split(" / ")[0] for f in new_findings + tracking_findings}
@@ -469,10 +557,16 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
     }
 
     logger.info(
-        "週報資料收集完成：新發現 %d、追蹤中 %d、已解決 %d、涵蓋率問題 %d 筆（%s ~ %s）",
+        "週報資料收集完成：新發現 %d、追蹤中 %d、已解決 %d、涵蓋率問題 %d 筆、"
+        "匯入稽核問題 %d 筆（%s ~ %s）",
         len(new_findings), len(tracking_findings), len(resolved_findings), len(coverage_gaps),
-        period_start, period_end,
+        len(ingestion_audit["issues"]), period_start, period_end,
     )
+    if ingestion_audit["all_missing_dates"]:
+        logger.warning(
+            "本期有 %d 天全廠皆無匯入紀錄，當日判定不具參考價值：%s",
+            len(ingestion_audit["all_missing_dates"]), ingestion_audit["all_missing_dates"],
+        )
 
     return {
         "period_start": period_start,
@@ -482,6 +576,7 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
         "resolved_findings": resolved_findings,
         "coverage": coverage,
         "coverage_gaps": coverage_gaps,
+        "ingestion_audit": ingestion_audit,
         "device_status_summary": device_status_summary,
         "stats": stats,
     }

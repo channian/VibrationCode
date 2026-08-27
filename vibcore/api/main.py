@@ -29,7 +29,7 @@ from psycopg2.extensions import connection as Connection
 
 from vibcore.api import service
 from vibcore.api.auth import verify_api_key
-from vibcore.api.schemas import SendReportRequest
+from vibcore.api.schemas import DAYS_MAX, DAYS_MIN, SendReportRequest
 from vibcore.db.connection import get_connection
 
 logging.basicConfig(level=logging.INFO)
@@ -98,11 +98,14 @@ def get_device_trend(
     device_id: str,
     metric: str = Query(..., description="vibcore.config.AGG_SPEC 的鍵名，例如 vel_rms"),
     position: str | None = None,
-    days: int = Query(default=30, ge=1, le=365),
+    days: int = Query(
+        default=30, ge=DAYS_MIN, le=DAYS_MAX,
+        description="觀察期天數，以日曆日切齊（見 service.resolve_period）",
+    ),
     _: None = Depends(verify_api_key),
     conn: Connection = Depends(get_db),
 ) -> dict:
-    """指標歷史趨勢，支援 days 參數。"""
+    """指標歷史趨勢，支援 days 參數（日曆日切齊，見 service.resolve_period）。"""
     return service.get_device_trend(
         conn, device_id=device_id, metric=metric, position=position, days=days
     )
@@ -127,14 +130,17 @@ def get_open_findings(
 
 @app.get(f"{TOOLS_PREFIX}/get_weekly_report_data")
 def get_weekly_report_data(
-    days: int = Query(default=7, ge=1, le=90, description="日報傳 1"),
+    days: int = Query(
+        default=7, ge=DAYS_MIN, le=DAYS_MAX,
+        description="窗口天數，以日曆日切齊（見 service.resolve_period）；日報傳 1",
+    ),
     building: str | None = None,
     floor: str | None = None,
     system: str | None = None,
     _: None = Depends(verify_api_key),
     conn: Connection = Depends(get_db),
 ) -> dict:
-    """週報彙總，支援 days 參數（日報傳 days=1）。"""
+    """週報彙總，支援 days 參數（日報傳 days=1；日曆日切齊，見 service.resolve_period）。"""
     return service.get_weekly_report_data(
         conn, days=days, building=building, floor=floor, system_name=system
     )
@@ -157,9 +163,12 @@ def send_report(
     conn: Connection = Depends(get_db),
 ) -> dict:
     """
-    收 verdict/headline/actions/notes，本系統負責排版寄送（SMTP 尚未設定，
-    目前僅落庫）。四道卡控：不接受收件人欄位、主旨系統產生、只收結構化
-    欄位並一律 HTML 轉義、每日發送次數上限（超過回 429，每次成功寫稽核 log）。
+    收 verdict/headline/actions/notes/days（選填 end_date），本系統負責排版
+    寄送（SMTP 尚未設定，目前僅落庫）。時間窗一律用 `days` 相對天數表示，
+    與 `get_weekly_report_data` 共用 `service.resolve_period()` 做日曆日切齊，
+    確保同一輪流程中兩者算出同一段期間。四道卡控：不接受收件人欄位、
+    主旨系統產生、只收結構化欄位並一律 HTML 轉義、每日發送次數上限
+    （超過回 429，每次成功寫稽核 log）。
     """
     limit = int(os.environ.get("VIB_REPORT_DAILY_LIMIT", DEFAULT_DAILY_REPORT_LIMIT))
     return service.send_report(conn, payload, daily_limit=limit)

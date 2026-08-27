@@ -78,6 +78,51 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def resolve_period(days: int, end_date: date | None = None) -> tuple[date, date]:
+    """
+    把「相對天數」的 `days` 參數換算成 `[period_start, period_end]`（皆為日期、
+    含頭尾）——本模組所有時間窗查詢共用的**唯一**入口，不得各自實作。
+
+    為什麼要抽成單一函式：no-code agent 平台上，日期運算是留給 LLM 自己
+    算的話，算錯了不會報錯，只會安靜產出涵蓋錯誤區間的報告；改成「相對
+    天數」後，日期運算移回系統側，但前提是所有端點都用**同一套**換算
+    邏輯——如果 `get_weekly_report_data` 與 `send_report` 各自用
+    `datetime.now() - timedelta(days=days)` 實作，兩次呼叫之間只要相差
+    幾分鐘，算出來的窗口就會不一樣：週報影響不大，但日報（`days=1`）
+    剛好跨過午夜時，兩邊會拿到完全不同的一天。
+
+    做法是把窗口錨定在「日曆日」而非「呼叫當下的時間點」：以 `end_date`
+    （預設今天，UTC）往前推 `days - 1` 天。同一個 UTC 日曆日之內，不論
+    呼叫幾次、相差幾分鐘，都會得到一模一樣的 `(period_start, period_end)`。
+
+    Args:
+        days: 窗口天數（含 `end_date` 當天）。呼叫端（FastAPI Query / Pydantic
+            Field）已驗證落在合理範圍（建議 1–365），本函式不重複驗證。
+        end_date: 窗口結束日（含）；預設為 UTC 今天，供 `send_report`
+            補產歷史報告時指定過去某天。
+
+    Returns:
+        `(period_start, period_end)`，皆為日期，`period_end` 一律等於
+        `end_date`（或今天），`period_start = end_date - (days - 1)`。
+    """
+    if end_date is None:
+        end_date = _now().date()
+    period_start = end_date - timedelta(days=days - 1)
+    return period_start, end_date
+
+
+def _period_utc_bounds(period_start: date, period_end: date) -> tuple[datetime, datetime]:
+    """
+    把 `resolve_period()` 算出的日曆日窗口，轉成查詢用的 `[start, end)` UTC
+    時間戳範圍——`period_end` 當天整天都要涵蓋，所以上界是 `period_end`
+    隔天的 00:00（不含）。所有時間戳皆已是 UTC（見 docs/agent_tools.md §1.4），
+    「日曆日」在此即為 UTC 日曆日，與其餘端點的時間格式一致。
+    """
+    start = datetime.combine(period_start, time.min, tzinfo=timezone.utc)
+    end = datetime.combine(period_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+    return start, end
+
+
 def _finding_public(row: dict) -> dict:
     """把 finding 相關的 DB row 轉成給 agent 的 dict，強制補上 interpretation_limit。"""
     d = jsonable(dict(row))
@@ -155,8 +200,9 @@ def _latest_ok_metrics(agg) -> dict:
 def _point_status(conn, device, point: dict) -> dict:
     point_id = point["point_id"]
     now = _now()
-    start = now - timedelta(days=_STATUS_WINDOW_DAYS)
-    agg = repository.get_agg(conn, point_id, start, now + timedelta(hours=1))
+    period_start, period_end = resolve_period(_STATUS_WINDOW_DAYS)
+    start, end = _period_utc_bounds(period_start, period_end)
+    agg = repository.get_agg(conn, point_id, start, end)
 
     last_real = queries.last_real_data_at(conn, point_id)
     data_age_minutes = None
@@ -231,7 +277,12 @@ def get_device_status(conn, device_id: str) -> dict:
 def get_device_trend(
     conn, device_id: str, metric: str, position: str | None = None, days: int = 30
 ) -> dict:
-    """指標歷史趨勢；`metric` 須為 `vibcore.config.AGG_SPEC` 的鍵名。"""
+    """
+    指標歷史趨勢；`metric` 須為 `vibcore.config.AGG_SPEC` 的鍵名。
+
+    `days` 一律經 `resolve_period()` 換算成日曆日切齊的窗口，不用「現在
+    往前推 N×24 小時」——理由見 `resolve_period()` docstring。
+    """
     device = repository.get_device(conn, device_id)
     if device is None:
         return {"error": f"設備不存在：{device_id}"}
@@ -246,9 +297,9 @@ def get_device_trend(
         return {"error": f"量測點不存在：{device_id}/{position}"}
 
     point_id = point["point_id"]
-    now = _now()
-    start = now - timedelta(days=days)
-    agg = repository.get_agg(conn, point_id, start, now + timedelta(hours=1))
+    period_start, period_end = resolve_period(days)
+    start, end = _period_utc_bounds(period_start, period_end)
+    agg = repository.get_agg(conn, point_id, start, end)
     baseline = repository.get_baseline(conn, point_id)
     trend = trend_mod.compute_trend(agg, metric, baseline)
     cov = coverage_report(agg)
@@ -276,6 +327,7 @@ def get_device_trend(
         "position": point.get("position"),
         "metric": metric,
         "days": days,
+        "period": {"start": jsonable(period_start), "end": jsonable(period_end)},
         "trend": {
             "slope_per_day": jsonable(trend.slope_per_day),
             "slope_per_month": jsonable(trend.slope_per_month),
@@ -329,12 +381,19 @@ def get_weekly_report_data(
     floor: str | None = None,
     system_name: str | None = None,
 ) -> dict:
-    """週報彙總；`days=1` 供日報使用。"""
-    now = _now()
-    start = now - timedelta(days=days)
+    """
+    週報彙總；`days=1` 供日報使用。
+
+    窗口一律經 `resolve_period()` 換算成日曆日切齊的區間，與 `send_report`
+    共用同一函式——同一輪流程中先呼叫本工具、幾分鐘後再呼叫
+    `send_report(days=N)`，兩者算出的期間保證相同，不會因為呼叫時間點
+    相差幾分鐘而各自對到不同的一天（`days=1` 跨午夜時尤其關鍵）。
+    """
+    period_start, period_end = resolve_period(days)
+    start, end = _period_utc_bounds(period_start, period_end)
 
     summary = queries.finding_summary_for_period(
-        conn, start, now, building=building, floor=floor, system_name=system_name
+        conn, start, end, building=building, floor=floor, system_name=system_name
     )
     open_rows = repository.get_open_findings(
         conn, building=building, floor=floor, system_name=system_name
@@ -343,7 +402,7 @@ def get_weekly_report_data(
     escalated_rows = [r for r in open_rows if r.get("escalated_at")]
 
     coverage_rows = queries.point_coverage_for_period(
-        conn, start, now, building=building, floor=floor, system_name=system_name
+        conn, start, end, building=building, floor=floor, system_name=system_name
     )
     coverage_items = []
     insufficient = []
@@ -368,7 +427,7 @@ def get_weekly_report_data(
     org_ratio = round(sum(ratios) / len(ratios), 4) if ratios else 0.0
 
     return {
-        "period": {"start": jsonable(start), "end": jsonable(now), "days": days},
+        "period": {"start": jsonable(period_start), "end": jsonable(period_end), "days": days},
         "findings_summary": {
             "currently_open": {
                 "err": open_by_severity.get("err", 0),
@@ -412,9 +471,9 @@ def get_event_context(conn, finding_key: str) -> dict:
 
     data_quality = None
     if row.get("point_id"):
-        now = _now()
-        start = now - timedelta(days=_EVENT_CONTEXT_WINDOW_DAYS)
-        agg = repository.get_agg(conn, row["point_id"], start, now + timedelta(hours=1))
+        period_start, period_end = resolve_period(_EVENT_CONTEXT_WINDOW_DAYS)
+        start, end = _period_utc_bounds(period_start, period_end)
+        agg = repository.get_agg(conn, row["point_id"], start, end)
         data_quality = jsonable(coverage_report(agg))
 
     finding_public = _finding_public(row)
@@ -454,7 +513,13 @@ def _render_placeholder_html(
 
 def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
     """
-    收 verdict/headline/actions/notes，本系統負責排版與（未來）寄送。
+    收 verdict/headline/actions/notes/days，本系統負責排版與（未來）寄送。
+
+    時間窗改為 `days`（相對天數，預設 7）+ 選填 `end_date`，一律經
+    `resolve_period()` 換算成日曆日切齊的 `[period_start, period_end]`——
+    與 `get_weekly_report_data` 共用同一函式，同一輪流程中兩者呼叫時間
+    相差幾分鐘也不影響算出的期間（見 `resolve_period()` docstring）。
+    不給 `end_date` 時預設為系統當下日期；給了則用於補產歷史報告。
 
     四道卡控：
       1. 收件人由系統設定決定——`SendReportRequest` 結構本身不接受收件人欄位
@@ -480,18 +545,18 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         {"level": a.level, "text": html_escape.escape(a.text)} for a in payload.actions
     ]
 
-    start_dt = datetime.combine(payload.period_start, time.min, tzinfo=timezone.utc)
-    end_dt = datetime.combine(payload.period_end, time.min, tzinfo=timezone.utc) + timedelta(days=1)
+    period_start, period_end = resolve_period(payload.days, end_date=payload.end_date)
+    start_dt, end_dt = _period_utc_bounds(period_start, period_end)
     summary = queries.finding_summary_for_period(
         conn, start_dt, end_dt,
         building=payload.building, floor=payload.floor, system_name=payload.system_name,
     )
 
     if payload.report_type == "weekly":
-        iso_cal = payload.period_end.isocalendar()
+        iso_cal = period_end.isocalendar()
         period_label = f"{iso_cal[0]}-W{iso_cal[1]:02d}"
     else:
-        period_label = payload.period_end.isoformat()
+        period_label = period_end.isoformat()
 
     agent_payload = {
         "verdict": payload.verdict,
@@ -508,8 +573,8 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         conn,
         report_type=payload.report_type,
         period_label=period_label,
-        period_start=payload.period_start,
-        period_end=payload.period_end,
+        period_start=period_start,
+        period_end=period_end,
         verdict=payload.verdict,
         headline=headline,
         agent_payload=agent_payload,
@@ -534,6 +599,7 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         "period_label": row["period_label"],
         "period_start": jsonable(row["period_start"]),
         "period_end": jsonable(row["period_end"]),
+        "days": payload.days,
         "verdict": row["verdict"],
         "headline": row["headline"],
         "actions": actions,

@@ -219,6 +219,48 @@ COMMENT ON TABLE raw_file IS 'Tier 2 檔案索引；analytic=每秒處理後資�
 CREATE INDEX idx_rawfile_date ON raw_file(file_date DESC);
 
 
+-- 每日匯入排程的執行紀錄（區分「感測器斷線」與「匯入排程沒跑」）
+--
+-- 動機：measurement_agg 的 no_data 只回答「這小時沒有數字」，答不出
+-- 「為什麼沒有」。感測器斷線與匯入排程沒跑，在 measurement_agg 裡長得
+-- 一模一樣（同樣是那個量測點、那段時間全是 no_data），但前者要現場查
+-- 感測器、後者要查系統排程，兩者對調是白跑一趟。更嚴重的是邊界情況：
+-- 若某天完全沒有來源檔、排程整個沒跑，聚合流程根本不會被觸發，
+-- measurement_agg 連一列（含 no_data）都不會寫入——現有的缺口偵測只補
+-- 「已觀測範圍內」的空洞（見 aggregate.py 的 _fill_gap_hours），對這種
+-- 整天憑空消失的情況完全無感。
+--
+-- ingestion_log 記錄「匯入這件事本身有沒有發生」，且獨立於
+-- measurement_agg 之外——找缺漏時是拿「量測點 × 應涵蓋的每一天」當
+-- 母集合去比對這張表，不是反過來從 measurement_agg 回推，才抓得到
+-- 上述「連一列都不存在」的邊界情況。
+CREATE TABLE ingestion_log (
+    point_id    BIGINT      NOT NULL REFERENCES measure_point(point_id) ON DELETE CASCADE,
+    ingest_date DATE        NOT NULL,   -- 這筆匯入涵蓋的「資料日期」，不是執行匯入當下的日期
+    status      TEXT        NOT NULL CHECK (status IN ('ok','partial','failed','no_file')),
+    source_file TEXT        NOT NULL DEFAULT '',
+    row_count   BIGINT      NOT NULL DEFAULT 0,
+    note        TEXT        NOT NULL DEFAULT '',
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (point_id, ingest_date)
+);
+COMMENT ON TABLE ingestion_log IS
+    '每日匯入排程的執行紀錄，一個量測點一天一列。此表沒有紀錄，即代表匯入排程當天'
+    '根本沒有處理過這個量測點——這與「排程跑了但該點沒資料」（感測器斷線）是完全不同'
+    '的問題，前者查系統排程，後者查現場設備，不可混為一談。';
+COMMENT ON COLUMN ingestion_log.status IS
+    'ok=正常匯入；partial=有匯入但檔案不完整；failed=匯入過程出錯；'
+    'no_file=該日根本沒有來源檔（上游未產生），四者皆代表「排程確實處理過這一天」，'
+    '差別只在結果好不好——真正的系統面死角是完全沒有這一列的 (point_id, ingest_date)';
+COMMENT ON COLUMN ingestion_log.ingest_date IS
+    '資料所屬日期，不是 ingested_at 的日期；補跑匯入時，同一天執行可能涵蓋更早的資料日';
+
+CREATE INDEX idx_ingestion_date       ON ingestion_log(ingest_date);
+CREATE INDEX idx_ingestion_point_date ON ingestion_log(point_id, ingest_date DESC);
+CREATE INDEX idx_ingestion_problem    ON ingestion_log(ingest_date, point_id)
+    WHERE status IN ('partial','failed','no_file');
+
+
 -- =============================================================
 -- 四、SCADA（電流等）
 -- =============================================================

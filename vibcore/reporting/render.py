@@ -314,7 +314,53 @@ def _gap_sentence(gap: dict[str, Any]) -> str:
     return ""
 
 
-def _present_quality(coverage: dict[str, Any], gaps: list[dict[str, Any]]) -> dict[str, Any]:
+#: ingestion_log 問題狀態 → 中文用語；措辭刻意與 `_gap_sentence` 的設備面
+#: 敘述（斷線／資料不全）明顯不同，讀者不必看到「檢查系統排程」字樣以外
+#: 的線索，就能一眼分辨這是系統面而非設備面的問題
+_INGEST_KIND_LABELS: dict[str, str] = {
+    "no_import": "當日完全無匯入紀錄",
+    "failed":    "匯入過程回報錯誤",
+    "partial":   "匯入紀錄顯示檔案不完整",
+    "no_file":   "當日無來源檔案可匯入",
+}
+
+
+def _ingestion_sentence(item: dict[str, Any]) -> str:
+    """
+    組出「系統面問題」清單裡每一行的說明文字。
+
+    刻意在每一句都重申「非感測器異常」——這正是這個機制存在的理由：
+    現有的斷線描述（`_gap_sentence` 的 offline 分支）已經用了「感測器
+    斷線」這個詞，若這裡的措辭不夠明確區分，工程師掃過去很容易把兩種
+    清單混為一談，又跑去現場檢查一台其實好好的感測器。
+    """
+    label = _INGEST_KIND_LABELS.get(item["kind"], item["kind"])
+    sentence = (f"{_fmt_date(item['date'])}：{label}，非感測器異常，"
+                f"請檢查當日匯入排程／來源檔案是否正常執行。")
+    if item.get("note"):
+        sentence += f"（{item['note']}）"
+    return sentence
+
+
+def _ingestion_banner(all_missing_dates: list[Any]) -> str:
+    """
+    全廠當日無匯入紀錄的警示文字；沒有這幾天就回傳空字串（樣板據此決定是否顯示）。
+
+    用詞刻意比清單裡的單點問題更重——這不是「某幾個量測點的問題」，是
+    「當天的所有判定都建立在不存在的資料上」，讀者不能把它當成資料品質
+    清單裡普通的一行帶過。
+    """
+    if not all_missing_dates:
+        return ""
+    dates_label = "、".join(_fmt_date(d) for d in sorted(all_missing_dates))
+    return (f"{dates_label}：全廠所有量測點當日皆無匯入紀錄，並非設備同時斷線，"
+            f"而是匯入排程當天很可能完全沒有執行。當日（含）所有設備的判定"
+            f"不具參考價值，請勿依本週報結論排除異常，並優先確認匯入排程執行狀態。")
+
+
+def _present_quality(
+    coverage: dict[str, Any], gaps: list[dict[str, Any]], ingestion_audit: dict[str, Any],
+) -> dict[str, Any]:
     bar_segments = [
         {"var": "--ok", "pct": coverage["ok_ratio"] * 100},
         {"var": "--ink-3", "pct": coverage["not_running_ratio"] * 100},
@@ -331,11 +377,20 @@ def _present_quality(coverage: dict[str, Any], gaps: list[dict[str, Any]]) -> di
         {"device_label": g["device_label"], "location": g["location"], "sentence": _gap_sentence(g)}
         for g in gaps
     ]
+    ingestion_items = [
+        {
+            "device_label": it["device_label"], "location": it["location"],
+            "sentence": _ingestion_sentence(it),
+        }
+        for it in ingestion_audit.get("issues") or []
+    ]
     return {
         "has_data": coverage["total_hours"] > 0,
         "bar_segments": bar_segments,
         "legend": legend,
         "gap_items": gap_items,
+        "ingestion_items": ingestion_items,
+        "all_missing_banner": _ingestion_banner(ingestion_audit.get("all_missing_dates") or []),
         "header_ratio_label": _fmt_pct(coverage["header_ratio"]),
     }
 
@@ -420,7 +475,9 @@ def render_weekly_html(data: dict[str, Any], agent_payload: dict[str, Any] | Non
         "verdict_label": VERDICT_LABELS.get(verdict, verdict),
         "headline": headline,
         "stat_tiles": stat_tiles,
-        "quality": _present_quality(data["coverage"], data["coverage_gaps"]),
+        "quality": _present_quality(
+            data["coverage"], data["coverage_gaps"], data.get("ingestion_audit") or {},
+        ),
         "new_findings": new_findings,
         "tracking_findings": tracking_findings,
         "resolved_findings": resolved_findings,

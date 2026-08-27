@@ -261,6 +261,28 @@ section { margin-top: 46px; }
 .qlist li { font-size: .88rem; color: var(--ink-2); padding: 9px 0; border-bottom: 1px solid var(--rule-soft); line-height: 1.65; }
 .qlist li:last-child { border-bottom: none; }
 
+.qgroup-label {
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 18px 0 0;
+}
+.qgroup-label:first-child { margin-top: 0; }
+
+.ingest-banner {
+  background: var(--crit-bg);
+  color: var(--crit);
+  border: 1px solid var(--crit);
+  border-radius: 3px;
+  padding: 13px 16px;
+  font-size: .88rem;
+  font-weight: 600;
+  line-height: 1.75;
+  margin: 0 0 14px;
+}
+
 .notes {
   background: var(--card);
   border: 1px solid var(--rule);
@@ -369,10 +391,17 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
     <h2>資料品質</h2>
     <span class="src">系統統計</span>
   </div>
-  <p class="secnote">涵蓋率不足的量測點，其判定結果不具參考價值，本週報中已排除其結論。</p>
+  <p class="secnote">涵蓋率不足的量測點，其判定結果不具參考價值，本週報中已排除其結論。
+    「設備面問題」與「系統面問題」是完全不同的兩件事：前者是感測器本身異常，該找現場工程師；
+    後者是每日匯入排程沒有正常執行，資料從一開始就不存在，該找系統排程，不是感測器。</p>
 
-  {% if quality.has_data %}
+  {% if quality.all_missing_banner %}
+  <p class="ingest-banner">{{ quality.all_missing_banner }}</p>
+  {% endif %}
+
+  {% if quality.has_data or quality.gap_items or quality.ingestion_items %}
   <div class="quality">
+    {% if quality.has_data %}
     <div class="qbar">
       {% for seg in quality.bar_segments %}
       <i style="width:{{ '%.1f'|format(seg.pct) }}%;background:var({{ seg.var }})"></i>
@@ -383,9 +412,23 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
       <span><i class="dot" style="background:var({{ leg.var }})"></i>{{ leg.label }} <b class="mono">{{ leg.pct_label }}</b></span>
       {% endfor %}
     </div>
+    {% else %}
+    <p class="empty">本期查無逐時聚合資料，涵蓋率無法計算——請優先確認下方「系統面問題」是否為原因。</p>
+    {% endif %}
+
     {% if quality.gap_items %}
+    <div class="qgroup-label">設備面問題 · 現場檢查感測器</div>
     <ul class="qlist">
       {% for g in quality.gap_items %}
+      <li><b class="mono">{{ g.device_label }}</b>{% if g.location %}　<span class="loc">{{ g.location }}</span>{% endif %}<br>{{ g.sentence }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if quality.ingestion_items %}
+    <div class="qgroup-label">系統面問題 · 檢查每日匯入排程</div>
+    <ul class="qlist">
+      {% for g in quality.ingestion_items %}
       <li><b class="mono">{{ g.device_label }}</b>{% if g.location %}　<span class="loc">{{ g.location }}</span>{% endif %}<br>{{ g.sentence }}</li>
       {% endfor %}
     </ul>

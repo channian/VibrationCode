@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Iterable
 
 import numpy as np
@@ -355,6 +355,125 @@ def upsert_daily(conn: Connection, point_id: int, daily_df: pd.DataFrame) -> int
     with conn.cursor() as cur:
         execute_values(cur, sql, rows, page_size=500)
     return len(rows)
+
+
+# =============================================================
+# 匯入稽核（區分「感測器斷線」與「匯入排程沒跑」）
+# =============================================================
+#
+# 三支函式合起來要回答一個現有系統答不出來的問題：某量測點某天沒資料，
+# 是「感測器斷線」還是「匯入排程根本沒跑」？兩者在 measurement_agg 裡
+# 長得一模一樣，但前者該找現場工程師，後者該找系統排程，處置方向完全
+# 相反——誤判的成本不是「少一則告警」，是工程師白跑一趟現場。
+#
+# find_missing_ingestion 之所以要以 measure_point × 日期為母集合、
+# 而不是從 measurement_agg 反推，是因為若排程整天沒跑，
+# measurement_agg 連一列（含 no_data）都不會存在，從那張表回推永遠
+# 看不到「憑空消失的一天」——這正是 aggregate.py 的 _fill_gap_hours
+# 只補「已觀測範圍內」缺口所留下的死角。
+
+def record_ingestion(
+    conn: Connection, point_id: int, ingest_date: date, status: str,
+    source_file: str = '', row_count: int = 0, note: str = '',
+) -> None:
+    """
+    記錄某量測點某日的匯入結果；同一 (point_id, ingest_date) 直接覆蓋舊紀錄。
+
+    為什麼覆蓋而不是累加一筆新紀錄：匯入排程最常見的操作是「重跑某一
+    天」——上游遲到的檔案補齊後重新匯入，或第一次失敗、修正腳本後再跑
+    一次。這兩種情況都該讓 ingestion_log 只保留「這一天目前的真實狀態」，
+    若疊出一堆舊的 failed 紀錄與新的 ok 紀錄並存，find_missing_ingestion
+    與週報都無法判斷「這天到底算不算有問題」。
+    """
+    sql = """
+        INSERT INTO ingestion_log
+            (point_id, ingest_date, status, source_file, row_count, note, ingested_at)
+        VALUES (%s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (point_id, ingest_date) DO UPDATE SET
+            status      = EXCLUDED.status,
+            source_file = EXCLUDED.source_file,
+            row_count   = EXCLUDED.row_count,
+            note        = EXCLUDED.note,
+            ingested_at = now()
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (point_id, ingest_date, status, source_file, int(row_count), note))
+    logger.info("記錄匯入結果：point_id=%s ingest_date=%s status=%s row_count=%d",
+                point_id, ingest_date, status, row_count)
+
+
+def get_ingestion_audit(
+    conn: Connection, start_date: date, end_date: date, point_id: int | None = None,
+) -> pd.DataFrame:
+    """
+    取回 `[start_date, end_date]`（皆含）區間內的匯入紀錄，含量測點／設備標籤。
+
+    直接把 device/measure_point 的標籤欄位一併 join 進來，是因為呼叫端
+    （週報收集層）拿到這份稽核紀錄後，第一件事一定是要組出可讀的
+    「設備 / 量測點・棟別」標籤——若這裡只回傳 point_id，呼叫端還要再
+    查一次 measure_point/device，等於同一份 join 邏輯要維護兩份。
+    """
+    clauses = ["il.ingest_date >= %(start)s", "il.ingest_date <= %(end)s"]
+    params: dict[str, Any] = {"start": start_date, "end": end_date}
+    if point_id is not None:
+        clauses.append("il.point_id = %(point_id)s")
+        params["point_id"] = point_id
+
+    sql = f"""
+        SELECT il.point_id, il.ingest_date, il.status, il.source_file, il.row_count,
+               il.note, il.ingested_at,
+               mp.position, mp.device_id, d.device_name, d.building, d.floor, d.system_name
+        FROM ingestion_log il
+        JOIN measure_point mp ON mp.point_id = il.point_id
+        JOIN device d         ON d.device_id = mp.device_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY il.ingest_date, il.point_id
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        cols = [d.name for d in cur.description]
+        rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def find_missing_ingestion(conn: Connection, start_date: date, end_date: date) -> list[dict]:
+    """
+    找出「應該要有匯入紀錄但沒有」的 (point_id, date) 組合——這是整個
+    稽核機制裡唯一能發現「排程完全沒跑」的入口。
+
+    母集合刻意是「`measure_point` 中 `is_active` 的量測點 × 區間內每一
+    天」，不是從 `measurement_agg` 或 `raw_file` 已有的資料反推：若某天
+    匯入排程完全沒跑，`measurement_agg` 連一列都不會存在，從那張表出發
+    永遠看不到「消失的那一天」。只有從「理論上這一天本來就該處理」出發，
+    用 LEFT JOIN 找缺口，才抓得到這種邊界情況。
+
+    只要 `ingestion_log` 對某 (point_id, date) 有任何一筆紀錄——不論
+    status 是 ok/partial/failed/no_file——就代表排程當天確實「處理過」
+    這個量測點，不算在本函式的缺漏範圍內；那個量測點該日資料好不好，
+    是 measurement_agg / 涵蓋率報告該回答的設備面問題，不是這裡要判定
+    的事。
+
+    Returns:
+        依日期、設備、量測位置排序的 dict 清單，每筆含
+        `point_id` / `device_id` / `position` / `date`，並附帶
+        `building` / `floor` / `system_name` 供呼叫端直接組地點標籤。
+    """
+    sql = """
+        SELECT mp.point_id, mp.device_id, mp.position, gs.d::date AS date,
+               d.building, d.floor, d.system_name
+        FROM measure_point mp
+        JOIN device d ON d.device_id = mp.device_id
+        CROSS JOIN generate_series(%(start)s::timestamp, %(end)s::timestamp, interval '1 day') AS gs(d)
+        LEFT JOIN ingestion_log il
+               ON il.point_id = mp.point_id AND il.ingest_date = gs.d::date
+        WHERE mp.is_active AND il.point_id IS NULL
+        ORDER BY gs.d, mp.device_id, mp.position
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"start": start_date, "end": end_date})
+        return [dict(r) for r in cur.fetchall()]
 
 
 # =============================================================
