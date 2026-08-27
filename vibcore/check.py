@@ -70,27 +70,108 @@ def check_db() -> bool:
 
 
 def check_schema() -> bool:
-    """回傳 schema 是否完整。"""
+    """
+    檢查資料表是否齊全，並區分「表不存在」與「表存在但沒權限」。
+
+    這兩種情況的處置完全相反——前者要跑 schema.sql，後者要 GRANT——但用
+    `information_schema.tables` 查都是回傳空集合，因為該檢視會依當前帳號的
+    權限過濾。若把「查不到」一律當成「沒建表」，就會叫使用者重跑 schema.sql，
+    而那完全解決不了權限問題（實際情境：用 postgres 建表、用 vibapp 連線）。
+
+    因此改為三個獨立來源交叉判斷：
+
+      pg_tables            系統目錄，不受權限過濾 → 表到底存不存在
+      has_table_privilege  逐表查 SELECT 權限     → 當前帳號能不能讀
+      pg_namespace         → schema 本身在不在
+
+    `has_table_privilege` 而非 `information_schema` 是刻意的：後者只要帳號
+    擁有任一種權限就會列出，即使 SELECT 已被收回也照樣可見，程式跑起來才會
+    炸。這裡問的是實際會用到的那個權限。
+    """
     print("\n【3】資料表")
     from vibcore.db.connection import get_connection
+
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'vib'"
-            )
-            found = {r["table_name"] for r in cur.fetchall()}
+            # 事實：表是否存在（系統目錄，不受權限影響）
+            cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'vib'")
+            actual = {r["tablename"] for r in cur.fetchall()}
 
-    missing = [t for t in EXPECTED_TABLES if t not in found]
-    if not found:
-        _line(FAIL, "vib schema 內沒有任何資料表")
-        print("\n  請執行：psql -d <資料庫名> -f db/schema.sql")
+            # 當前帳號實際有沒有 SELECT 權限。
+            # 刻意不用 information_schema.tables 判斷——該檢視只要帳號擁有
+            # 任一種權限就會列出，即使 SELECT 已被收回也照樣可見，程式跑起來
+            # 才會炸。has_table_privilege 問的是真正需要的那個權限。
+            cur.execute(
+                "SELECT tablename FROM pg_tables "
+                "WHERE schemaname = 'vib' "
+                "  AND has_table_privilege(current_user, "
+                "        quote_ident(schemaname) || '.' || quote_ident(tablename), 'SELECT')"
+            )
+            visible = {r["tablename"] for r in cur.fetchall()}
+
+            cur.execute("SELECT current_user AS u")
+            current_user = cur.fetchone()["u"]
+
+            cur.execute("SELECT count(*) AS n FROM pg_namespace WHERE nspname = 'vib'")
+            schema_exists = cur.fetchone()["n"] > 0
+
+            # 表在 public 而非 vib？（schema.sql 被改動或手動建表時可能發生）
+            cur.execute(
+                "SELECT count(*) AS n FROM pg_tables "
+                "WHERE schemaname = 'public' AND tablename = ANY(%s)",
+                (list(EXPECTED_TABLES),),
+            )
+            in_public = cur.fetchone()["n"]
+
+    # ── 情況一：schema 或表根本不存在 ──
+    if not schema_exists or not actual:
+        if in_public:
+            _line(FAIL, f"表建在 public schema（{in_public} 張），但本系統預期在 vib")
+            print("\n  db/schema.sql 開頭會 CREATE SCHEMA vib 並切換 search_path。")
+            print("  若表跑到 public，可能是執行了修改過的版本。建議重新建庫：")
+            print("    dropdb <資料庫名> && createdb <資料庫名>")
+            print("    psql -d <資料庫名> -f db/schema.sql")
+        else:
+            _line(FAIL, "vib schema 內沒有任何資料表")
+            print("\n  請執行：psql -d <資料庫名> -f db/schema.sql")
         return False
+
+    # ── 情況二：表存在，但當前帳號看不到 → 權限問題 ──
+    if actual and not visible:
+        _line(FAIL, f"表存在（{len(actual)} 張）但帳號 {current_user} 沒有 SELECT 權限")
+        print("\n  這不是建表問題，重跑 schema.sql 沒有用。")
+        print(f"  多數情況是用 postgres 建表、但 .env 設定用 {current_user} 連線。")
+        print("\n  請以建表的帳號（通常是 postgres）執行授權：")
+        print(f"""
+    psql -d <資料庫名> <<'SQL'
+    GRANT USAGE ON SCHEMA vib TO {current_user};
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vib TO {current_user};
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA vib TO {current_user};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA vib
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {current_user};
+    ALTER DEFAULT PRIVILEGES IN SCHEMA vib
+        GRANT USAGE, SELECT ON SEQUENCES TO {current_user};
+    SQL
+""")
+        print("  或改用建表的帳號連線（修改 .env 的 VIB_DB_USER）。")
+        return False
+
+    # ── 情況三：部分可見 → 權限給了一半 ──
+    missing_from_view = actual - visible
+    if missing_from_view:
+        _line(FAIL, f"帳號 {current_user} 只對 {len(visible)}/{len(actual)} 張表有 SELECT 權限")
+        print(f"\n  缺少權限的表：{', '.join(sorted(missing_from_view))}")
+        print("  權限可能只授權了部分表，建議用上方的 GRANT ... ON ALL TABLES 重新授權。")
+        return False
+
+    # ── 情況四：真的缺表 ──
+    missing = [t for t in EXPECTED_TABLES if t not in actual]
     if missing:
         _line(FAIL, f"缺少 {len(missing)} 張表：{', '.join(missing)}")
         print("\n  schema.sql 可能只套用了一部分，請重新完整執行一次")
         return False
 
-    _line(OK, f"{len(EXPECTED_TABLES)} 張表齊全")
+    _line(OK, f"{len(EXPECTED_TABLES)} 張表齊全，帳號 {current_user} 可正常存取")
     return True
 
 

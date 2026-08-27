@@ -48,20 +48,56 @@ cd <專案目錄>
 pip install -r requirements.txt
 ```
 
-### 步驟 3：建立資料庫
+### 步驟 3：建立資料庫與資料表
 
 ```bash
 createdb vibration
 psql -d vibration -f db/schema.sql
 ```
 
-這會建立 `vib` schema、20 張資料表，並寫入預設資料：
+這會建立 **`vib` schema**、20 張資料表，並寫入預設資料：
 13 條判定規則、ISO 10816 四級門檻、3 個簽核階段的 SLA、5 種角色。
+
+> **表放在 `vib` schema 而非 `public` 是刻意的**，用意是與資料庫裡其他系統
+> 的表區隔開。因此手動下 SQL 時要寫 `vib.device`，或先執行
+> `SET search_path TO vib;`。程式端已在連線時自動設好，不需額外處理。
 
 > 若 `createdb` 提示權限不足，改用：
 > `psql -U postgres -c "CREATE DATABASE vibration;"`
 
-### 步驟 4：設定連線參數
+### 步驟 4：建立應用程式帳號並授權
+
+**如果你打算用 `postgres` 帳號直接連線，這步可以跳過**，直接到步驟 5。
+
+較好的做法是給應用程式一個獨立帳號。但要注意：**用 `postgres` 建表、卻用
+另一個帳號連線的話，那個帳號預設看不到任何表**——不是表沒建成功，而是沒有
+權限。這是最容易踩到的坑。
+
+以**建表的那個帳號**（通常是 `postgres`）執行：
+
+```sql
+-- 建立應用程式帳號
+CREATE USER vibapp WITH LOGIN PASSWORD '你的密碼';
+
+-- 授權存取 vib schema
+GRANT USAGE ON SCHEMA vib TO vibapp;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vib TO vibapp;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA vib TO vibapp;
+
+-- 讓日後新增的表也自動套用同樣權限
+ALTER DEFAULT PRIVILEGES IN SCHEMA vib
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO vibapp;
+ALTER DEFAULT PRIVILEGES IN SCHEMA vib
+    GRANT USAGE, SELECT ON SEQUENCES TO vibapp;
+```
+
+最後兩段 `ALTER DEFAULT PRIVILEGES` 容易被略過，但**少了它，將來 schema
+變更新增的表，這個帳號一樣會存取不到**，而且症狀跟現在一模一樣。
+
+> 授權指令必須在**該資料庫內**執行（`psql -d vibration`），不是連到
+> 預設的 postgres 資料庫執行。
+
+### 步驟 5：設定連線參數
 
 複製設定範本：
 
@@ -109,7 +145,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 </details>
 
-### 步驟 5：執行自檢確認
+### 步驟 6：執行自檢確認
 
 ```bash
 python -m vibcore.check
@@ -397,10 +433,27 @@ SELECT ingest_date, status, note FROM vib.ingestion_log
 輸出報表的程式都有 `PermissionError` 保護，會跳過該檔並繼續處理其餘設備，
 不會整批中斷。關掉檔案重跑即可。
 
+### 「自檢說 vib schema 內沒有任何資料表，但我確定建過了」
+
+先確認表到底在不在——用**建表時的那個帳號**（通常是 `postgres`）查：
+
+```sql
+SELECT count(*) FROM pg_tables WHERE schemaname = 'vib';
+```
+
+- **回傳 0** → 表真的沒建成功，重跑 `psql -d <資料庫名> -f db/schema.sql`
+- **回傳 20** → 表在，是**連線帳號沒有權限**。依 §一步驟 4 執行 GRANT
+
+`pg_tables` 是系統目錄不受權限過濾，所以能問出「事實」；而
+`information_schema.tables` 會依權限過濾，沒權限時即使表就在那裡也查不到。
+
+新版自檢已能自動區分這兩種情況並給出對應指令，若你的輸出仍只說「沒有任何
+資料表」，代表用的是舊版，更新後重跑即可。
+
 ### 「改了 .env 但沒有生效」
 
 最常見的原因是**同名的系統環境變數蓋過了 `.env`**。這是刻意的優先順序
-（見 §一步驟 4），但排查時容易困惑。確認方式：
+（見 §一步驟 5），但排查時容易困惑。確認方式：
 
 ```bash
 python -m vibcore.check      # 【1】區塊會列出目前實際生效的值
