@@ -27,50 +27,139 @@
 
 ---
 
-## 一、環境準備
+## 一、安裝與設定（依序執行）
 
-### 1.1 系統需求
+### 步驟 1：確認系統需求
 
 | 項目 | 版本 | 備註 |
 |------|------|------|
-| Python | 3.10+ | 程式使用 `X \| None` 型別語法 |
+| Python | 3.10+ | 程式使用 `X \| None` 型別語法，3.9 以下會語法錯誤 |
 | PostgreSQL | 14+ | 開發與測試在 16 上進行 |
 
-### 1.2 安裝套件
+```bash
+python --version      # 應顯示 3.10 以上
+psql --version
+```
+
+### 步驟 2：安裝 Python 套件
 
 ```bash
+cd <專案目錄>
 pip install -r requirements.txt
 ```
 
-### 1.3 建立資料庫
+### 步驟 3：建立資料庫
 
 ```bash
 createdb vibration
 psql -d vibration -f db/schema.sql
 ```
 
-`schema.sql` 會建立 `vib` schema 與全部資料表，並寫入預設值：
-ISO 10816 四級門檻、13 條規則的參數、各簽核階段 SLA（各 5 天）、5 種角色。
+這會建立 `vib` schema、20 張資料表，並寫入預設資料：
+13 條判定規則、ISO 10816 四級門檻、3 個簽核階段的 SLA、5 種角色。
 
-### 1.4 設定連線
+> 若 `createdb` 提示權限不足，改用：
+> `psql -U postgres -c "CREATE DATABASE vibration;"`
 
-以環境變數提供，程式不讀設定檔：
+### 步驟 4：設定連線參數
+
+複製設定範本：
 
 ```bash
-export VIB_DB_HOST=localhost
-export VIB_DB_PORT=5432
-export VIB_DB_NAME=vibration
-export VIB_DB_USER=vibapp
-export VIB_DB_PASSWORD=********
-export VIB_AGENT_API_KEY=<發給 Agent 平台的金鑰>
+cp .env.example .env
 ```
 
-> Windows 用 `set` 而非 `export`。建議寫成批次檔或用系統環境變數，
-> 不要寫進程式碼。
+編輯 `.env`，填入你的實際值：
+
+```ini
+VIB_DB_HOST=localhost
+VIB_DB_PORT=5432
+VIB_DB_NAME=vibration
+VIB_DB_USER=vibapp
+VIB_DB_PASSWORD=你的密碼
+
+# 發給 Agent 平台的金鑰，產生方式見下
+VIB_AGENT_API_KEY=
+```
+
+產生一組隨機 API 金鑰：
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+**關於設定的優先順序**：系統環境變數優先於 `.env` 檔。這是刻意的——
+正式機通常由系統或容器注入環境變數，若 `.env` 蓋過去，一個忘了刪的
+開發用檔案會讓服務**安靜地連到錯的資料庫**，而且不會報錯。
+
+`.env` 已列入 `.gitignore`，不會被提交。
+
+<details>
+<summary>完整的環境變數清單</summary>
+
+| 變數 | 預設值 | 用途 |
+|------|--------|------|
+| `VIB_DB_HOST` | `localhost` | 資料庫主機 |
+| `VIB_DB_PORT` | `5432` | 資料庫連接埠 |
+| `VIB_DB_NAME` | `vibration` | 資料庫名稱 |
+| `VIB_DB_USER` | `vibcore` | 連線帳號 |
+| `VIB_DB_PASSWORD` | 空字串 | 連線密碼 |
+| `VIB_AGENT_API_KEY` | 無 | Agent 呼叫 API 的金鑰。**未設定時 API 一律回 503**（拒絕服務而非放行） |
+| `VIB_REPORT_DAILY_LIMIT` | `3` | `send_report` 每日寄送次數上限，超過回 429 |
+
+</details>
+
+### 步驟 5：執行自檢確認
+
+```bash
+python -m vibcore.check
+```
+
+這支程式**只讀取不修改**，可以隨時重複執行。它會依序檢查設定來源、
+資料庫連線、資料表是否齊全、預設資料是否寫入，最後告訴你下一步該做什麼。
+
+順利的話會看到類似輸出：
+
+```
+【1】設定來源
+  ✓ 找到設定檔 /path/to/.env
+  目前生效的設定：
+  VIB_DB_HOST     = localhost
+  ...
+  VIB_DB_PASSWORD （已設定）
+
+【2】資料庫連線
+  ✓ 連線成功（PostgreSQL 16.13 ...）
+
+【3】資料表
+  ✓ 20 張表齊全
+
+【4】預設資料
+  ✓ 判定規則：13 筆
+  ✓ ISO 門檻等級：4 筆
+  ✓ 簽核階段 SLA：3 筆
+  ✓ 角色定義：5 筆
+
+【5】營運資料
+  · 設備：0 筆
+  ...
+
+【6】下一步
+  尚未匯入任何資料。建議順序：
+    1. 先用歷史資料跑離線回測校準門檻 ...
+```
+
+任何一項顯示 `✗` 時，程式會直接印出常見原因與修正指令，不會讓你自己猜。
+
+**到這裡安裝就完成了。** 接下來依 §二 補台帳資料，然後進行 §三 的門檻校準。
 
 ---
 
-## 二、初次設定
+## 二、初次設定（補台帳資料）
+
+> 這一節的操作都是對資料庫下 SQL。可用 `psql -d vibration` 進入互動介面，
+> 或用你慣用的資料庫工具。所有表都在 `vib` schema 下，所以表名要寫成
+> `vib.device`（或先執行 `SET search_path TO vib;` 之後就能省略前綴）。
 
 ### 2.1 設備台帳
 
@@ -307,6 +396,28 @@ SELECT ingest_date, status, note FROM vib.ingestion_log
 
 輸出報表的程式都有 `PermissionError` 保護，會跳過該檔並繼續處理其餘設備，
 不會整批中斷。關掉檔案重跑即可。
+
+### 「改了 .env 但沒有生效」
+
+最常見的原因是**同名的系統環境變數蓋過了 `.env`**。這是刻意的優先順序
+（見 §一步驟 4），但排查時容易困惑。確認方式：
+
+```bash
+python -m vibcore.check      # 【1】區塊會列出目前實際生效的值
+```
+
+若顯示的值不是 `.env` 裡寫的，檢查系統環境變數：
+
+```bash
+# Linux / macOS
+env | grep VIB_
+
+# Windows PowerShell
+Get-ChildItem Env: | Where-Object Name -like "VIB_*"
+```
+
+其他可能：`.env` 不在專案根目錄（必須與 `vibcore/` 同層）、
+或未安裝 `python-dotenv`（此時 `vibcore.check` 會出現警告）。
 
 ---
 

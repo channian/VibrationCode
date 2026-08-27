@@ -8,3 +8,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2
 jinja2>=3.0
+python-dotenv>=1.0
