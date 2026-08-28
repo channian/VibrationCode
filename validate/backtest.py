@@ -65,9 +65,17 @@ class BacktestResult:
     n_points: int = 0
 
 
-def build_point_context(point: PointSeries, agg_cfg: AggregateConfig = DEFAULT_AGG) -> PointContext:
-    """對單一量測點跑「聚合 → 基準期」，供後續逐日規則評估重複使用。"""
-    agg = aggregate_hourly(point.raw, cfg=agg_cfg, fill_gaps=True)
+def build_point_context(point: PointSeries, agg_cfg: AggregateConfig = DEFAULT_AGG,
+                        auto_detect_density: bool = True) -> PointContext:
+    """
+    對單一量測點跑「聚合 → 基準期」，供後續逐日規則評估重複使用。
+
+    `auto_detect_density` 預設開啟，讓聚合層逐日推估取樣密度——同一量測點
+    的匯出檔可能混雜每秒與每 10 分鐘兩種前端版本。使用者以
+    `--samples-per-hour` 明確指定時才關閉，讓明確指定的值真正生效。
+    """
+    agg = aggregate_hourly(point.raw, cfg=agg_cfg, fill_gaps=True,
+                           auto_detect_density=auto_detect_density)
     if agg.empty:
         return PointContext(point=point, agg=agg, baseline=None, axis_baseline=None, eval_timestamps=[])
 
@@ -144,9 +152,11 @@ def build_episodes(pc: PointContext, rule_row: RuleConfigRow, fn: RuleFunc) -> l
 
 def run_backtest(points: list[PointSeries],
                   rule_configs: dict[str, RuleConfigRow],
-                  agg_cfg: AggregateConfig = DEFAULT_AGG) -> BacktestResult:
+                  agg_cfg: AggregateConfig = DEFAULT_AGG,
+                  auto_detect_density: bool = True) -> BacktestResult:
     """對所有量測點跑完整回測：聚合 → 涵蓋率 → 缺口 → 基準期 → 逐日規則評估。"""
-    point_contexts = [build_point_context(p, agg_cfg) for p in points]
+    point_contexts = [build_point_context(p, agg_cfg, auto_detect_density)
+                      for p in points]
 
     coverage_rows, gap_rows, episode_rows = [], [], []
     for pc in point_contexts:

@@ -31,6 +31,78 @@ RuleFunc = Callable[[RuleContext], RuleOutcome]
 REGISTRY: dict[str, RuleFunc] = {}
 
 
+# ──────────────────────────────────────────────────────────
+# 規則分類：決定「這件事該由誰處理」
+# ──────────────────────────────────────────────────────────
+#
+# 13 條規則講的其實是兩種不同性質的問題，處置者不同：
+#
+#   - `DATA_AVAILABILITY`（資料可用性）：問題出在「量測系統有沒有把
+#     資料收上來、量得準不準」——感測器離線、資料品質異常、量程配置
+#     可能有誤、安裝／量測有效性存疑。這類要處置的人是 IT／儀電，
+#     不是叫設備工程師去判斷轉子有沒有異常。
+#   - `EQUIPMENT`（設備狀態）：問題出在「設備本身的振動特徵是否在
+#     變化」——速度偏高、衝擊上升、趨勢劣化等。這類要處置的人是設備
+#     工程師，需要判斷要不要安排巡檢或停機檢查。
+#
+# 分類分錯的後果：這兩類的「觸發密度」是拿去做完全不同決策的依據——
+# 設備狀態類密度用來校準振動門檻、估算工程師要盯多少台設備；資料可用性
+# 類密度反映的是佈建品質（感測器安裝、通訊、量程設定），該去改善的是
+# 硬體與網路，不是振動門檻。若混在一起算，佔比可能過半的資料可用性
+# 問題會把「全廠平均密度」撐高，讓人誤以為設備真的普遍不穩定，因而
+# 誤判要加派工程師人力或把振動門檻調鬆——實際上只是感測器常斷線。
+class RuleCategory:
+    """規則分類代碼（字串常數，供比對用）。"""
+    DATA_AVAILABILITY = 'data_availability'
+    EQUIPMENT = 'equipment'
+
+
+#: rule_code → 分類。新增規則時記得同步在這裡歸類，否則會落入
+#: `rule_category()` 的「未知代碼」警告分支，統計數字會不準。
+RULE_CATEGORY: dict[str, str] = {
+    # 資料可用性：處置者是 IT／儀電，回答「資料收得到、收得準嗎」
+    'SENSOR_OFFLINE': RuleCategory.DATA_AVAILABILITY,
+    'DATA_QUALITY': RuleCategory.DATA_AVAILABILITY,
+    # SENSOR_SATURATION 同時可能代表真實的強烈振動（訊號真的頂到滿
+    # 刻度），但第一步處置永遠是先確認量程配置對不對——量程設錯，後面
+    # 所有峰值類指標都會失真，無從判斷是真異常還是量程問題，這一步是
+    # 資料可用性性質的處置，故歸此類而非設備狀態。
+    'SENSOR_SATURATION': RuleCategory.DATA_AVAILABILITY,
+    'ISO_CLASS_SUSPECT': RuleCategory.DATA_AVAILABILITY,
+    # 軸能量分佈排列跳變，代表疑似感測器重貼或更換，是安裝／量測有效性
+    # 問題——即使設備振動真的變了，量測基準也已經因為感測器位置改變而
+    # 失效，要先確認安裝狀態才能重新比對，不能直接拿新舊資料判定設備
+    # 劣化，故歸資料可用性而非設備狀態。
+    'ORIENTATION_CHANGE': RuleCategory.DATA_AVAILABILITY,
+
+    # 設備狀態：處置者是設備工程師，回答「設備振動特徵是否在變化」
+    'ISO_ZONE': RuleCategory.EQUIPMENT,
+    'VEL_HIGH': RuleCategory.EQUIPMENT,
+    'IMPACT_RISE': RuleCategory.EQUIPMENT,
+    'DEGRADE_TREND': RuleCategory.EQUIPMENT,
+    'SPECTRAL_SHIFT': RuleCategory.EQUIPMENT,
+    'AXIS_SHIFT': RuleCategory.EQUIPMENT,
+    'STEP_CHANGE': RuleCategory.EQUIPMENT,
+    'STANDBY_NO_RUNTIME': RuleCategory.EQUIPMENT,
+}
+
+
+def rule_category(rule_code: str) -> str:
+    """
+    查詢規則分類。
+
+    未知代碼回傳 `equipment` 並記警告，而不是拋例外——回測與報表不該
+    因為一條新規則忘了歸類就整批中斷，但要留下痕跡讓人回頭補上；預設
+    歸設備狀態類是刻意選擇「寧可誤令工程師多看一眼，也不要把它算進
+    資料可用性、讓人誤以為是佈建問題而漏看」。
+    """
+    cat = RULE_CATEGORY.get(rule_code)
+    if cat is None:
+        logger.warning(f"規則 {rule_code} 未列入 RULE_CATEGORY 分類表，暫歸設備狀態類")
+        return RuleCategory.EQUIPMENT
+    return cat
+
+
 def register(rule_code: str) -> Callable[[RuleFunc], RuleFunc]:
     """
     把規則函式掛進註冊表。

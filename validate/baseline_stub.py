@@ -109,7 +109,15 @@ def _stub_axis_energy_baseline(agg: pd.DataFrame,
     if len(rows) < 3:
         return None
 
-    return {k: float(np.median([r[k] for r in rows if k in r])) for k in _AXIS_KEYS}
+    out = {k: float(np.median([r[k] for r in rows if k in r])) for k in _AXIS_KEYS}
+
+    # 基準期的振動量值一併帶出，讓 ORIENTATION_CHANGE 能判斷「當下這組佔比
+    # 是否在可比的能量水準上算出來的」。低能量小時的佔比是雜訊，拿來比對會
+    # 產生大量假跳變。
+    energies = [r['energy'] for r in rows if isinstance(r.get('energy'), (int, float))]
+    if energies:
+        out['energy'] = float(np.median(energies))
+    return out
 
 
 def _import_real_baseline_fn() -> tuple[BaselineFunc, AxisBaselineFunc, bool]:

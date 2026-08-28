@@ -589,23 +589,32 @@ REGISTRY: dict[str, RuleFunc] = {
 }
 
 
-def _try_import_real_registry() -> dict[str, RuleFunc]:
+def _try_import_real_registry() -> tuple[dict[str, RuleFunc], frozenset[str]]:
     """
     嘗試整批接上真實規則引擎（例如 `vibcore.rules.REGISTRY`）。
 
     找不到時安靜地維持 stub 登錄表；找到但只涵蓋部分規則代碼時，
     採「逐條覆蓋」而非整批取代——已完工的規則優先用真的，其餘繼續用
     stub 頂著，讓回測不會因為某條規則還沒寫完就整個跑不動。
+
+    第二個回傳值是「實際接上真實實作的規則代碼」。報告必須據此標示，
+    不能寫死——寫死的字串會隨程式演進而過時，把可信的結果標成 stub
+    （使用者因此不敢採用正確的門檻），或把 stub 標成真實（更糟）。
     """
     merged = dict(REGISTRY)
+    real_codes: set[str] = set()
     try:
         from vibcore.rules import REGISTRY as real_registry  # type: ignore
         for rule_code, fn in real_registry.items():
             merged[rule_code] = fn
+            real_codes.add(rule_code)
             logger.info(f"規則 {rule_code} 已接上真實實作 vibcore.rules")
     except ImportError:
         pass
-    return merged
+    return merged, frozenset(real_codes)
 
 
-REGISTRY = _try_import_real_registry()
+REGISTRY, REAL_RULE_CODES = _try_import_real_registry()
+
+#: 仍使用 validate/rules_stub.py 簡化版的規則代碼（正常情況應為空集合）
+STUB_RULE_CODES = frozenset(REGISTRY) - REAL_RULE_CODES

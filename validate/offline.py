@@ -6,17 +6,12 @@ offline.py — 離線回測主程式
 規則），回答上線前最關鍵的問題——**這套規則跑過去這幾個月的資料，會噴
 幾件 Finding？分佈在哪些設備、哪些規則？門檻該怎麼調？**
 
-規則層有 8 條規則（`VEL_HIGH`／`IMPACT_RISE`／`AXIS_SHIFT`／
-`ORIENTATION_CHANGE`／`SENSOR_OFFLINE`／`DATA_QUALITY`／
-`SENSOR_SATURATION`／`STANDBY_NO_RUNTIME`）在撰寫本檔當下由其他人平行
-開發中，尚未完成，本程式透過 `validate.rules_stub` 的可替換 stub 頂上；
-另外 5 條（`ISO_ZONE`／`ISO_CLASS_SUSPECT`／`STEP_CHANGE`／
-`DEGRADE_TREND`／`SPECTRAL_SHIFT`）與基準期計算已接上真實的
-`vibcore.metrics.*` 模組。哪些已經是真實模組、哪些還是 stub，見
-`validate/baseline_stub.py` / `validate/rules_stub.py` 檔頭的說明，以及
-執行後 `summary.txt` 開頭的「指標／規則層實作來源」區塊——**用 stub 跑
-出來的那幾條規則，門檻建議只能當「量級」參考，不能直接拿去上線**，等
-真實模組接上後務必重跑一次。
+`validate/rules_stub.py` 保留了每條規則的簡化版，但只在真實實作尚未存在
+時才會被用到——`vibcore.rules` 完成後即自動逐條覆蓋。當前哪幾條是真的、
+哪幾條還是簡化版，由執行時實際檢查後寫入 `summary.txt` 開頭的「指標／
+規則層實作來源」區塊，**不是寫死的字串**。早期版本把這段寫死，導致真實
+規則早已接上、報告卻仍標示為 stub，使用者因而不敢採用正確的門檻建議。
+若該區塊指出某幾條仍是簡化版，那幾條的門檻建議只能當量級參考。
 
 用法：
     python -m validate.offline --data-dir data/
@@ -42,7 +37,13 @@ from validate.baseline_stub import USING_REAL_BASELINE
 from validate.points import load_points
 from validate.report import write_reports
 from validate.rule_defaults import load_rule_configs
-from validate.rules_stub import USING_REAL_DEVIATION, USING_REAL_ISO, USING_REAL_TREND
+from validate.rules_stub import (
+    REAL_RULE_CODES,
+    STUB_RULE_CODES,
+    USING_REAL_DEVIATION,
+    USING_REAL_ISO,
+    USING_REAL_TREND,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,39 +90,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _detect_samples_per_hour(points) -> int | None:
+def _report_cadence_mix(points) -> None:
     """
-    從資料本身推測「每小時應有幾筆」。
+    盤點各量測點的取樣密度並回報，不做任何覆寫。
 
-    聚合層預設 3600（每秒一筆，對應正式環境的前端輸出），但回測資料
-    未必是這個密度——歷史匯出可能降採樣過，合成測試資料也常用每分鐘
-    一筆。密度猜錯的後果不是報錯，而是**每一小時都被判為 partial、
-    所有指標型規則靜默跳過、報告顯示「零觸發」**，看起來像規則校準良好，
-    實際上什麼都沒評估過。這種錯誤比直接崩潰危險得多，所以寧可自動偵測。
+    早期版本會算出一個「全廠代表密度」去覆寫聚合設定，那是錯的：不同設備
+    換版時間不同，同一份匯出裡可能同時有每秒（即時量測）與每 10 分鐘
+    （長期量測）兩種資料，強押單一密度必然讓其中一種全部誤判為 partial。
+    密度改由聚合層逐日推估（見 `aggregate.detect_cadence_segments`），
+    這裡只負責讓使用者看見資料實際長什麼樣。
 
-    取各量測點「資料最密集的那一小時」的筆數中位數，避免被頭尾不完整的
-    小時拉低。
+    特別要點名「單一量測點內密度改變」的情形——這代表該點跨越了前端改版，
+    跨段的基準期不可比，尤其 PEAK/CREST/KURT 這類取最大值的指標會隨取樣
+    密度系統性偏移，看起來像設備狀態突然改變。
     """
-    densities = []
+    from vibcore.pipeline.aggregate import detect_cadence_segments
+
+    tally: dict[int, int] = {}
+    switched: list[str] = []
     for p in points:
         df = getattr(p, 'raw', None)
-        if df is None or df.empty or 'datetime' not in df.columns:
+        if df is None or df.empty:
             continue
-        per_hour = df.groupby(df['datetime'].dt.floor('h')).size()
-        if not per_hour.empty:
-            densities.append(int(per_hour.max()))
-    if not densities:
-        return None
+        seg = detect_cadence_segments(df)
+        if seg.empty:
+            continue
+        for sph in seg['samples_per_hour'].unique():
+            tally[int(sph)] = tally.get(int(sph), 0) + 1
+        if len(seg) > 1:
+            switched.append(
+                f"{p.device.device_id}/{p.position}："
+                + "→".join(f"{int(r.samples_per_hour)}筆/時" for r in seg.itertuples())
+            )
 
-    detected = int(pd.Series(densities).median())
-    if detected >= 3000:
-        return None      # 已接近每秒一筆，用預設值即可
-    logger.warning(
-        f"偵測到資料密度約每小時 {detected} 筆（預設假設為 "
-        f"{DEFAULT_AGG.expected_samples_per_hour} 筆）。已自動改用偵測值，"
-        f"若不正確請用 --samples-per-hour 明確指定"
-    )
-    return detected
+    if not tally:
+        return
+
+    desc = "、".join(f"每小時 {sph} 筆（{n} 個量測點）"
+                     for sph, n in sorted(tally.items(), reverse=True))
+    logger.info(f"資料取樣密度盤點：{desc}")
+
+    if switched:
+        logger.warning(
+            "\n" + "=" * 62 +
+            f"\n⚠ {len(switched)} 個量測點在觀測期內取樣密度改變（混雜前端版本）："
+            + "".join(f"\n    {s}" for s in switched[:10])
+            + (f"\n    …另有 {len(switched) - 10} 個" if len(switched) > 10 else "")
+            + "\n  各段已各自套用對應門檻，可分析比例不受影響；但**跨段的基準期"
+              "不可比**，\n  這些點的趨勢與突變類判定請保守解讀。"
+            + "\n" + "=" * 62
+        )
 
 
 def _abort_if_nothing_analyzable(result) -> None:
@@ -166,18 +184,21 @@ def main(argv: list[str] | None = None) -> int:
     n_active = sum(1 for r in rule_configs.values() if r.is_active)
     logger.info(f"載入 {len(rule_configs)} 條規則設定（{n_active} 條啟用中）")
 
+    _report_cadence_mix(points)
+
+    # 未明確指定時交給聚合層逐日推估密度（可處理同一點內混雜前端版本）；
+    # 明確指定時關閉自動偵測，否則使用者給的值會被自動偵測覆蓋掉，
+    # 「指定了卻沒作用」是最難查的那種問題。
     agg_overrides = {}
+    auto_density = args.samples_per_hour is None
     if args.samples_per_hour is not None:
         agg_overrides['expected_samples_per_hour'] = args.samples_per_hour
-    else:
-        detected = _detect_samples_per_hour(points)
-        if detected is not None:
-            agg_overrides['expected_samples_per_hour'] = detected
     if args.min_running_samples is not None:
         agg_overrides['min_running_samples'] = args.min_running_samples
     agg_cfg = dataclasses.replace(DEFAULT_AGG, **agg_overrides) if agg_overrides else DEFAULT_AGG
 
-    result = run_backtest(points, rule_configs, agg_cfg=agg_cfg)
+    result = run_backtest(points, rule_configs, agg_cfg=agg_cfg,
+                          auto_detect_density=auto_density)
     logger.info(f"回測完成：{result.n_devices} 台設備、{result.n_points} 個量測點、"
                f"{len(result.episodes_df)} 個觸發事件")
 
@@ -201,8 +222,16 @@ def main(argv: list[str] | None = None) -> int:
         '多變量偏離（vibcore.metrics.deviation）': USING_REAL_DEVIATION,
         '趨勢分析（vibcore.metrics.trend）': USING_REAL_TREND,
         '基準期計算（vibcore.metrics.baseline）': USING_REAL_BASELINE,
-        '其餘規則（VEL_HIGH/IMPACT_RISE/軸能量/事件類，暫用 validate/rules_stub.py）': False,
     }
+    # 規則層據實標示，不寫死。若全部接上真實實作就明講，否則列出還在用
+    # 簡化版的規則代碼——使用者需要知道「哪幾條」不可據以定門檻，而不是
+    # 看到一句籠統的警告就對整份報告失去信心。
+    if STUB_RULE_CODES:
+        using_real[f"規則層（{len(STUB_RULE_CODES)} 條仍為簡化版："
+                   f"{'、'.join(sorted(STUB_RULE_CODES))}）"] = False
+        using_real[f"規則層（其餘 {len(REAL_RULE_CODES)} 條）"] = True
+    else:
+        using_real[f'規則層 {len(REAL_RULE_CODES)} 條全部（vibcore.rules）'] = True
 
     written = write_reports(result, rule_configs, args.out_dir, sweep_df, using_real)
     print('\n報告已產出：')

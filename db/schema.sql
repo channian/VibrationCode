@@ -394,7 +394,11 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      '{"mahalanobis_sigma":3.0}',
      '特徵向量偏離基準；輸出各特徵標準化偏離量而非 0–100 分數'),
     ('ORIENTATION_CHANGE', '感測器方向改變',   'event',       'orientation_change','warn',
-     '{"ratio_delta":0.25}',
+     '{"ratio_delta":0.25,"consecutive_readings":3,"min_energy_ratio":0.3}',
+     -- consecutive_readings：需連續幾筆可信資料都超出門檻才觸發。只看單筆
+     --   會變成每天拿一個隨機小時擲骰子（實測 33 週誤觸發 93 次）。
+     -- min_energy_ratio：當下三軸合成量值需達基準期的此比例，佔比才具可比性。
+     --   接近停機時三軸都貼近雜訊，歸一化後的佔比會劇烈跳動。
      '軸能量分佈排列跳變，疑似感測器重貼或更換'),
     ('SENSOR_OFFLINE',     '感測器離線',       'event',       'sensor_offline',   'err',
      '{"hours":24}',

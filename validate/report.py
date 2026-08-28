@@ -5,9 +5,11 @@ report.py — 把回測結果轉成人看得懂的報表
 
   coverage.csv               每台設備/量測點的資料涵蓋率
   gaps.csv                   斷線／資料不全區段清單，依時長排序
-  finding_stats_by_rule.csv  依規則的觸發統計
+  finding_stats_by_rule.csv  依規則的觸發統計（含 category 欄位）
   finding_stats_by_device.csv 依設備的觸發統計
-  trigger_density.csv        每台設備每週觸發密度（判斷會不會誤報洪水的關鍵表）
+  trigger_density.csv        每台設備每週觸發密度，依 RuleCategory 分開算
+                              （判斷會不會誤報洪水的關鍵表）
+  episodes_detail.csv        每一個觸發事件的明細（含 category 欄位）
   threshold_sensitivity.csv  門檻敏感度掃描（有跑掃描才會產生）
   summary.txt / summary.html 摘要
 
@@ -15,6 +17,14 @@ report.py — 把回測結果轉成人看得懂的報表
 Excel 開著」導致 `PermissionError` 直接讓整支程式中斷的坑，這裡遇到寫入
 被拒時會改寫到帶時間戳的檔名，並記警告，不讓一個被鎖住的檔案拖垮整份
 回測報告。
+
+**為什麼觸發統計與密度都要依 `RuleCategory` 分開呈現**：13 條規則裡，
+`SENSOR_OFFLINE`／`DATA_QUALITY` 這類「資料收不到」的規則，處置者是
+IT／儀電；其餘「設備狀態可能有變化」的規則，處置者是設備工程師。實測
+資料裡前兩者常佔全部 Finding 的七成以上，若把兩類混算成單一「觸發
+密度」，數字會被資料可用性問題撐大，讓人誤以為設備普遍不穩定、進而
+誤判要加派工程師人力或調鬆振動門檻——但真正該處理的是感測器佈建。
+分類依據見 `vibcore.rules.engine.RULE_CATEGORY` 的說明。
 """
 
 from __future__ import annotations
@@ -25,10 +35,18 @@ import os
 
 import pandas as pd
 
+from vibcore.rules.engine import RULE_CATEGORY, RuleCategory, rule_category
+
 from validate.backtest import BacktestResult, span_weeks
 from validate.rule_defaults import RuleConfigRow
 
 logger = logging.getLogger(__name__)
+
+#: 分類代碼 → 報表顯示用的中文標籤（含處置者提示，讓人一眼看出誰要處理）
+_CATEGORY_LABELS: dict[str, str] = {
+    RuleCategory.EQUIPMENT: '設備狀態類（設備工程師判讀）',
+    RuleCategory.DATA_AVAILABILITY: '資料可用性類（IT／儀電處置）',
+}
 
 _COVERAGE_COLS = {
     'device_id': '設備代碼', 'device_name': '設備名稱', 'point_id': '量測點ID',
@@ -76,7 +94,8 @@ def _safe_write(path: str, writer, max_retry: int = 3) -> str:
 def _finding_stats_by_rule(episodes_df: pd.DataFrame,
                             rule_configs: dict[str, RuleConfigRow]) -> pd.DataFrame:
     active_rules = pd.DataFrame([
-        {'rule_code': r.rule_code, 'rule_name': r.rule_name, 'family': r.family, 'severity': r.severity}
+        {'rule_code': r.rule_code, 'rule_name': r.rule_name, 'family': r.family, 'severity': r.severity,
+         'category': rule_category(r.rule_code)}
         for r in rule_configs.values() if r.is_active
     ])
     if episodes_df.empty:
@@ -97,6 +116,8 @@ def _finding_stats_by_rule(episodes_df: pd.DataFrame,
     for col in ('n_episodes', 'n_devices_affected', 'total_duration_days'):
         stats[col] = stats[col].fillna(0).astype(int)
     stats['avg_duration_days'] = stats['avg_duration_days'].fillna(0.0).round(2)
+    # 分類內部仍依觸發次數由多到少排——category 分組時（見
+    # `_build_summary_text`）沿用這個順序，不必再排一次
     return stats.sort_values('n_episodes', ascending=False).reset_index(drop=True)
 
 
@@ -146,6 +167,35 @@ def _device_span_weeks(result: BacktestResult) -> dict[str, float]:
     return {d: span_weeks(lo, hi) for d, (lo, hi) in spans.items()}
 
 
+def _finding_stats_by_device_category(episodes_df: pd.DataFrame, result: BacktestResult) -> pd.DataFrame:
+    """
+    每台設備依 `RuleCategory` 分開的觸發次數——密度必須分開算（見模組
+    docstring），所以在合計之前就要先把「這台設備這次回測期間各分類
+    各觸發幾件」拆出來，供 `_trigger_density` 使用。
+    """
+    all_devices = sorted({pc.point.device.device_id for pc in result.point_contexts})
+    device_names = {pc.point.device.device_id: pc.point.device.device_name for pc in result.point_contexts}
+    base = pd.DataFrame({'device_id': all_devices})
+    base['device_name'] = base['device_id'].map(device_names)
+    base['n_equipment'] = 0
+    base['n_data_availability'] = 0
+
+    if episodes_df.empty:
+        return base
+
+    df = episodes_df.copy()
+    df['category'] = df['rule_code'].map(rule_category)
+    g = (df.groupby(['device_id', 'category']).size().unstack(fill_value=0)
+         .reindex(columns=[RuleCategory.EQUIPMENT, RuleCategory.DATA_AVAILABILITY], fill_value=0)
+         .rename(columns={RuleCategory.EQUIPMENT: 'n_equipment',
+                          RuleCategory.DATA_AVAILABILITY: 'n_data_availability'})
+         .reset_index())
+    out = base.drop(columns=['n_equipment', 'n_data_availability']).merge(g, on='device_id', how='left')
+    for col in ('n_equipment', 'n_data_availability'):
+        out[col] = out[col].fillna(0).astype(int)
+    return out
+
+
 def _trigger_density(episodes_df: pd.DataFrame, result: BacktestResult) -> pd.DataFrame:
     """
     每台設備每週觸發密度——**判斷會不會誤報洪水的關鍵指標**。
@@ -153,14 +203,34 @@ def _trigger_density(episodes_df: pd.DataFrame, result: BacktestResult) -> pd.Da
     分母是**該設備自己**的觀測期間（週），分子是該設備的事件數；沒有
     觸發過的設備也要出現在表裡（值為 0），否則平均值會被「有問題的設備」
     帶偏，看不出真實的全廠負荷。
+
+    **`equipment_per_week` 與 `data_availability_per_week` 分開算、不合併
+    成單一密度**：兩者處置者不同（設備工程師 vs IT／儀電），合併計算會
+    讓佔比常過半的資料可用性問題把「工程師該擔心的密度」灌爆（見模組
+    docstring）。`episodes_per_week` 仍保留原本的合計密度，供想看整體
+    告警量的人參考，但校準振動門檻、估算工程師工作量請用
+    `equipment_per_week`。
     """
     device_weeks = _device_span_weeks(result)
-    by_device = _finding_stats_by_device(episodes_df, result)
+    by_device = _finding_stats_by_device_category(episodes_df, result)
+    by_device['n_episodes'] = by_device['n_equipment'] + by_device['n_data_availability']
     by_device['span_weeks'] = by_device['device_id'].map(device_weeks).fillna(0.0).round(2)
+
+    def _density(n: int, weeks: float) -> float:
+        return round(n / weeks, 3) if weeks else 0.0
+
+    by_device['equipment_per_week'] = by_device.apply(
+        lambda r: _density(r['n_equipment'], r['span_weeks']), axis=1)
+    by_device['data_availability_per_week'] = by_device.apply(
+        lambda r: _density(r['n_data_availability'], r['span_weeks']), axis=1)
     by_device['episodes_per_week'] = by_device.apply(
-        lambda r: round(r['n_episodes'] / r['span_weeks'], 3) if r['span_weeks'] else 0.0, axis=1)
-    return by_device[['device_id', 'device_name', 'n_episodes', 'span_weeks', 'episodes_per_week']] \
-        .sort_values('episodes_per_week', ascending=False).reset_index(drop=True)
+        lambda r: _density(r['n_episodes'], r['span_weeks']), axis=1)
+
+    cols = ['device_id', 'device_name', 'n_equipment', 'n_data_availability', 'n_episodes',
+            'span_weeks', 'equipment_per_week', 'data_availability_per_week', 'episodes_per_week']
+    # 依「設備狀態類」密度排序——那才是工程師要看、決定要不要調門檻或
+    # 加派人力的數字（見 `_build_summary_text` 的排行榜說明）
+    return by_device[cols].sort_values('equipment_per_week', ascending=False).reset_index(drop=True)
 
 
 def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConfigRow],
@@ -199,27 +269,59 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
                          f"{g['gap_start']} ～ {g['gap_end']}（{g['hours']:.0f} 小時）")
         lines.append('')
 
-    lines.append('-- Finding 觸發統計（依規則，由多到少）--')
-    for _, r in stats_by_rule.iterrows():
-        lines.append(f"  {r['rule_code']:20s} {r['rule_name']:14s} "
-                     f"觸發 {int(r['n_episodes']):4d} 次　影響 {int(r['n_devices_affected']):3d} 台設備")
+    lines.append('-- Finding 觸發統計 --')
+    lines.append('  兩類處置者不同（見 vibcore.rules.engine.RULE_CATEGORY），分開列示、各自小計，')
+    lines.append('  不要把兩邊的次數加在一起當「觸發密度」看，否則會誤判設備狀態的嚴重程度。')
+    grand_total = 0
+    for cat in (RuleCategory.EQUIPMENT, RuleCategory.DATA_AVAILABILITY):
+        subset = stats_by_rule[stats_by_rule['category'] == cat] if 'category' in stats_by_rule.columns \
+            else stats_by_rule.iloc[0:0]
+        subtotal = int(subset['n_episodes'].sum()) if not subset.empty else 0
+        grand_total += subtotal
+        lines.append('')
+        lines.append(f"  【{_CATEGORY_LABELS[cat]}】小計 {subtotal} 件")
+        for _, r in subset.iterrows():
+            lines.append(f"    {r['rule_code']:20s} {r['rule_name']:14s} "
+                         f"觸發 {int(r['n_episodes']):4d} 次　影響 {int(r['n_devices_affected']):3d} 台設備")
+    lines.append('')
+    lines.append(f"  合計：{grand_total} 件")
     lines.append('')
 
-    lines.append('-- 觸發密度（每台設備每週幾件，前 10 高）--')
-    for _, d in density.head(10).iterrows():
-        lines.append(f"  {d['device_id']:15s} {d['episodes_per_week']:.2f} 件/週"
-                     f"（{d['n_episodes']} 件 / {d['span_weeks']:.1f} 週）")
+    lines.append('-- 觸發密度 --')
+    lines.append('  「設備狀態類」密度才是拿來校準振動門檻、估算工程師工作量的依據；')
+    lines.append('  「資料可用性類」密度反映的是感測器／通訊／量程等佈建品質，該處置的是')
+    lines.append('  IT／儀電，不能拿來加派工程師人力或調鬆振動門檻。')
+    lines.append('')
+    lines.append('  前 10 高「設備狀態類」觸發密度（依此排序，工程師優先看這裡；')
+    lines.append('  同列附上同期資料可用性件數供對照）：')
+    for _, d in density.sort_values('equipment_per_week', ascending=False).head(10).iterrows():
+        lines.append(f"  {d['device_id']:15s} 設備狀態 {d['equipment_per_week']:.2f} 件/週"
+                     f"（{int(d['n_equipment'])} 件 / {d['span_weeks']:.1f} 週）"
+                     f"　同期資料可用性 {int(d['n_data_availability'])} 件")
+    lines.append('')
     # 全廠平均用「總事件數 / 各設備觀測週數總和」——每台設備觀測期間可能
     # 不同（新裝設備、中途停用等），用單一共同期間當分母會系統性算錯
     # （見 `_device_span_weeks` 說明），必須逐台加總分母才正確。
-    fleet_total = density['n_episodes'].sum()
     fleet_device_weeks = density['span_weeks'].sum()
+    fleet_equipment = int(density['n_equipment'].sum())
+    fleet_data_availability = int(density['n_data_availability'].sum())
+    fleet_total = fleet_equipment + fleet_data_availability
     fleet_devices = len(density) or 1
-    fleet_density = fleet_total / fleet_device_weeks if fleet_device_weeks else 0
-    lines.append(f"  全廠平均：{fleet_density:.2f} 件/設備/週"
-                 f"（總計 {int(fleet_total)} 件 / {fleet_devices} 台設備 / 觀測週數總和 {fleet_device_weeks:.1f} 週）")
-    if fleet_density > 2:
-        lines.append("  ⚠ 平均每台每週超過 2 件，四階段簽核可能很快就會塞爆，建議檢視門檻敏感度表後調鬆")
+
+    def _fleet_density(n: int) -> float:
+        return n / fleet_device_weeks if fleet_device_weeks else 0.0
+
+    equipment_density = _fleet_density(fleet_equipment)
+    lines.append(f"  全廠平均－設備狀態類：{equipment_density:.2f} 件/設備/週"
+                 f"（{fleet_equipment} 件 / {fleet_devices} 台設備 / 觀測週數總和 {fleet_device_weeks:.1f} 週）"
+                 "　★ 校準門檻、估算工程師工作量請用這個數字")
+    lines.append(f"  全廠平均－資料可用性類：{_fleet_density(fleet_data_availability):.2f} 件/設備/週"
+                 f"（{fleet_data_availability} 件）　→ 反映佈建品質，處置者是 IT／儀電")
+    lines.append(f"  全廠平均－合計：{_fleet_density(fleet_total):.2f} 件/設備/週"
+                 f"（{fleet_total} 件，兩類相加僅供參考整體告警量，不可直接用於門檻校準）")
+    if equipment_density > 2:
+        lines.append("  ⚠ 設備狀態類平均每台每週超過 2 件，四階段簽核可能很快就會塞爆，"
+                     "建議檢視門檻敏感度表後調鬆")
     lines.append('')
 
     if sweep_df is not None and not sweep_df.empty:
@@ -242,6 +344,15 @@ def _build_summary_html(text_summary: str, stats_by_rule: pd.DataFrame,
 
     sweep_html = _df_to_html(sweep_df) if sweep_df is not None else '<p>（本次未執行門檻敏感度掃描）</p>'
 
+    # 兩張表分開放，呼應摘要文字：處置者不同，不該放在同一張表裡讓人
+    # 順手把兩邊的次數加總來看
+    if 'category' in stats_by_rule.columns:
+        stats_equipment = stats_by_rule[stats_by_rule['category'] == RuleCategory.EQUIPMENT]
+        stats_data_avail = stats_by_rule[stats_by_rule['category'] == RuleCategory.DATA_AVAILABILITY]
+    else:
+        stats_equipment = stats_by_rule.iloc[0:0]
+        stats_data_avail = stats_by_rule.iloc[0:0]
+
     return f"""<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <title>離線回測摘要</title>
@@ -252,13 +363,17 @@ def _build_summary_html(text_summary: str, stats_by_rule: pd.DataFrame,
   table.tbl th, table.tbl td {{ border: 1px solid #ddd; padding: 4px 10px; text-align: right; font-size: 0.9rem; }}
   table.tbl th {{ background: #eee; }}
   h2 {{ border-bottom: 2px solid #ccc; padding-bottom: 4px; margin-top: 2rem; }}
+  p.note {{ color: #555; font-size: 0.9rem; }}
 </style></head>
 <body>
 <h1>離線回測摘要</h1>
 <pre>{text_summary}</pre>
-<h2>Finding 觸發統計（依規則）</h2>
-{_df_to_html(stats_by_rule)}
-<h2>觸發密度（依設備）</h2>
+<h2>Finding 觸發統計－{_CATEGORY_LABELS[RuleCategory.EQUIPMENT]}</h2>
+{_df_to_html(stats_equipment)}
+<h2>Finding 觸發統計－{_CATEGORY_LABELS[RuleCategory.DATA_AVAILABILITY]}</h2>
+{_df_to_html(stats_data_avail)}
+<h2>觸發密度（依設備，依設備狀態類密度排序）</h2>
+<p class="note">equipment_per_week 才是校準門檻、估算工程師工作量的依據；data_availability_per_week 反映佈建品質，處置者是 IT／儀電。</p>
 {_df_to_html(density)}
 <h2>門檻敏感度掃描</h2>
 {sweep_html}
@@ -287,8 +402,12 @@ def write_reports(result: BacktestResult, rule_configs: dict[str, RuleConfigRow]
         stats_by_device, os.path.join(out_dir, 'finding_stats_by_device.csv'))
     written['trigger_density'] = _safe_write_csv(
         density, os.path.join(out_dir, 'trigger_density.csv'))
+    # 明細表補上 category 欄位——單看 rule_code 要對照分類表才知道處置者
+    # 是誰，直接落欄位讓人在 Excel 裡就能篩選/樞紐分析，不必回頭查表
+    episodes_out = result.episodes_df.copy()
+    episodes_out['category'] = episodes_out['rule_code'].map(rule_category)
     written['episodes'] = _safe_write_csv(
-        result.episodes_df, os.path.join(out_dir, 'episodes_detail.csv'))
+        episodes_out, os.path.join(out_dir, 'episodes_detail.csv'))
     if sweep_df is not None and not sweep_df.empty:
         written['threshold_sensitivity'] = _safe_write_csv(
             sweep_df, os.path.join(out_dir, 'threshold_sensitivity.csv'))

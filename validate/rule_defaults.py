@@ -74,7 +74,10 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             description='特徵向量偏離基準；輸出各特徵標準化偏離量而非 0–100 分數'),
         RuleConfigRow(
             'ORIENTATION_CHANGE', '感測器方向改變', 'event', 'orientation_change', 'warn',
-            {'ratio_delta': 0.25},
+            # consecutive_readings / min_energy_ratio 的用意見 event_rules.py
+            # 的 orientation_change docstring：前者擋逐日單點擲骰，後者擋
+            # 低能量小時的佔比雜訊。兩者需與 db/schema.sql 的 seed 一致。
+            {'ratio_delta': 0.25, 'consecutive_readings': 3, 'min_energy_ratio': 0.3},
             description='軸能量分佈排列跳變，疑似感測器重貼或更換'),
         RuleConfigRow(
             'SENSOR_OFFLINE', '感測器離線', 'event', 'sensor_offline', 'err',

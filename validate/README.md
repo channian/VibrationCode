@@ -95,12 +95,20 @@ python -m validate.offline --data-dir /tmp/vib_synth \
 |------|------|
 | `coverage.csv` | 每台設備/量測點的 ok / partial / no_data / not_running 時數與可分析比例 |
 | `gaps.csv` | 斷線／資料不全區段清單，依時長由長到短排序 |
-| `finding_stats_by_rule.csv` | 依規則的觸發次數、影響設備數、平均持續天數 |
-| `finding_stats_by_device.csv` | 依設備的觸發次數、err/warn 分布 |
-| `trigger_density.csv` | **每台設備每週幾件**——判斷會不會誤報洪水的關鍵表 |
-| `episodes_detail.csv` | 每一個觸發事件的明細（設備、規則、起訖、持續天數） |
+| `finding_stats_by_rule.csv` | 依規則的觸發次數、影響設備數、平均持續天數，含 `category` 欄位 |
+| `finding_stats_by_device.csv` | 依設備的觸發次數、err/warn 分布（不分類，合計視角） |
+| `trigger_density.csv` | **每台設備每週幾件，依 `category` 分開算**（`equipment_per_week` / `data_availability_per_week` / 合計 `episodes_per_week`）——判斷會不會誤報洪水的關鍵表 |
+| `episodes_detail.csv` | 每一個觸發事件的明細（設備、規則、起訖、持續天數、`category`） |
 | `threshold_sensitivity.csv` | 門檻敏感度掃描（預設對 `VEL_HIGH.sigma`／`IMPACT_RISE.crest_sigma`／`STEP_CHANGE.mahalanobis_sigma` 各掃一輪） |
-| `summary.txt` / `summary.html` | 摘要，含指標／規則層實作來源、涵蓋率、觸發統計、密度、掃描結果的重點整理 |
+| `summary.txt` / `summary.html` | 摘要，含指標／規則層實作來源、涵蓋率、觸發統計（分「設備狀態類」／「資料可用性類」兩區塊）、分開的密度數字、掃描結果的重點整理 |
+
+> **13 條規則分成兩類**（見 `vibcore.rules.engine.RULE_CATEGORY`）：
+> `data_availability`（資料可用性，處置者是 IT／儀電：`SENSOR_OFFLINE`／
+> `DATA_QUALITY`／`SENSOR_SATURATION`／`ISO_CLASS_SUSPECT`／
+> `ORIENTATION_CHANGE`）與 `equipment`（設備狀態，處置者是設備工程師：
+> 其餘 8 條）。實測資料裡前者常佔七成以上，混算成單一「觸發密度」會讓
+> 數字被資料可用性問題撐大，誤導門檻校準與人力配置——所以報表把兩者
+> 拆開，`trigger_density.csv` 的排行榜也改依 `equipment_per_week` 排序。
 
 ### 判斷順序建議
 
@@ -109,11 +117,14 @@ python -m validate.offline --data-dir /tmp/vib_synth \
 2. **再看 `coverage.csv`**：可分析比例太低（< 50%）的量測點，後面的觸發
    統計對這個點沒有意義（`is_sufficient` 的判斷邏輯見
    `vibcore.types.CoverageInfo`）。
-3. **看 `trigger_density.csv`**：這是最終要回答的問題。經驗法則——
-   四階段簽核（工程師 → 主管 → 專家 → 結案）每關 SLA 是 5 天
-   （`db/schema.sql` 的 `sla_config`），一個工程師若要同時盯著多台設備，
-   每台每週超過 1～2 件大概就會開始積壓。若全廠平均或個別設備明顯超過
-   這個量級，代表門檻太緊。
+3. **看 `trigger_density.csv`**：這是最終要回答的問題，但要看
+   `equipment_per_week`（設備狀態類）欄位，不是 `episodes_per_week`
+   （合計）——`data_availability_per_week` 反映的是感測器／通訊／量程
+   佈建品質，該找 IT／儀電，不是拿來校準振動門檻。經驗法則——四階段
+   簽核（工程師 → 主管 → 專家 → 結案）每關 SLA 是 5 天（`db/schema.sql`
+   的 `sla_config`），一個工程師若要同時盯著多台設備，每台每週超過
+   1～2 件設備狀態類 Finding 大概就會開始積壓。若全廠平均或個別設備的
+   `equipment_per_week` 明顯超過這個量級，代表門檻太緊。
 4. **`episodes_detail.csv` 抽查幾筆**：尤其是持續天數很短（1～2 天）又
    反覆出現的同一條規則同一台設備——這種「一下觸發一下解除」的抖動，
    在正式系統裡等於重複開單、關單，對工程師是干擾而非有效預警，通常

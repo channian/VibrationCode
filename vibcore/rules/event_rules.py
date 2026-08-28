@@ -380,10 +380,19 @@ def orientation_change(ctx: RuleContext) -> RuleOutcome:
     """
     軸能量分佈（排序後 major/mid/minor 佔比）相對基準期出現跳變。
 
-    比對的是**最新一筆**可信資料 vs 基準期分佈，抓的是「單點跳變」；
-    持續性、緩慢的偏移屬於 `AXIS_SHIFT`（monotonic）的職責，兩者刻意
-    分開，因為成因推論的措辭完全不同——跳變較像一次性的安裝變動，
-    緩慢偏移較像漸進的工況或結構變化。
+    抓的是「跳變」；持續性、緩慢的偏移屬於 `AXIS_SHIFT`（monotonic）的
+    職責，兩者刻意分開，因為成因推論的措辭完全不同——跳變較像一次性的
+    安裝變動，緩慢偏移較像漸進的工況或結構變化。
+
+    有兩道防線，都是實測回測後補上的（68 台設備 33 週觸發 93 次，平均每台
+    5.5 次，遠高於「重貼感測器」這種罕見事件該有的頻率）：
+
+    1. **能量門檻**：佔比是歸一化的結果，設備接近停機時三軸都貼近雜訊，
+       佔比會劇烈跳動。只要當下的三軸合成量值明顯低於基準期水準，這組
+       佔比就不具可比性，直接不判定。單看佔比無從察覺這件事。
+    2. **持續性**：早期版本只比對最新一筆可信資料，而規則是每天跑一次，
+       等於每天拿一個隨機小時去擲骰子。改為要求連續數筆都超出門檻——
+       感測器真的被移位不會只有一小時異常，雜訊則不會連續數筆同向偏離。
 
     誠實的限制：本系統**無法區分**這個跳變是感測器被重新黏貼/移位造成，
     還是設備本身振動方向真的改變了——排序後的能量分佈刻意不保留 x/y/z
@@ -393,6 +402,8 @@ def orientation_change(ctx: RuleContext) -> RuleOutcome:
     """
     rule_code, issue_type, family = 'ORIENTATION_CHANGE', 'orientation_change', 'event'
     ratio_delta_th = float(ctx.params.get('ratio_delta', 0.25))
+    consecutive = max(1, int(ctx.params.get('consecutive_readings', 3)))
+    min_energy_ratio = float(ctx.params.get('min_energy_ratio', 0.3))
 
     baseline = ctx.axis_energy_baseline
     if not baseline:
@@ -402,27 +413,42 @@ def orientation_change(ctx: RuleContext) -> RuleOutcome:
     if d.empty or 'data_status' not in d.columns or 'axis_energy_sorted' not in d.columns:
         return RuleOutcome.no_trigger(rule_code, issue_type, family)
 
-    ok = d[d['data_status'] == DataStatus.OK]
-    row = _latest_row(ok)
-    current = row['axis_energy_sorted'] if row is not None else None
-    if not isinstance(current, dict):
+    ok = d[d['data_status'] == DataStatus.OK].sort_values('ts_hour')
+    recent = [v for v in ok['axis_energy_sorted'].tail(consecutive) if isinstance(v, dict)]
+    if len(recent) < consecutive:
+        # 資料不足以判斷持續性，寧可不判定也不要拿單筆下結論
         return RuleOutcome.no_trigger(rule_code, issue_type, family)
 
-    deltas = _axis_deltas(current, baseline)
-    if not deltas:
+    # 能量門檻：基準期沒帶 energy 的舊資料（例如既有 DB 中的基準）跳過此檢查，
+    # 維持相容；有帶的話，能量明顯偏低的小時其佔比不可比，直接不判定。
+    base_energy = baseline.get('energy')
+    if isinstance(base_energy, (int, float)) and base_energy > 0:
+        energies = [c.get('energy') for c in recent]
+        if any(not isinstance(e, (int, float)) or e < base_energy * min_energy_ratio
+               for e in energies):
+            return RuleOutcome.no_trigger(rule_code, issue_type, family)
+
+    per_reading = [_axis_deltas(c, baseline) for c in recent]
+    if any(not p for p in per_reading):
         return RuleOutcome.no_trigger(rule_code, issue_type, family)
 
-    max_delta = max(abs(v) for v in deltas.values())
-    triggered = max_delta >= ratio_delta_th
-    if not triggered:
+    # 取「連續數筆中最小的那個最大偏移」——全部都要超標才算數，
+    # 回報時用最保守的數字，避免用尖峰值誇大變化幅度。
+    per_reading_max = [max(abs(v) for v in p.values()) for p in per_reading]
+    max_delta = min(per_reading_max)
+    if max_delta < ratio_delta_th:
         return RuleOutcome.no_trigger(rule_code, issue_type, family)
+
+    current = recent[-1]
+    deltas = per_reading[-1]
 
     return RuleOutcome(
         triggered=True, rule_code=rule_code, issue_type=issue_type, family=family,
         severity='warn',
         title='軸能量分佈排列跳變',
         detail=(f'三軸能量佔比（排序後）與基準期相比最大變化 {max_delta:.0%}'
-                f'（門檻 {ratio_delta_th:.0%}）。'),
+                f'（門檻 {ratio_delta_th:.0%}），且連續 {consecutive} 筆可信'
+                f'資料皆超出門檻。'),
         interpretation_limit=(
             '軸能量分佈改變可能來自感測器重新黏貼或鬆脫移位，也可能來自'
             '設備本身振動方向改變，本系統無法區分兩者成因；建議先確認'
