@@ -10,10 +10,15 @@ M2 驅動端…）。這一層是規則引擎真正落地前，回測框架自�
 `analytic_reader.py`。
 
 切點邏輯（依可信度由高到低）：
-1. 若有 `Label` 欄且非空、有多值 → 以 `Label` 當作 position。
-2. 否則若 `Channel_X/Y/Z` 三軸組合在檔案內有多種 → 以組合當 position
+1. 若 `Channel_X/Y/Z` 三軸組合在檔案內有多種 → 以組合當 position
    （同一物理感測點的三軸配線應該固定，組合改變代表換了安裝位置）。
-3. 都沒有 → 整台設備視為單一量測點，position 固定為 `M1`。
+2. 否則整台設備視為單一量測點，position 固定為 `M1`。
+
+**`Label` 欄刻意不使用。** 前端開發時把它拿來存電流 TAG 名稱（例如
+`FACCIMTAB.ZONE1_K12_CHS|K12_BF_CHS_PMS_CH01_I_AVG`），與量測位置無關。
+早期版本曾用它切點，結果同一台設備被切成兩個假的量測點——有 TAG 的列
+歸到一個以 TAG 命名的 position，沒有的列歸到 `M1`，基準與統計因此被
+拆散。本改版不使用電流 TAG，此欄一律忽略。
 
 **已知限制**：真實台帳（`measure_point`）由工程師維護、位置命名有意義
 （"M1 自由端"）；這裡是資料驅動的猜測，只求回測時「同一物理位置的資料
@@ -79,12 +84,11 @@ def _build_device_context(device_id: str, meta: dict, overrides: dict | None) ->
 
 
 def _position_series(df: pd.DataFrame) -> pd.Series:
-    """為每一列決定所屬 position 名稱；見模組 docstring 的切點邏輯。"""
-    if 'Label' in df.columns:
-        label = df['Label'].astype('string').str.strip()
-        if label.notna().any() and label.replace('', pd.NA).notna().any():
-            return label.fillna('M1').replace('', 'M1')
+    """
+    為每一列決定所屬 position 名稱；見模組 docstring 的切點邏輯。
 
+    `Label` 欄刻意不納入判斷——它存的是電流 TAG 名稱而非量測位置。
+    """
     chan_cols = [c for c in ('Channel_X', 'Channel_Y', 'Channel_Z') if c in df.columns]
     if len(chan_cols) == 3:
         combo = df[chan_cols].astype('string').agg('-'.join, axis=1)

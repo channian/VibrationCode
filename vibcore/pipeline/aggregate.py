@@ -198,6 +198,13 @@ def aggregate_hourly(df: pd.DataFrame,
             cfg = replace(cfg, expected_samples_per_hour=detected)
             logger.info(f"  已改用偵測到的資料密度：每小時 {detected} 筆")
 
+    # 運轉樣本門檻必須跟著密度走。寫死絕對筆數的話，低密度資料（每 10 分鐘
+    # 一筆＝每小時 6 筆）永遠達不到為每秒一筆訂的 60 筆，每個小時都會變成
+    # partial，指標型規則全部跳過——而且不會報錯，只會安靜地什麼都判不出來。
+    min_running = cfg.effective_min_running(cfg.expected_samples_per_hour)
+    logger.debug(f"  運轉樣本門檻：{min_running} 筆"
+                 f"（每小時預期 {cfg.expected_samples_per_hour} 筆）")
+
     work = df.copy()
     work['_hour'] = work['datetime'].dt.floor('h')
     work['_running'] = mark_running(work, cfg)
@@ -213,7 +220,7 @@ def aggregate_hourly(df: pd.DataFrame,
             # 有資料但設備未運轉——正常狀態，不是異常
             status = DataStatus.NOT_RUNNING
             metrics = _empty_metrics()
-        elif completeness < cfg.partial_threshold or n_run < cfg.min_running_samples:
+        elif completeness < cfg.partial_threshold or n_run < min_running:
             # 有數字但樣本不足，指標不具代表性
             status = DataStatus.PARTIAL
             metrics = _aggregate_running(sub_run)

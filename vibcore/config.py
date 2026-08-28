@@ -111,8 +111,35 @@ class AggregateConfig:
     #: 完整度低於此值標記為 partial，其指標不進入趨勢回歸與規則判定
     partial_threshold: float = 0.5
 
-    #: 運轉樣本數低於此值時，該小時的指標不具代表性
-    min_running_samples: int = 60
+    #: 運轉樣本數需達「每小時預期樣本數」的此比例，該小時的指標才具代表性。
+    #:
+    #: 用比例而非絕對筆數，是因為取樣頻率會隨資料版本改變：即時量測是每秒
+    #: 一筆（3600 筆/小時），長期量測是每 10 分鐘一筆（6 筆/小時）。若寫死
+    #: 「至少 60 筆」，10 分鐘版一小時最多 6 筆，**永遠達不到門檻**，每個
+    #: 小時都會被判為 partial，所有指標型規則靜默跳過，整份回測歸零。
+    #:
+    #: 預設 60/3600 是沿用原本「每秒一筆時至少要有 1 分鐘運轉資料」的判準，
+    #: 換算到 10 分鐘版即為「至少 1 筆」。
+    min_running_ratio: float = 60 / 3600
+
+    #: 運轉樣本數的絕對下限，避免比例算出 0
+    min_running_floor: int = 1
+
+    #: 明確指定運轉樣本數門檻；設定後覆蓋上面的比例計算。
+    #: 一般不需要動，除非要針對特定資料集手動調整。
+    min_running_samples: int | None = None
+
+    def effective_min_running(self, expected_per_hour: int | None = None) -> int:
+        """
+        算出這批資料實際適用的「最少運轉樣本數」。
+
+        Args:
+            expected_per_hour: 該批資料實測的每小時樣本數；None 表示用設定值
+        """
+        if self.min_running_samples is not None:
+            return self.min_running_samples
+        expected = expected_per_hour or self.expected_samples_per_hour
+        return max(self.min_running_floor, round(expected * self.min_running_ratio))
 
 
 @dataclass(frozen=True)
