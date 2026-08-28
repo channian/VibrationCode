@@ -213,6 +213,44 @@ def _resolve_score_metric(agg: pd.DataFrame, cfg: 'BaselineConfig') -> str | Non
     return None
 
 
+def _restrict_to_latest_cadence(agg: pd.DataFrame, point_id: int | str = '') -> pd.DataFrame:
+    """
+    基準期只能在「與待判定資料相同取樣密度」的區段內挑選。
+
+    為什麼必須這樣做：每小時聚合值是該小時內樣本的平均，樣本數越多平均
+    越穩定。每秒取樣的一小時是 3600 筆的平均，每 10 分鐘取樣只有 6 筆，
+    後者的每小時值天生就抖得多。基準期掃描選的是「最穩定的窗口」，混雜
+    兩種密度時**必然選中高密度那一段**，接著把低密度資料拿去跟一個標準差
+    被嚴重低估的基準相比，於是整段資料看起來都在偏離。
+
+    實測：同一組統計分布，只是前 8 天用每秒取樣、之後改每 10 分鐘，
+    STEP_CHANGE 會穩定誤觸發；純單一密度時誤報率僅約 8%。取最大值的
+    accPEAK/accCREST/accKURT 更嚴重——3600 筆取最大值與 6 筆取最大值
+    本來就不是同一個量。
+
+    因此只保留最近一段的密度（規則要判定的正是最近的資料）。捨棄的歷史
+    資料會讓基準期可用的樣本變少，但用錯誤的基準比沒有基準更糟——後者
+    至少會誠實回傳 None。
+    """
+    if 'expected_samples' not in agg.columns or agg.empty:
+        return agg
+
+    ok = agg[agg['data_status'] == DataStatus.OK] if 'data_status' in agg.columns else agg
+    densities = ok['expected_samples'].dropna().unique()
+    if len(densities) <= 1:
+        return agg
+
+    latest = ok.sort_values('ts_hour')['expected_samples'].iloc[-1]
+    kept = agg[agg['expected_samples'] == latest]
+    logger.warning(
+        f"detect_baseline：point={point_id} 資料含 {len(densities)} 種取樣密度"
+        f"（{sorted(int(d) for d in densities)} 筆/小時），基準期僅在最近的"
+        f"{int(latest)} 筆/小時區段內挑選（{len(kept)}/{len(agg)} 小時）。"
+        f"跨密度的基準會低估標準差而使整段資料看起來都在偏離。"
+    )
+    return kept
+
+
 def detect_baseline(agg: pd.DataFrame,
                      cfg: BaselineConfig = DEFAULT_BASELINE_CFG,
                      point_id: int | str = '') -> BaselineStats | None:
@@ -246,6 +284,8 @@ def detect_baseline(agg: pd.DataFrame,
     if agg is None or agg.empty or 'ts_hour' not in agg.columns:
         logger.warning("detect_baseline：輸入聚合資料為空或缺少 ts_hour 欄，無法偵測基準期")
         return None
+
+    agg = _restrict_to_latest_cadence(agg, point_id)
 
     metrics = list(AGG_SPEC.keys())
     # 評分指標必須以「資料中實際存在且有值」為準，不能只看設定檔有沒有列。

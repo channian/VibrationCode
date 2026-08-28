@@ -103,6 +103,14 @@ def _stub_axis_energy_baseline(agg: pd.DataFrame,
     if ok.empty or 'axis_energy_sorted' not in ok.columns:
         return None
 
+    # 與 detect_baseline 相同的理由：取樣密度不同的區段不可混用為基準。
+    # 這裡取「最早 14 天」，混雜資料時那正好會落在舊的高密度區段，而規則
+    # 判定的是最近的低密度資料，兩者的每小時穩定度不同量級。
+    if 'expected_samples' in ok.columns and ok['expected_samples'].nunique(dropna=True) > 1:
+        ok = ok[ok['expected_samples'] == ok['expected_samples'].iloc[-1]]
+        if ok.empty:
+            return None
+
     window_end = ok['ts_hour'].iloc[0] + pd.Timedelta(days=min_days)
     window = ok[ok['ts_hour'] < window_end]
     rows = [r for r in window['axis_energy_sorted'] if isinstance(r, dict)]
