@@ -34,7 +34,7 @@ import pandas as pd
 from vibcore.config import DEFAULT_AGG
 from validate.backtest import run_backtest, sweep_threshold
 from validate.baseline_stub import USING_REAL_BASELINE
-from validate.points import load_points
+from validate.points import load_points, trim_points
 from validate.report import write_reports
 from validate.rule_defaults import load_rule_configs
 from validate.rules_stub import (
@@ -84,6 +84,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument('--min-running-samples', type=int, default=None,
                    help='判定「該小時指標具代表性」所需的最少運轉樣本數（預設 60）；'
                         '搭配 --samples-per-hour 一起調整合成資料的取樣密度')
+    p.add_argument('--since', default=None, metavar='YYYY-MM-DD',
+                   help='只回測此日期（含）之後的資料')
+    p.add_argument('--until', default=None, metavar='YYYY-MM-DD',
+                   help='只回測此日期（含）之前的資料')
+    p.add_argument('--latest-cadence-only', action='store_true',
+                   help='匯出檔混雜不同前端版本（每秒／每 10 分鐘）時，'
+                        '只保留每個量測點最近一段連續同密度的資料。'
+                        '逐點各自裁切，不是統一切一個日期——各設備換版時間不同，'
+                        '統一日期會丟掉早就換好版的點的好資料')
     p.add_argument('--sweep', action='append', default=[], metavar='RULE:param:v1,v2,v3',
                    help='額外加入的門檻掃描，可重複給多次')
     p.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
@@ -183,6 +192,17 @@ def main(argv: list[str] | None = None) -> int:
     rule_configs = load_rule_configs(args.rule_config)
     n_active = sum(1 for r in rule_configs.values() if r.is_active)
     logger.info(f"載入 {len(rule_configs)} 條規則設定（{n_active} 條啟用中）")
+
+    if args.since or args.until or args.latest_cadence_only:
+        points = trim_points(
+            points,
+            since=pd.Timestamp(args.since) if args.since else None,
+            until=pd.Timestamp(args.until) if args.until else None,
+            latest_cadence_only=args.latest_cadence_only,
+        )
+        if not points:
+            logger.error("裁切後沒有任何量測點還有資料，請放寬 --since/--until，中止")
+            return 1
 
     _report_cadence_mix(points)
 

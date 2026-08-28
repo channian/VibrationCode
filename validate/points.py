@@ -121,6 +121,64 @@ def load_device_meta_overrides(path: str | None) -> dict[str, dict]:
         return {}
 
 
+def trim_points(points: list[PointSeries],
+                since: pd.Timestamp | None = None,
+                until: pd.Timestamp | None = None,
+                latest_cadence_only: bool = False) -> list[PointSeries]:
+    """
+    裁掉不想納入回測的資料區間。
+
+    `latest_cadence_only` 是為「匯出檔混雜前端版本」設計的：只保留每個
+    量測點最近一段連續同密度的資料。**刻意逐點各自裁切，而不是統一切一個
+    日期**——各設備換版時間不同（實測同一批資料裡有 5/18、6/4、3/31 等
+    多個切換點），統一日期會把早就換好版的點的好資料一起丟掉。
+
+    為什麼值得裁：混雜密度會同時造成三件事——換版空窗被算成感測器離線、
+    涵蓋率分母被撐大、以及基準期偏誤（每小時樣本數多的區段變異天生較小，
+    會贏得「最穩定窗口」的選擇，再拿去比對低密度資料就整段看起來在偏離）。
+    基準期偏誤已在 `vibcore.metrics.baseline` 內擋掉，但前兩者只能靠裁切。
+
+    Returns:
+        裁切後的量測點清單；裁到沒有資料的點會被剔除並記錄。
+    """
+    from vibcore.pipeline.aggregate import detect_cadence_segments
+
+    out: list[PointSeries] = []
+    dropped: list[str] = []
+    for p in points:
+        df = p.raw
+        before = len(df)
+        if since is not None:
+            df = df[df['datetime'] >= since]
+        if until is not None:
+            df = df[df['datetime'] <= until]
+
+        if latest_cadence_only and not df.empty:
+            seg = detect_cadence_segments(df)
+            if len(seg) > 1:
+                last = seg.iloc[-1]
+                cut = pd.Timestamp(last['start_day'])
+                df = df[df['datetime'] >= cut]
+                logger.info(
+                    f"  {p.device.device_id}/{p.position}：混雜 {len(seg)} 種取樣密度，"
+                    f"只保留 {cut:%Y-%m-%d} 起的 {int(last['samples_per_hour'])} 筆/小時區段"
+                )
+
+        if df.empty:
+            dropped.append(f"{p.device.device_id}/{p.position}")
+            continue
+        if len(df) != before:
+            p = PointSeries(device=p.device, point_id=p.point_id, position=p.position,
+                            raw=df.reset_index(drop=True), source_files=p.source_files)
+        out.append(p)
+
+    if dropped:
+        logger.warning(f"裁切後無資料而剔除的量測點（{len(dropped)} 個）："
+                       + "、".join(dropped[:10])
+                       + (f" …另有 {len(dropped) - 10} 個" if len(dropped) > 10 else ""))
+    return out
+
+
 def load_points(folder: str, pattern: str = '*.csv',
                  device_meta_path: str | None = None) -> list[PointSeries]:
     """
