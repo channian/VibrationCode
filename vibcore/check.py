@@ -181,7 +181,7 @@ def check_seed() -> None:
     with get_connection() as conn:
         with conn.cursor() as cur:
             for table, label, expect in (
-                ("rule_config", "判定規則", 13),
+                ("rule_config", "判定規則", 14),
                 ("iso_threshold", "ISO 門檻等級", 4),
                 ("sla_config", "簽核階段 SLA", 3),
                 ("app_role", "角色定義", 5),

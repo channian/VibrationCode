@@ -54,7 +54,12 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             description='velOA 相對基準超過 N 個標準差'),
         RuleConfigRow(
             'IMPACT_RISE', '衝擊性指標上升', 'monotonic', 'impact_rise', 'warn',
-            {'crest_sigma': 2.5, 'kurt_sigma': 2.5, 'require_both': False},
+            # 逐軸門檻與合成值同量級：沒有證據支持逐軸 kurt 比合成值更敏感
+            # 或更不敏感（實測 crest 是逐軸較大、kurt 反而是合成較大），
+            # 故不預設偏鬆或偏緊。
+            {'crest_sigma': 2.5, 'kurt_sigma': 2.5,
+             'crest_axis_sigma': 2.5, 'kurt_axis_sigma': 2.5,
+             'require_both': False},
             description='accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
         RuleConfigRow(
             'DEGRADE_TREND', '指標持續劣化', 'monotonic', 'degradation_trend', 'warn',
@@ -80,6 +85,13 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             {'ratio_delta': 0.25, 'consecutive_readings': 3, 'min_energy_ratio': 0.3},
             description='軸能量分佈排列跳變，疑似感測器重貼或更換'),
         RuleConfigRow(
+            'TEMP_RISE', '溫度相對基準上升', 'oscillating', 'temp_rise', 'warn',
+            # sigma 與 IMPACT_RISE 同量級；另有 consecutive_readings 把關，
+            # 兩道防線一起收斂假警報。vibration_co_rise_sigma 只影響敘述
+            # 措辭（同期振動是否也偏離），不影響是否觸發。
+            {'sigma': 2.5, 'consecutive_readings': 3, 'vibration_co_rise_sigma': 1.0},
+            description='溫度相對基準持續上升；一併呈現同期振動有無同步變化'),
+        RuleConfigRow(
             'SENSOR_OFFLINE', '感測器離線', 'event', 'sensor_offline', 'err',
             {'hours': 24},
             description='逾時無資料'),
@@ -97,7 +109,10 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             description='備機超過 N 天未運轉，建議試車'),
         RuleConfigRow(
             'ISO_CLASS_SUSPECT', 'ISO 等級存疑', 'event', 'iso_class_suspect', 'warn',
-            {},
+            # frontend_consecutive_readings：與前端 iso10816 不一致需連續
+            # 幾筆才算數。太小會被 Zone 邊界抖動觸發，太大則反應太慢；
+            # 比照 ORIENTATION_CHANGE 的 consecutive_readings。
+            {'frontend_consecutive_readings': 3},
             description='基準期中位數已超過所指派等級的 B/C 界，等級可能填錯或機器本有問題'),
     ]
 }

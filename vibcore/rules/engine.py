@@ -84,6 +84,10 @@ RULE_CATEGORY: dict[str, str] = {
     'AXIS_SHIFT': RuleCategory.EQUIPMENT,
     'STEP_CHANGE': RuleCategory.EQUIPMENT,
     'STANDBY_NO_RUNTIME': RuleCategory.EQUIPMENT,
+    # 溫度異常的處置者是設備工程師（要不要安排深度量測），不是 IT。
+    # 雖然它也可能來自感測器本身的問題，但那屬於判讀時的保留，
+    # 不改變「先由設備端看」這個分流結果。
+    'TEMP_RISE': RuleCategory.EQUIPMENT,
 }
 
 

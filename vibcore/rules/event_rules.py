@@ -39,7 +39,7 @@ import logging
 import pandas as pd
 
 from vibcore.config import DataStatus, FULL_SCALE_MS2, G_TO_MS2, SATURATION_PCT, SENSOR_RANGE_G
-from vibcore.metrics.iso import evaluate_iso
+from vibcore.metrics.iso import classify_zone, evaluate_iso
 from vibcore.rules.engine import register
 from vibcore.types import RuleContext, RuleOutcome
 
@@ -57,6 +57,16 @@ _DATA_QUALITY_MIN_DENOM_HOURS = 12
 
 #: 判定「零值卡死」的容差；浮點數比較不可直接用 == 0。
 _ZERO_EPS = 1e-9
+
+#: 前端 `iso10816`（聚合後欄位 `iso_zone_frontend`）為 1..4 的數字分級，
+#: 本系統內部一律用字母 Zone；交叉比對前先在此統一轉換，避免兩種表示法
+#: 在各處分別互轉、彼此漂移。語意見 db/schema.sql 的欄位註解與
+#: docs/DATA_CONTRACT.md §3.2：1=Zone A（最佳）...4=Zone D（最差）。
+_FRONTEND_ZONE_MAP: dict[int, str] = {1: 'A', 2: 'B', 3: 'C', 4: 'D'}
+
+#: Zone 字母的嚴重度排序，只用來判斷「哪一邊判得比較嚴重」，不用於
+#: 其他數值運算。
+_ZONE_RANK: dict[str, int] = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
 
 
 # ──────────────────────────────────────────────────────────
@@ -469,15 +479,167 @@ def orientation_change(ctx: RuleContext) -> RuleOutcome:
 # ISO_CLASS_SUSPECT — ISO 等級疑似填錯
 # ──────────────────────────────────────────────────────────
 
+def _frontend_zone_cross_check(agg_asof: pd.DataFrame,
+                                machine_class: str,
+                                consecutive: int) -> dict | None:
+    """
+    比對「本系統依 `evaluate_iso()` 同一套門檻算出的 Zone」與「前端已算好
+    寫在 `iso_zone_frontend` 欄位的 Zone」，找持續性的不一致。
+
+    這條檢查的立足點跟 `evaluate_iso()` 裡原本的合理性檢查不同：原本那條
+    只看「我們自己這一套是否內部矛盾」（基準期實測值 vs 我們指派的等級）；
+    這裡看的是「我們這一套跟前端那一套，結論是否對得起來」——兩邊各自
+    可能對，也可能都有各自的機械等級假設但其中一邊填錯了，本函式本身
+    無從分辨，只負責找出「持續對不起來」這件事。
+
+    只在能同時取得可信 velRMS（`data_status == ok`）與有效前端 Zone
+    （`iso_zone_frontend` ∈ {1,2,3,4}）的小時上比較；任一邊缺席就跳過
+    該小時，不強行湊數，也不把「缺席」當成「一致」或「不一致」。
+
+    要求連續 `consecutive` 筆「有效可比對」的小時都不一致，且不一致的
+    方向（本系統較嚴 / 前端較嚴）前後一致，才視為持續性落差：
+    - 單筆不一致：兩邊的取樣視窗、資料到齊時間點本來就可能有些微差異，
+      落在 Zone 邊界附近時一筆抖動很常見，不足以下「台帳有問題」的結論；
+    - 方向忽正忽負：代表兩邊在邊界附近彼此穿插，比較像雜訊而非穩定的
+      系統性落差（例如兩套機械等級假設，換算後門檻剛好很接近）。
+
+    Args:
+        agg_asof: 已用 `_asof()` 篩過「不偷看未來」的聚合資料。
+        machine_class: 本系統依台帳認定的機械等級（呼叫端已確認
+            `evaluate_iso(...).applicable` 為 True 才會傳進來）。
+        consecutive: 連續筆數門檻（對應規則參數
+            `frontend_consecutive_readings`）。
+
+    Returns:
+        None 代表沒有觸發（含：欄位不存在、資料不足、方向不一致等，
+        全部安靜地視為「沒有可用的交叉檢查結果」，不拋錯）；否則回傳
+        dict，含不一致方向與最新一筆兩邊的 Zone，供組裝 `RuleOutcome`。
+    """
+    if agg_asof is None or agg_asof.empty:
+        return None
+    if 'iso_zone_frontend' not in agg_asof.columns:
+        # 前端沒有帶這個欄位（舊資料、或該版本的前端未輸出）——這是
+        # 「無法比對」，不是「比對後一致」，兩者不可混為一談，但兩者的
+        # 處置一樣：安靜地不觸發，退回只看本系統自己判定的行為。
+        return None
+    if 'data_status' not in agg_asof.columns or 'vel_rms' not in agg_asof.columns:
+        return None
+
+    ok = agg_asof[agg_asof['data_status'] == DataStatus.OK].sort_values('ts_hour')
+    if ok.empty:
+        return None
+
+    comparable = []
+    for _, row in ok.iterrows():
+        vel_rms = row.get('vel_rms')
+        fz_raw = row.get('iso_zone_frontend')
+        if pd.isna(vel_rms) or pd.isna(fz_raw):
+            continue
+        try:
+            fz_int = int(fz_raw)
+        except (TypeError, ValueError):
+            continue
+        if fz_int not in _FRONTEND_ZONE_MAP:
+            continue
+        our_zone = classify_zone(float(vel_rms), machine_class)
+        if our_zone is None:
+            continue
+        comparable.append({
+            'ts_hour': row.get('ts_hour'),
+            'vel_rms': float(vel_rms),
+            'our_zone': our_zone,
+            'frontend_zone': _FRONTEND_ZONE_MAP[fz_int],
+        })
+
+    if len(comparable) < consecutive:
+        # 有欄位、但可比對的小時數不夠——多半是這個功能剛上線沒多久，
+        # 舊資料沒有回填 iso_zone_frontend，寧可等資料夠了再判斷。
+        return None
+
+    recent = comparable[-consecutive:]
+    diffs = [_ZONE_RANK[r['our_zone']] - _ZONE_RANK[r['frontend_zone']] for r in recent]
+    if any(d == 0 for d in diffs):
+        # 連續窗口內只要有一筆兩邊一致，就不構成「持續」不一致。
+        return None
+    signs = {1 if d > 0 else -1 for d in diffs}
+    if len(signs) != 1:
+        # 方向不穩定：這一筆我們比較嚴、下一筆前端比較嚴，不像是穩定的
+        # 系統性落差（例如兩邊機械等級假設不同），較像邊界附近的雜訊。
+        return None
+
+    direction = 'ours_worse' if signs.pop() > 0 else 'frontend_worse'
+    latest = recent[-1]
+    return {
+        'direction': direction,
+        'consecutive': consecutive,
+        'our_zone': latest['our_zone'],
+        'frontend_zone': latest['frontend_zone'],
+        'vel_rms': latest['vel_rms'],
+        'at_hour': str(latest['ts_hour']) if latest['ts_hour'] is not None else None,
+        'readings': [
+            {'ts_hour': str(r['ts_hour']) if r['ts_hour'] is not None else None,
+             'vel_rms': round(r['vel_rms'], 3),
+             'our_zone': r['our_zone'], 'frontend_zone': r['frontend_zone']}
+            for r in recent
+        ],
+    }
+
+
 @register('ISO_CLASS_SUSPECT')
 def iso_class_suspect(ctx: RuleContext) -> RuleOutcome:
     """
-    ISO 等級疑似填錯：基準期 velRMS 中位數已超過所指派等級的 B/C 界。
+    ISO 等級疑似填錯——兩條獨立的判準，任一成立即觸發：
 
-    判定邏輯完全委由 `vibcore.metrics.iso.evaluate_iso()` 執行（見該模組
-    說明）——這裡只負責把它的結果包成 `RuleOutcome`，不重新發明一套簡化
-    版判準，避免兩處邏輯漂移。未分級設備（`iso_class_source == 'unset'`）
-    `evaluate_iso` 本身就不會標記為 suspect，此規則自然不會觸發。
+    1. **基準期水準檢查**（原有邏輯，委由 `evaluate_iso()` 執行，見該
+       模組說明）：基準期 velRMS 中位數已超過所指派等級的 B/C 界。這一
+       條檢查的是「我們自己這套判定內部有沒有矛盾」——不重新發明一套
+       簡化版判準，避免兩處邏輯漂移。
+
+    2. **前端交叉檢查**（新增，見 `_frontend_zone_cross_check()`）：同一
+       小時，本系統用 `evaluate_iso()` 同一套門檻算出的 Zone，是否與前端
+       已經算好、隨資料一起送來的 `iso_zone_frontend` 欄位**持續**兜不
+       起來。連續不一致要求 `consecutive` 筆、且方向一致，見該函式
+       docstring；單筆不一致可能只是門檻邊界抖動，刻意不觸發。
+
+    **這兩條檢查在定位上其實是同一件事的兩種偵測方式，但成因推論完全
+    不同，務必分開理解：**
+
+    - 條件 1 抓的是「我們指派的等級，跟我們自己量到的振動水準對不起來」；
+    - 條件 2 抓的是「我們指派的等級，跟前端那一套算出來的結論對不起來」，
+      而**本系統不知道前端用的是哪一個機械等級**在算 `iso10816`——換言之，
+      條件 2 不一定代表本系統的等級填錯，也可能是前端那一側的假設有誤，
+      甚至兩邊都有各自的依據但對同一台設備做了不同認定。**這是台帳
+      （設備機械等級）資訊本身的問題，不是設備振動異常的問題**——
+      因此：
+        * severity 維持 `warn`（不是 `err`）；
+        * 文字導向「請核對這台設備的機械等級（ISO10816_code）是否填
+          對」，而不是「請工程師去現場複測」；
+        * 觸發文字會明講不一致的**方向**（本系統判得比較嚴重、或前端
+          判得比較嚴重）——兩者代表的落差方向不同，但**哪一邊的等級
+          假設是對的，本系統無法判斷**，這一點寫在 `interpretation_limit`。
+
+    **前提與退回行為**（安靜，不拋錯）：
+    - `evaluate_iso()` 對未分級設備（`class_source == 'unset'`）回傳
+      `applicable=False`；此時本系統自己都算不出 Zone 可比，條件 2 不
+      執行——沒有可比較的基準，勉強比對只會產生沒有意義的雜訊。
+    - `iso_zone_frontend` 欄位不存在（舊資料、或該版本前端未輸出這個
+      欄位）時，條件 2 安靜地視為「無法比對」而不觸發，行為等同這個
+      功能上線前的舊版——不會因為欄位不存在而誤觸發，也不會因此拋錯。
+    - 兩條檢查共用同一道既有的 `ctx.baseline is None` 前置檢查（本規則
+      原本就只在基準期已建立後才判定）；代價是設備剛上線、基準期尚未
+      建立前，即使前端與本系統的 Zone 已經持續兜不起來也不會提早示警，
+      但此時任何判定的證據都還不穩固，與本規則其餘部分的節奏一致，
+      故沿用而不特別放寬。
+
+    參數（皆讀自 `ctx.params`，seed 由呼叫端維護）：
+    - `frontend_consecutive_readings`（建議預設 3）：條件 2 要求的連續
+      可比對小時數，設計取捨同 `ORIENTATION_CHANGE` 的
+      `consecutive_readings`——太小易被邊界抖動觸發，太大則反應太慢。
+
+    **強制欄位**：`interpretation_limit` 誠實說明本系統不知道前端算
+    `iso10816` 時假設了哪一個機械等級，因此無法判斷條件 2 觸發時是
+    「本系統的台帳填錯」還是「前端的等級假設有誤」，只能提示雙方都去
+    核對台帳，不可據此直接認定任何一邊的 Zone 結論可信。
     """
     rule_code, issue_type, family = 'ISO_CLASS_SUSPECT', 'iso_class_suspect', 'event'
 
@@ -487,29 +649,79 @@ def iso_class_suspect(ctx: RuleContext) -> RuleOutcome:
     agg_asof = _asof(ctx.agg, ctx.now)
     iso = evaluate_iso(agg_asof, ctx.device, ctx.baseline)
 
-    if not iso.is_class_suspect:
+    cross = None
+    if iso.applicable:
+        consecutive = max(1, int(ctx.params.get('frontend_consecutive_readings', 3)))
+        cross = _frontend_zone_cross_check(agg_asof, iso.machine_class, consecutive)
+
+    if not iso.is_class_suspect and cross is None:
         return RuleOutcome.no_trigger(rule_code, issue_type, family)
 
     baseline_median = ctx.baseline.stats['vel_rms'].median if 'vel_rms' in ctx.baseline.stats else None
     bc_threshold = iso.thresholds.get('bc')
 
+    detail_parts: list[str] = []
+    limit_parts: list[str] = []
+    evidence: dict = {
+        'machine_class': iso.machine_class,
+        'class_source': iso.class_source,
+    }
+
+    if iso.is_class_suspect:
+        # `iso.suspect_reason`（來自 iso.py，不在本檔修改範圍內）會提到
+        # 「基礎剛性」等具體規格字眼，但本身沒有帶免責語——單獨看會被
+        # `guardrail.check_outcome()` 判定為「提及故障相關詞彙卻缺少免責
+        # 語」。這裡補一句涵蓋整個 detail 欄位的免責語，不改動 iso.py
+        # 產生的原文，只是把「本系統無法區分兩者」講清楚、講完整。
+        detail_parts.append(iso.suspect_reason)
+        detail_parts.append(
+            '（本系統無法區分是台帳等級填寫錯誤、還是設備規格本身特殊，'
+            '兩者都需人工複核，不由系統自動判定。）'
+        )
+        limit_parts.append(
+            '基準期水準檢查：此判定僅指出基準期實測水準與目前指派的機械'
+            '等級不吻合，本系統無法區分是台帳等級填寫錯誤、還是設備本身'
+            '振動水準原本就偏高（例如馬力、基礎剛性等規格特殊）；兩者都'
+            '需要人工核對台帳與現場設備規格後才能確認，不應直接採信目前'
+            '的 Zone 分級結論。'
+        )
+        evidence['baseline_median_vel_rms'] = baseline_median
+        evidence['thresholds'] = iso.thresholds
+
+    if cross is not None:
+        if cross['direction'] == 'ours_worse':
+            direction_text = (
+                f"本系統依台帳機械等級判為 Zone {cross['our_zone']}，"
+                f"前端同一時段判為 Zone {cross['frontend_zone']}，"
+                '本系統的判定持續比前端更嚴重'
+            )
+        else:
+            direction_text = (
+                f"前端判為 Zone {cross['frontend_zone']}，"
+                f"本系統依台帳機械等級同一時段判為 Zone {cross['our_zone']}，"
+                '前端的判定持續比本系統更嚴重'
+            )
+        detail_parts.append(
+            f"前端交叉檢查：連續 {cross['consecutive']} 筆可信資料中，"
+            f"{direction_text}（最新一筆 velRMS {cross['vel_rms']:.2f} mm/s）。"
+        )
+        limit_parts.append(
+            '前端交叉檢查：本系統與前端對同一時段判出不同 Zone，本系統'
+            '不知道前端計算 iso10816 時假設了哪一個機械等級，因此無法'
+            '判斷是本系統登記的機械等級（ISO10816_code）填錯、還是前端'
+            '的等級假設有誤——這是台帳資訊本身的問題，不代表設備振動'
+            '異常，也不需要另外派工程師到現場複測；請負責維護設備台帳'
+            '的人員核對這台設備登記的機械等級是否正確。'
+        )
+        evidence['frontend_cross_check'] = cross
+
     return RuleOutcome(
         triggered=True, rule_code=rule_code, issue_type=issue_type, family=family,
         severity='warn',
         title='ISO 等級疑似需複核',
-        detail=iso.suspect_reason,
-        interpretation_limit=(
-            '此判定僅指出基準期實測水準與目前指派的機械等級不吻合，無法'
-            '判斷是台帳等級填寫錯誤、還是設備本身振動水準原本就偏高；'
-            '兩者都需要人工核對台帳與現場設備規格（馬力、基礎剛性等）後'
-            '才能確認，不應直接採信目前的 Zone 分級結論。'
-        ),
+        detail='\n'.join(detail_parts),
+        interpretation_limit='\n'.join(limit_parts),
         current_value=baseline_median, baseline_value=bc_threshold, value_unit='mm/s',
-        evidence={
-            'machine_class': iso.machine_class,
-            'class_source': iso.class_source,
-            'baseline_median_vel_rms': baseline_median,
-            'thresholds': iso.thresholds,
-        },
+        evidence=evidence,
         target_type='point',
     )

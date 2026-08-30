@@ -11,7 +11,7 @@ from vibcore.rules.engine import (  # noqa: F401
 )
 
 # 匯入即註冊；缺任一模組時不讓整個套件失效，仍可跑其餘規則
-for _mod in ('metric_rules', 'event_rules'):
+for _mod in ('metric_rules', 'event_rules', 'temp_rules'):
     try:
         __import__(f'vibcore.rules.{_mod}')
     except ImportError:  # pragma: no cover - 開發期部分模組尚未完成

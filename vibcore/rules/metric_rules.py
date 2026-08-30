@@ -53,6 +53,11 @@ _METRIC_LABELS: dict[str, str] = {
     'acc_kurt': '峰度（accKURT）',
     'disp_p2p': '位移峰對峰值（dispP2P）',
     'acc_weighted_mean_freq': '加速度頻譜加權平均頻率（accWeightedMeanFreq）',
+    # 逐軸衝擊型指標（三軸取最大，見 config.py 的 AXIS_IMPACT_COLS）：
+    # 刻意不在名稱裡標示是哪一軸，理由與 `_axis_energy_sorted` 相同——
+    # 軸標籤不可信，這裡的「逐軸」只代表「三軸中取最大值」這個運算方式。
+    'acc_crest_axis_max': '波峰因子逐軸最大值（accCREST 三軸取大）',
+    'acc_kurt_axis_max': '峰度逐軸最大值（accKURT 三軸取大）',
 }
 
 #: 指標的物理單位（純比值型指標如 crest/kurt 沒有單位）
@@ -64,6 +69,8 @@ _METRIC_UNITS: dict[str, str] = {
     'acc_kurt': '',
     'disp_p2p': 'mm',
     'acc_weighted_mean_freq': 'Hz',
+    'acc_crest_axis_max': '',
+    'acc_kurt_axis_max': '',
 }
 
 #: ISO Zone 的嚴重程度順序（A 最輕、D 最重）
@@ -112,6 +119,26 @@ def _latest_ok_value(ctx: RuleContext, metric: str) -> float | None:
     if 'ts_hour' in sub.columns:
         sub = sub.sort_values('ts_hour')
     return float(sub['_v'].iloc[-1])
+
+
+def _sigma_channel(
+    ctx: RuleContext, metric: str, threshold: float,
+) -> tuple[float | None, object | None, float | None, bool]:
+    """
+    算單一指標欄位相對基準的 (最新值, 基準統計量, σ, 是否達門檻)。
+
+    抽成共用函式是因為 `IMPACT_RISE` 現在要對合成值與逐軸最大值各算一次
+    完全相同的流程；欄位或基準統計量任一缺失都回傳 `(val, None, None,
+    False)`——**安靜地視為該通道不可用，不是錯誤**，這樣舊基準（沒有
+    `acc_crest_axis_max` / `acc_kurt_axis_max` 統計量）餵進來時，呼叫端
+    不需要另外寫防呆，新通道自然退化成「沒有這個證據」。
+    """
+    val = _latest_ok_value(ctx, metric)
+    stat = ctx.baseline.stats.get(metric) if ctx.baseline is not None else None
+    if stat is None or val is None:
+        return val, None, None, False
+    sigma = stat.sigma_of(val)
+    return val, stat, sigma, sigma >= threshold
 
 
 def _parse_axis_dict(value) -> dict[str, float] | None:
@@ -286,13 +313,43 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
 @register('IMPACT_RISE')
 def impact_rise(ctx: RuleContext) -> RuleOutcome:
     """
-    accCREST / accKURT 相對基準顯著上升。
+    accCREST / accKURT 相對基準顯著上升；同時比對**合成通道**
+    （`acc_crest` / `acc_kurt`，對合成訊號算的）與**逐軸通道**
+    （`acc_crest_axis_max` / `acc_kurt_axis_max`，三軸取最大值，見
+    `pipeline/aggregate.py` 的 `_axis_impact_max`）。
 
-    `require_both=False`（預設）時任一指標達門檻即觸發——crest 與 kurt
-    對衝擊事件的敏感度不同，只看單一指標可能漏掉另一種樣態（見 PLAN §十二
-    的 AHU 樣本：velRMS 落在 Zone A/B，但 accCREST/accKURT 明顯異常）。
-    `require_both=True` 時收斂成「兩者同步上升」才觸發，減少假警報但可能
-    漏掉單一指標先動的早期訊號，留給使用端依現場經驗選擇。
+    **為什麼兩種通道都要看，而不是直接用逐軸值取代合成值**：兩者衡量的
+    是不同的東西，敏感度方向也不一致，不能假設其中一種必然比較敏感。
+    實測 ZP 3-5 同一筆資料：三軸 crest 為 4.65/5.01/4.30，合成欄卻只有
+    4.08（低於任一軸——單一方向的衝擊被其他兩軸稀釋掉了）；但同一筆的
+    kurt 恰好相反，三軸為 3.15/3.37/2.87，合成欄卻是 4.53（高於任一軸）。
+    所以本規則對兩種通道分別判定門檻、任一通道超標即觸發（OR），並在
+    evidence／detail 裡標明是哪個通道——「衝擊集中在單一方向」只是對
+    資料型態的客觀描述，不是成因推論，兩者觸發的意義不同：
+    只有逐軸通道超標，代表衝擊可能集中在單一方向；合成與逐軸都超標，
+    代表整體性的變化。
+
+    判定邏輯：合成通道與逐軸通道各自沿用原本的「`require_both=False`
+    時任一指標（crest 或 kurt）達門檻即算該通道觸發，`require_both=True`
+    時需兩者同步上升」規則，兩個通道的判定結果再取 OR 作為最終是否觸發。
+    這樣當基準期沒有逐軸統計量時（見下），逐軸通道恆為不觸發，整條規則
+    會自然退化成加入逐軸通道之前的原始行為，不需要另外分支。
+
+    參數（沿用既有的 `crest_sigma` 命名風格）：
+    - `crest_sigma`（預設 2.5）：合成 accCREST 的 σ 門檻
+    - `kurt_sigma`（預設 2.5）：合成 accKURT 的 σ 門檻
+    - `crest_axis_sigma`（建議預設 2.5）：逐軸 acc_crest_axis_max 的 σ 門檻
+    - `kurt_axis_sigma`（建議預設 2.5）：逐軸 acc_kurt_axis_max 的 σ 門檻
+      （與 crest_axis_sigma 給同一預設值，是因為目前沒有證據支持逐軸
+      kurt 比合成值更敏感或更不敏感——見上方 ZP 3-5 的反例，故不預設
+      偏鬆或偏緊，留給使用端依實際資料校準）
+    - `require_both`（預設 False）：語意同原本，只是分別套用在合成與
+      逐軸兩個通道上（見上）
+
+    基準期缺少 `acc_crest_axis_max` / `acc_kurt_axis_max` 的統計量時
+    （既有資料庫的基準期都是這種情況，因為這兩個聚合欄位是後來才加的），
+    `_sigma_channel` 會安靜回傳「該通道不可用」，本規則照常只用合成值
+    判定，不拋錯、不整條規則跳過。
     """
     if ctx.baseline is None:
         logger.debug(f"IMPACT_RISE：point={ctx.point_id} 尚無基準期，無法判定")
@@ -300,37 +357,58 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
 
     crest_th = float(ctx.params.get('crest_sigma', 2.5))
     kurt_th = float(ctx.params.get('kurt_sigma', 2.5))
+    crest_axis_th = float(ctx.params.get('crest_axis_sigma', 2.5))
+    kurt_axis_th = float(ctx.params.get('kurt_axis_sigma', 2.5))
     require_both = bool(ctx.params.get('require_both', False))
 
-    crest_val = _latest_ok_value(ctx, 'acc_crest')
-    kurt_val = _latest_ok_value(ctx, 'acc_kurt')
-    crest_stat = ctx.baseline.stats.get('acc_crest')
-    kurt_stat = ctx.baseline.stats.get('acc_kurt')
+    crest_val, crest_stat, crest_sigma, crest_up = _sigma_channel(ctx, 'acc_crest', crest_th)
+    kurt_val, kurt_stat, kurt_sigma, kurt_up = _sigma_channel(ctx, 'acc_kurt', kurt_th)
+    crest_axis_val, crest_axis_stat, crest_axis_sigma, crest_axis_up = \
+        _sigma_channel(ctx, 'acc_crest_axis_max', crest_axis_th)
+    kurt_axis_val, kurt_axis_stat, kurt_axis_sigma, kurt_axis_up = \
+        _sigma_channel(ctx, 'acc_kurt_axis_max', kurt_axis_th)
 
-    crest_sigma = crest_stat.sigma_of(crest_val) if crest_stat is not None and crest_val is not None else None
-    kurt_sigma = kurt_stat.sigma_of(kurt_val) if kurt_stat is not None and kurt_val is not None else None
-
-    if crest_sigma is None and kurt_sigma is None:
-        logger.debug(f"IMPACT_RISE：point={ctx.point_id} 無可用的 acc_crest/acc_kurt 資料或基準統計量")
+    if all(s is None for s in (crest_sigma, kurt_sigma, crest_axis_sigma, kurt_axis_sigma)):
+        logger.debug(f"IMPACT_RISE：point={ctx.point_id} 無可用的衝擊性指標資料或基準統計量")
         return RuleOutcome.no_trigger('IMPACT_RISE', 'impact_rise', 'monotonic')
 
-    crest_up = crest_sigma is not None and crest_sigma >= crest_th
-    kurt_up = kurt_sigma is not None and kurt_sigma >= kurt_th
-    triggered = (crest_up and kurt_up) if require_both else (crest_up or kurt_up)
+    composite_triggered = (crest_up and kurt_up) if require_both else (crest_up or kurt_up)
+    axis_triggered = (crest_axis_up and kurt_axis_up) if require_both else (crest_axis_up or kurt_axis_up)
+    triggered = composite_triggered or axis_triggered
 
     if not triggered:
         return RuleOutcome.no_trigger('IMPACT_RISE', 'impact_rise', 'monotonic')
 
-    # 挑 σ 較大者作為呈現用的主要數值（不代表「哪個更重要」，只是取較顯著者）
-    if kurt_sigma is not None and (crest_sigma is None or kurt_sigma > crest_sigma):
-        primary_metric, primary_val, primary_stat, primary_sigma = 'acc_kurt', kurt_val, kurt_stat, kurt_sigma
-    else:
-        primary_metric, primary_val, primary_stat, primary_sigma = 'acc_crest', crest_val, crest_stat, crest_sigma
+    # 挑 σ 最大者作為呈現用的主要數值（不代表「哪個更重要」，只是取較顯著者）。
+    # 四個候選中缺資料/缺基準統計量的通道 sigma 為 None 已被濾掉；只剩合成
+    # 兩通道時，這一步與加入逐軸通道之前完全等價。
+    candidates = [
+        ('acc_crest', crest_val, crest_stat, crest_sigma),
+        ('acc_kurt', kurt_val, kurt_stat, kurt_sigma),
+        ('acc_crest_axis_max', crest_axis_val, crest_axis_stat, crest_axis_sigma),
+        ('acc_kurt_axis_max', kurt_axis_val, kurt_axis_stat, kurt_axis_sigma),
+    ]
+    primary_metric, primary_val, primary_stat, primary_sigma = max(
+        (c for c in candidates if c[3] is not None), key=lambda c: c[3],
+    )
 
-    both_up = crest_up and kurt_up
+    # 標明觸發來源，讓 evidence／detail 能區分「合成」「逐軸」「兩者都有」
+    # ——這個區分只描述資料型態，不推論成因（見函式 docstring）。
+    if composite_triggered and axis_triggered:
+        trigger_source = 'both'
+    elif axis_triggered:
+        trigger_source = 'axis_max'
+    else:
+        trigger_source = 'composite'
+
     detail = (f'{_label(primary_metric)} 相對基準期中位數 {primary_stat.median:.2f} '
-              f'上升至 {primary_val:.2f}（{primary_sigma:+.1f}σ）。' +
-              ('波峰因子與峰度同步上升。' if both_up else ''))
+              f'上升至 {primary_val:.2f}（{primary_sigma:+.1f}σ）。')
+    if crest_up and kurt_up:
+        detail += '合成訊號的波峰因子與峰度同步上升。'
+    if trigger_source == 'axis_max':
+        detail += '僅逐軸最大值（三軸取大）超標、合成訊號未達門檻，衝擊可能集中在單一方向。'
+    elif trigger_source == 'both':
+        detail += '合成訊號與逐軸最大值同步超標，屬整體性變化。'
 
     return RuleOutcome(
         triggered=True,
@@ -343,19 +421,28 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
         interpretation_limit=(
             '波峰因子（Crest）與峰度（Kurtosis）反映振動訊號中衝擊成分的強弱，兩者上升通常代表'
             '週期性衝擊事件增加，常見於軸承劣化、潤滑不足或機件鬆動等情況，'
-            '本系統無法區分具體成因，建議安排專家量測系統複測以確認。'
+            '本系統無法區分具體成因；逐軸最大值可用於察覺衝擊是否集中在單一方向，'
+            '但感測器可能貼錯方向，本系統刻意不保留是哪一軸，因此無法指出實際方向，'
+            '仍建議安排專家量測系統複測以確認。'
         ),
         current_value=primary_val,
         baseline_value=primary_stat.median,
         value_unit=_unit(primary_metric),
         evidence={
             'primary_metric': primary_metric,
+            'trigger_source': trigger_source,
             'crest_current': crest_val,
             'crest_sigma': round(crest_sigma, 2) if crest_sigma is not None else None,
             'crest_threshold_sigma': crest_th,
             'kurt_current': kurt_val,
             'kurt_sigma': round(kurt_sigma, 2) if kurt_sigma is not None else None,
             'kurt_threshold_sigma': kurt_th,
+            'crest_axis_current': crest_axis_val,
+            'crest_axis_sigma': round(crest_axis_sigma, 2) if crest_axis_sigma is not None else None,
+            'crest_axis_threshold_sigma': crest_axis_th,
+            'kurt_axis_current': kurt_axis_val,
+            'kurt_axis_sigma': round(kurt_axis_sigma, 2) if kurt_axis_sigma is not None else None,
+            'kurt_axis_threshold_sigma': kurt_axis_th,
             'require_both': require_both,
         },
     )

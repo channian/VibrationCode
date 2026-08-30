@@ -402,7 +402,11 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      '{"sigma":3.0}',
      'velOA 相對基準超過 N 個標準差'),
     ('IMPACT_RISE',        '衝擊性指標上升',   'monotonic',   'impact_rise',      'warn',
-     '{"crest_sigma":2.5,"kurt_sigma":2.5,"require_both":false}',
+     -- 逐軸門檻與合成值同量級：實測 crest 是逐軸較大、kurt 反而是合成
+     -- 較大（見 docs/DATA_CONTRACT.md §3.3），沒有證據支持哪一邊該偏鬆，
+     -- 故給相同預設值。
+     '{"crest_sigma":2.5,"kurt_sigma":2.5,'
+     '"crest_axis_sigma":2.5,"kurt_axis_sigma":2.5,"require_both":false}',
      'accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
     ('DEGRADE_TREND',      '指標持續劣化',     'monotonic',   'degradation_trend','warn',
      '{"min_days":14,"min_r2":0.3,"slope_pct_per_month":10}',
@@ -436,8 +440,14 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      '{"days":30}',
      '備機超過 N 天未運轉，建議試車'),
     ('ISO_CLASS_SUSPECT',  'ISO 等級存疑',     'event',       'iso_class_suspect','warn',
-     '{}',
-     '基準期中位數已超過所指派等級的 B/C 界，等級可能填錯或機器本有問題');
+     '{"frontend_consecutive_readings":3}',
+     '基準期中位數已超過所指派等級的 B/C 界，等級可能填錯或機器本有問題'),
+    ('TEMP_RISE',          '溫度相對基準上升', 'oscillating', 'temp_rise',        'warn',
+     -- sigma 與 IMPACT_RISE 同量級；另有 consecutive_readings 把關，
+     -- 兩道防線一起收斂假警報。vibration_co_rise_sigma 只影響敘述措辭
+     -- （同期振動是否也偏離），不影響是否觸發。
+     '{"sigma":2.5,"consecutive_readings":3,"vibration_co_rise_sigma":1.0}',
+     'tempAVG 相對基準持續上升；一併呈現同期振動有無同步變化（不判定成因）');
 
 -- 各簽核階段的 SLA
 CREATE TABLE sla_config (
