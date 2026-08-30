@@ -33,7 +33,7 @@ import pandas as pd
 import psycopg2.extensions
 from psycopg2.extras import Json, execute_values
 
-from vibcore.config import AGG_SPEC
+from vibcore.config import AGG_SPEC, AXIS_IMPACT_COLS
 from vibcore.types import (
     CLOSED_STATUSES,
     FINDING_AUTO_RESOLVED,
@@ -54,7 +54,10 @@ Connection = psycopg2.extensions.connection
 #: 兩邊如果各自維護一份欄位清單，聚合層新增/移除欄位時很容易漏改一邊，
 #: 讓 bulk_insert_agg 悄悄漏寫某個指標而不報錯（多出的欄位被忽略、
 #: 缺少的欄位變成 NULL，兩者都不會讓程式炸掉，只會讓資料悄悄不見）。
-_AGG_METRIC_COLS: tuple[str, ...] = tuple(AGG_SPEC.keys())
+#: 寫入 measurement_agg 的指標欄。AGG_SPEC 之外還要加上 AXIS_IMPACT_COLS
+#: ——那組是跨三軸取極值算出來的，不是單一來源欄位的聚合，所以不在
+#: AGG_SPEC 裡；漏掉的話會安靜地不寫入，欄位永遠是 NULL。
+_AGG_METRIC_COLS: tuple[str, ...] = tuple(AGG_SPEC.keys()) + tuple(AXIS_IMPACT_COLS.keys())
 
 _DAILY_METRIC_COLS: tuple[str, ...] = (
     "running_hours", "vel_rms", "vel_oa", "acc_rms", "acc_oa", "acc_peak",

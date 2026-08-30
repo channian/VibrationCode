@@ -170,6 +170,23 @@ CREATE TABLE measurement_agg (
     vel_weighted_mean_freq  NUMERIC(10,3),
     -- 軸能量分佈（排序後佔比，方向無關）
     axis_energy_sorted  JSONB,
+    -- 逐軸衝擊指標取「三軸最大」，再取該小時最大值。合成欄是對合成訊號
+    -- 另算的，單一方向的衝擊會被其他兩軸稀釋（實測 ZP 3-5 三軸 crest
+    -- 4.65/5.01/4.30，合成欄只有 4.08）。只存極值不存是哪一軸——感測器
+    -- 可能貼錯方向，軸標籤不可信。
+    acc_crest_axis_max  NUMERIC(12,6),
+    acc_kurt_axis_max   NUMERIC(12,6),
+    -- 溫度（°C）。與振動獨立的唯一物理通道：「振動上升但溫度持平」與
+    -- 「兩者一起上升」對現場的意義不同。可能是感測器內部溫度而非軸承座
+    -- 溫度（見 docs/DATA_CONTRACT.md §3.1），故僅用於與自身基準比的相對
+    -- 趨勢，不設絕對門檻。
+    temp_avg            NUMERIC(8,3),
+    temp_max            NUMERIC(8,3),
+    temp_min            NUMERIC(8,3),
+    -- 前端已算好的 ISO 分級（1=Zone A … 4=Zone D），取該小時最差值。
+    -- 僅作為本系統自行判定的交叉檢查——前端假設的機械等級未知，
+    -- 兩者不一致時由 ISO_CLASS_SUSPECT 提出。
+    iso_zone_frontend   SMALLINT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (point_id, ts_hour)
 );

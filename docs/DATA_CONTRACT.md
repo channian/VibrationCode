@@ -64,9 +64,9 @@ accMeanPeakFreq  accWeightedMeanFreq
 
 ---
 
-## 三、可用但目前未納入（建議評估）
+## 三、已納入（2026-08 新增）
 
-### 3.1 溫度 `tempMAX` / `tempAVG` / `tempMIN`
+### 3.1 溫度 `tempMAX` / `tempAVG` / `tempMIN` → `temp_max/avg/min`
 
 實測有值且有鑑別度：ZP 3-5 為 37.6°C，CP 10 為 50.6°C。
 
@@ -78,7 +78,7 @@ accMeanPeakFreq  accWeightedMeanFreq
 溫度；若感測器貼在軸承座上，兩者有固定偏移但趨勢一致。**用於相對趨勢
 （與自身基準比）不受影響，用於絕對門檻則需先釐清。**
 
-### 3.2 `iso10816` / `iso10816_x/y/z`
+### 3.2 `iso10816` → `iso_zone_frontend`
 
 前端已算好的 ISO 分級值（1 = Zone A）。
 
@@ -88,15 +88,19 @@ A/B 界線 1.12 mm/s 判定皆為 Zone A，與前端的 `iso10816 = 1` 一致。
 **用途**：作為本系統 ISO 判定的交叉檢查，不取代自行計算——前端假設的
 機械等級未知。不一致時應觸發 `ISO_CLASS_SUSPECT`。
 
-### 3.3 逐軸的 `accCREST_x/y/z`、`accKURT_x/y/z`
+### 3.3 逐軸 `accCREST_x/y/z`、`accKURT_x/y/z` → `acc_crest_axis_max`、`acc_kurt_axis_max`
 
-目前只用合成值。衝擊型劣化常集中在單一方向，合成值會把它稀釋掉；取三軸
-中的最大值（或排序後的分佈）會更敏感。
+衝擊型劣化常集中在單一方向，合成值會把它稀釋掉。實測 ZP 3-5 的三軸
+crest 為 4.65/5.01/4.30，合成欄只有 4.08——低於任何一軸。
 
-沿用既有的方向無關原則：**排序後使用，不保留 x/y/z 標籤**（感測器可能
+**但 kurtosis 的情況相反**：同一筆的三軸 kurt 是 3.15/3.37/2.87，合成欄
+卻是 4.53，高於任一軸。所以逐軸值不必然比合成值敏感，兩者是不同的量，
+規則應同時利用而非取代。
+
+沿用既有的方向無關原則：**只取極值、不保留 x/y/z 標籤**（感測器可能
 貼錯方向，見 `aggregate.py` 的 `_axis_energy_sorted`）。
 
-### 3.4 其他逐軸欄位
+### 3.4 尚未納入的其他逐軸欄位
 
 `accPEAK_x/y/z`、`accOA_x/y/z`、`velOA_x/y/z`、`velPEAK_x/y/z`、
 `dispRMS_x/y/z`、`dispP2P_x/y/z`、`accMeanPeakFreq_x/y/z`、

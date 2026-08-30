@@ -55,6 +55,7 @@ META_COLS = (
 #: 這些指標存在的意義就沒了。
 AGG_MEAN = 'mean'      # 代表性水準
 AGG_MAX = 'max'        # 極值，不可平均
+AGG_MIN = 'min'        # 極小值（目前僅溫度用）
 AGG_AT_MAX = 'at_max'  # 取「主振幅最大時」對應的值
 
 #: 進入 Tier 1 資料庫的精選欄位 → (來源欄位, 聚合方式)
@@ -116,6 +117,24 @@ AGG_SPEC: dict[str, tuple[str, str]] = {
     'acc_top1_freq':          ('accTOP1FREQ',         AGG_AT_MAX),
     'acc_top1_amp':           ('accTOP1FREQ_V',       AGG_MAX),
     'vel_weighted_mean_freq': ('velWeightedMeanFreq', AGG_MEAN),
+    # 溫度（°C）——與振動獨立的唯一物理通道。「振動上升但溫度持平」與
+    # 「兩者一起上升」對現場的意義不同，而做這個區分不需要推論成因。
+    # 注意：可能是感測器內部溫度而非軸承座溫度（見 docs/DATA_CONTRACT.md
+    # §3.1），故只用於「與自身基準比」的相對趨勢，不設絕對門檻。
+    'temp_avg':   ('tempAVG',   AGG_MEAN),
+    'temp_max':   ('tempMAX',   AGG_MAX),
+    'temp_min':   ('tempMIN',   AGG_MIN),
+    # 前端已算好的 ISO 分級（1=Zone A…4=Zone D）。取該小時最差值。
+    # 僅作為本系統自行判定的交叉檢查——前端假設的機械等級未知。
+    'iso_zone_frontend': ('iso10816', AGG_MAX),
+}
+
+#: 逐軸的衝擊型指標。衝擊常集中在單一方向，只看合成值會被稀釋；
+#: 取三軸中的最大值較敏感。沿用方向無關原則——只取極值、不保留
+#: x/y/z 標籤，因為感測器可能貼錯方向（見 `_axis_energy_sorted`）。
+AXIS_IMPACT_COLS: dict[str, tuple[str, str, str]] = {
+    'acc_crest_axis_max': ('accCREST_x', 'accCREST_y', 'accCREST_z'),
+    'acc_kurt_axis_max':  ('accKURT_x',  'accKURT_y',  'accKURT_z'),
 }
 
 #: `at_max` 聚合的參考欄位（取此欄最大時對應的值）
