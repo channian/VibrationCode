@@ -464,3 +464,72 @@ def coverage_report(agg: pd.DataFrame) -> dict:
         'period_start':     agg['ts_hour'].min(),
         'period_end':       agg['ts_hour'].max(),
     }
+
+
+def rollup_daily(agg: pd.DataFrame, cfg: AggregateConfig = DEFAULT_AGG) -> pd.DataFrame:
+    """
+    把每小時聚合再彙整為每日一筆，供週報與長期趨勢使用。
+
+    小時層是判定用的（規則引擎逐日評估最近幾小時），日層是**呈現用的**
+    ——週報的趨勢圖、設備間比較、A/B 期間對照都跑在日層。兩者的取捨不同：
+    小時層要保留缺口列讓趨勢圖能正確斷線，日層則要一個代表值。
+
+    聚合語意沿用 `AGG_SPEC`：mean 類取各小時代表值的平均，max 類取各小時
+    最大值的最大——**衝擊事件不可被平均掉**，這與小時層的理由相同。
+
+    `running_hours` 是備機判定的依據（`STANDBY_NO_RUNTIME`），算的是
+    「該小時有運轉樣本」的小時數，因此 `partial` 也計入：資料不全不代表
+    設備沒轉，把它排除會讓備機判定失準。但**指標只取 `ok` 小時**，
+    partial 的數字不具代表性。
+
+    Returns:
+        DataFrame[date, running_hours, <指標欄>, axis_energy_sorted]；
+        輸入為空時回傳空 DataFrame。
+    """
+    if agg is None or agg.empty or 'ts_hour' not in agg.columns:
+        return pd.DataFrame()
+
+    d = agg.copy()
+    d['_date'] = pd.to_datetime(d['ts_hour']).dt.date
+
+    rows = []
+    for day, sub in d.groupby('_date', sort=True):
+        ok = sub[sub['data_status'] == DataStatus.OK]
+        row: dict = {
+            'date': day,
+            'running_hours': int((pd.to_numeric(sub.get('n_samples_running'),
+                                                errors='coerce').fillna(0) > 0).sum()),
+        }
+
+        for target, (_source, how) in AGG_SPEC.items():
+            if target not in ok.columns or ok.empty:
+                row[target] = None
+                continue
+            col = pd.to_numeric(ok[target], errors='coerce').dropna()
+            if col.empty:
+                row[target] = None
+            elif how == AGG_MAX:
+                row[target] = float(col.max())
+            elif how == AGG_MIN:
+                row[target] = float(col.min())
+            else:                      # mean / at_max 都取平均作為當日代表值
+                row[target] = float(col.mean())
+
+        for target in AXIS_IMPACT_COLS:
+            col = (pd.to_numeric(ok[target], errors='coerce').dropna()
+                   if target in ok.columns and not ok.empty else pd.Series(dtype=float))
+            row[target] = float(col.max()) if not col.empty else None
+
+        # 軸能量分佈取各分量的中位數。用中位數而非平均，是因為單一小時的
+        # 異常佔比（例如接近停機時的雜訊）不該把當日代表值帶走。
+        dicts = [v for v in ok.get('axis_energy_sorted', pd.Series(dtype=object))
+                 if isinstance(v, dict)]
+        row['axis_energy_sorted'] = (
+            {k: float(np.median([x[k] for x in dicts if k in x]))
+             for k in ('major', 'mid', 'minor', 'energy')
+             if any(k in x for x in dicts)}
+            if dicts else None
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows)

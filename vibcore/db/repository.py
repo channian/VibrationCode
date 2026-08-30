@@ -59,9 +59,12 @@ Connection = psycopg2.extensions.connection
 #: AGG_SPEC 裡；漏掉的話會安靜地不寫入，欄位永遠是 NULL。
 _AGG_METRIC_COLS: tuple[str, ...] = tuple(AGG_SPEC.keys()) + tuple(AXIS_IMPACT_COLS.keys())
 
+#: 每日 rollup 的欄位。週報與長期趨勢讀的是日層，這裡漏掉的欄位在週報裡
+#: 等於不存在——小時層算得再細也沒用。
 _DAILY_METRIC_COLS: tuple[str, ...] = (
     "running_hours", "vel_rms", "vel_oa", "acc_rms", "acc_oa", "acc_peak",
     "acc_crest", "acc_kurt", "disp_p2p", "acc_weighted_mean_freq",
+    "acc_crest_axis_max", "acc_kurt_axis_max", "temp_avg", "temp_max",
 )
 
 _SEVERITY_RANK = {"ok": 0, "warn": 1, "err": 2}

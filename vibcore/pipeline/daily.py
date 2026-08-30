@@ -42,7 +42,7 @@ from vibcore.config import AggregateConfig, DEFAULT_AGG, DEFAULT_TREND
 from vibcore.db import repository as repo
 from vibcore.io.analytic_reader import load_analytic_dir
 from vibcore.metrics.baseline import detect_baseline
-from vibcore.pipeline.aggregate import aggregate_hourly, coverage_report
+from vibcore.pipeline.aggregate import aggregate_hourly, coverage_report, rollup_daily
 from vibcore.rules import evaluate_all, outcome_to_finding
 from vibcore.types import (
     CLOSED_STATUSES, DeviceContext, Finding, RuleContext,
@@ -185,6 +185,13 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
         repo.bulk_insert_agg(conn, point_id, agg)
         result.agg_hours = len(agg)
         result.coverage = coverage_report(agg)
+
+        # 日層 rollup。週報與長期趨勢讀的是 measurement_daily，這一步漏掉
+        # 的話那張表永遠是空的，而且不會有任何錯誤訊息——週報只會顯示
+        # 「查無資料」，看起來像設備沒運轉。
+        daily = rollup_daily(agg, agg_cfg)
+        if not daily.empty:
+            repo.bulk_insert_daily(conn, point_id, daily)
 
         cov_ratio = result.coverage.get('analyzable_ratio', 0.0)
         _record_ingestion(

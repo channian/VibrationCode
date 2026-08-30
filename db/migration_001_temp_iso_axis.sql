@@ -37,3 +37,11 @@ COMMENT ON COLUMN measurement_agg.temp_max IS '該小時溫度最大值（°C）
 COMMENT ON COLUMN measurement_agg.temp_min IS '該小時溫度最小值（°C）';
 COMMENT ON COLUMN measurement_agg.iso_zone_frontend IS
     '前端計算的 ISO 分級（1=A…4=D），該小時最差值；供交叉檢查用';
+
+-- 日層 rollup 也要跟上。週報與長期趨勢讀的是這張表，小時層有值但日層
+-- 沒有的欄位，等於在週報裡不存在。
+ALTER TABLE measurement_daily
+    ADD COLUMN IF NOT EXISTS acc_crest_axis_max NUMERIC(12,6),
+    ADD COLUMN IF NOT EXISTS acc_kurt_axis_max  NUMERIC(12,6),
+    ADD COLUMN IF NOT EXISTS temp_avg NUMERIC(8,3),
+    ADD COLUMN IF NOT EXISTS temp_max NUMERIC(8,3);

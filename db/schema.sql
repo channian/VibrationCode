@@ -222,6 +222,12 @@ CREATE TABLE measurement_daily (
     disp_p2p      NUMERIC(12,8),
     acc_weighted_mean_freq NUMERIC(10,3),
     axis_energy_sorted JSONB,
+    -- 逐軸衝擊指標與溫度。週報與長期趨勢是看日層資料，日層漏掉的欄位
+    -- 等於在週報裡不存在——小時層有值也沒用。
+    acc_crest_axis_max NUMERIC(12,6),
+    acc_kurt_axis_max  NUMERIC(12,6),
+    temp_avg      NUMERIC(8,3),
+    temp_max      NUMERIC(8,3),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (point_id, date)
 );
