@@ -51,6 +51,35 @@ class PointContext:
     baseline: object  # BaselineStats | None，型別見 vibcore.types
     axis_baseline: dict | None
     eval_timestamps: list[pd.Timestamp]
+    _asof_cache: dict = field(default_factory=dict, repr=False)
+
+    def agg_asof(self, now) -> pd.DataFrame:
+        """
+        只取 `now`（含）之前的聚合資料。
+
+        **這是回測正確性的關鍵**。指標型規則刻意不依賴 `ctx.now`，而是取
+        「資料裡最後一筆 ok」當作現況（見 `vibcore/rules/metric_rules.py`
+        的 `_latest_ok_value`）。正式環境沒問題——每天跑一次，傳進去的
+        就是到今天為止的資料，「最後一筆」自然等於今天。
+
+        但回測是拿**完整序列**逐日重放的。若整份 agg 直接傳進去，每一個
+        評估日看到的都是同一個資料末端值，等於偷看未來：只要設備在觀測期
+        「最後」是偏離的，回測就會判定它從第一天起就一直偏離。
+
+        實測後果：異常只發生在最後 3 天，VEL_HIGH 與 STEP_CHANGE 卻在兩個
+        月前的評估日就觸發。連續觸發被 `build_episodes` 合併成一段，於是
+        每台設備恰好產生一個事件——這正是「N 次 / N 台」那種整齊到不像
+        真實故障分布的統計外觀的成因。
+
+        逐日切片會重複很多次（量測點 × 規則 × 天數），故快取結果；
+        同一個量測點的所有規則共用同一份切片。
+        """
+        key = pd.Timestamp(now)
+        cached = self._asof_cache.get(key)
+        if cached is None:
+            cached = self.agg[self.agg['ts_hour'] <= key]
+            self._asof_cache[key] = cached
+        return cached
 
 
 @dataclass
@@ -126,7 +155,7 @@ def build_episodes(pc: PointContext, rule_row: RuleConfigRow, fn: RuleFunc) -> l
     for ts in pc.eval_timestamps:
         ctx = RuleContext(
             device=pc.point.device, point_id=pc.point.point_id, position=pc.point.position,
-            agg=pc.agg, baseline=pc.baseline, params=rule_row.params, now=ts,
+            agg=pc.agg_asof(ts), baseline=pc.baseline, params=rule_row.params, now=ts,
             axis_energy_baseline=pc.axis_baseline, last_data_at=None,
         )
         try:
