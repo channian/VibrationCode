@@ -57,7 +57,7 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             {'threshold_mode': 'iso', 'sigma': 3.0},
             description='velOA 相對基準超過 N 個標準差'),
         RuleConfigRow(
-            'IMPACT_RISE', '衝擊性指標上升', 'monotonic', 'impact_rise', 'warn',
+            'IMPACT_RISE', '衝擊性指標上升', 'monotonic', 'impact_rise', 'observe',
             # 逐軸門檻與合成值同量級：沒有證據支持逐軸 kurt 比合成值更敏感
             # 或更不敏感（實測 crest 是逐軸較大、kurt 反而是合成較大），
             # 故不預設偏鬆或偏緊。

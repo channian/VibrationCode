@@ -412,10 +412,16 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      -- sigma 保留為對照組，供敏感度掃描並列比較。
      '{"threshold_mode":"iso","sigma":3.0}',
      'velOA 相對基準超過 N 個標準差'),
-    ('IMPACT_RISE',        '衝擊性指標上升',   'monotonic',   'impact_rise',      'warn',
+    ('IMPACT_RISE',        '衝擊性指標上升',   'monotonic',   'impact_rise',      'observe',
      -- 逐軸門檻與合成值同量級：實測 crest 是逐軸較大、kurt 反而是合成
      -- 較大（見 docs/DATA_CONTRACT.md §3.3），沒有證據支持哪一邊該偏鬆，
      -- 故給相同預設值。
+     -- 嚴重度為 observe：kurtosis>4 這個業界通則實測在本廠設備上**沒有
+     -- 鑑別力**——ZP 3-5 的逐筆 accKURT 中位數就是 4.53（100% 超過 4），
+     -- CP 10 是 3.60、AHU-601 是 2.37。該通則假設健康機器的 kurtosis 接近
+     -- 常態值 3，但這裡有機器的基線本來就在 4.5。既然找不到可辯護的外部
+     -- 依據，就不該進 SLA（見 vibcore/types.py 的 SEVERITY_OBSERVE）。
+     -- 待 false_positive 回饋累積出真實精確率後再評估升為 warn。
      -- kurt_absolute=4.0：accKURT 是 Pearson 定義，常態分布為 3，業界慣以
      --   超過 4 視為訊號中出現衝擊成分。這是業界通則不是正式標準。
      --   與 σ 判定取 AND：純相對判定會讓本來就安靜的機器因微幅上升就告警，
