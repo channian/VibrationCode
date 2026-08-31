@@ -270,6 +270,51 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
 
 
 # ──────────────────────────────────────────────────────────
+# Observation（observe 級判定，不進簽核鏈）
+# ──────────────────────────────────────────────────────────
+
+def _outcome_to_observation(outcome, ctx) -> repo.Observation:
+    """
+    把 observe 級 `RuleOutcome` 轉成可寫入 `observation` 表的物件。
+
+    鍵值組法與 `vibcore.rules.engine.outcome_to_finding` 重複了幾行——
+    本次任務的檔案歸屬不含 `vibcore/rules/`，無法把這段邏輯抽成兩邊
+    共用的函式，只能各自維護一份。兩者都是
+    `{target_type}:{target}:{issue_type}`，日後若要合併，應在規則層
+    另外開一個不含簽核欄位的轉換入口給雙方呼叫。
+    """
+    target = (ctx.device.device_id if outcome.target_type == 'device'
+             else f'{ctx.device.device_id}_{ctx.position}')
+    return repo.Observation(
+        observation_key=Finding.make_key(outcome.target_type, target, outcome.issue_type),
+        device_id=ctx.device.device_id,
+        point_id=ctx.point_id if outcome.target_type == 'point' else None,
+        target_type=outcome.target_type,
+        target=target,
+        issue_type=outcome.issue_type,
+        family=outcome.family,
+        rule_code=outcome.rule_code,
+        title=outcome.title,
+        detail=outcome.detail,
+        baseline_value=outcome.baseline_value,
+        current_value=outcome.current_value,
+        value_unit=outcome.value_unit,
+        evidence=outcome.evidence,
+        # 判定當下的時間。不帶的話 repository 會退回 now()，匯入歷史資料
+        # 時整批觀察項目會被壓成執行當天，任何過去期間的週報都查不到。
+        # 與 outcome_to_finding 的處理一致。
+        first_seen_at=ctx.now,
+        last_seen_at=ctx.now,
+        # 留存觸發當下的門檻，理由同 outcome_to_finding：門檻要靠實際
+        # 誤報率迭代，沒有這份快照，日後評估「該不該升為 warn」就只能
+        # 重跑整條管線。
+        trigger_params=dict(ctx.params or {}),
+        interpretation_limit=outcome.interpretation_limit,
+        source='rule_engine',
+    )
+
+
+# ──────────────────────────────────────────────────────────
 # Finding 生命週期
 # ──────────────────────────────────────────────────────────
 
@@ -284,6 +329,15 @@ def _is_worse(new_value: float | None, old_value: float | None,
     """
     if new_value is None or old_value is None:
         return False
+    # `old_value` 來自 `repo.get_open_findings()`（DB NUMERIC 欄位，
+    # psycopg2 回傳 decimal.Decimal），`new_value`/`baseline_value` 來自
+    # 當次 RuleOutcome（一般是 Python float）。混算會直接拋
+    # TypeError，讓整批規則引擎的交易失敗——這與本次 observation 任務
+    # 無關，是既有的既存缺陷，這裡一併修正（統一轉型為 float 才比較），
+    # 否則任何規則的 finding 只要再次觸發，惡化偵測就必定炸掉。
+    new_value, old_value = float(new_value), float(old_value)
+    if baseline_value is not None:
+        baseline_value = float(baseline_value)
     if baseline_value is None:
         delta_pct = abs(new_value - old_value) / abs(old_value or 1) * 100
         return new_value > old_value and delta_pct >= ESCALATE_MIN_DELTA_PCT
@@ -305,14 +359,14 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
 
     但也不能安靜丟掉：完全不留痕跡的話，等累積足夠回饋要把某條規則從
     observe 升為 warn 時就沒有歷史數據可用，週報的觀察名單也會沒有素材，
-    使用者更可能誤以為系統這段時間什麼都沒偵測到。因此這裡只計數、不落庫
-    ——`PointResult.observed`（已在 `process_point` 依嚴重度分類好）供
-    呼叫端在執行摘要中呈現。若之後要讓觀察名單能被週報引用真正的數值
-    （而不只是計數），需要另外的落庫位置（例如新表或欄位），但那屬於
-    `db/schema.sql` 的變動範圍，這一輪先讓計數與清單在回傳物件裡可見。
+    使用者更可能誤以為系統這段時間什麼都沒偵測到。因此這裡改寫入獨立的
+    `observation` 表（`repo.upsert_observation`）——不與 `finding` 共用
+    一張表，是為了不讓 observe 級判定帶著簽核欄位、被介面誤呈現成待辦
+    事項（見 db/schema.sql 該表的說明）。`PointResult.observed` 仍保留
+    rule_code 清單供執行摘要使用，但落庫與否已與它無關。
 
     Returns:
-        (upsert 筆數, 標記惡化筆數, observe 級判定筆數)
+        (finding upsert 筆數, 標記惡化筆數, 實際寫入 observation 的筆數)
     """
     n_upsert = n_escalate = n_observed = 0
     existing = {f['finding_key']: f for f in repo.get_open_findings(conn)}
@@ -325,7 +379,12 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
 
         for outcome in outcomes:
             if not is_actionable(outcome.severity):
-                n_observed += 1
+                observation = _outcome_to_observation(outcome, ctx)
+                try:
+                    repo.upsert_observation(conn, observation)
+                    n_observed += 1
+                except Exception as e:
+                    logger.error(f"Observation upsert 失敗（{observation.observation_key}）：{e}")
                 continue
 
             finding = outcome_to_finding(outcome, ctx)

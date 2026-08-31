@@ -604,6 +604,90 @@ CREATE INDEX idx_status_hist ON finding_status_history(finding_id, changed_at);
 
 
 -- =============================================================
+-- 六之二、觀察名單（observe 級判定，不進簽核鏈）
+-- =============================================================
+--
+-- 為什麼不沿用 finding 的簽核欄位：observe 級規則沒有可對外交代的門檻
+-- 依據（見 rule_config.severity 與 vibcore/types.py SEVERITY_OBSERVE 的
+-- 說明），不建立 finding、不進四階簽核、不佔 SLA。若這裡帶著
+-- status / stage_entered_at / assigned_to 這些欄位，介面遲早會把它呈現
+-- 成「待處理」，第一線工程師會誤以為這是派工——分出 observe 這一級本來
+-- 就是為了避免拿答不出來的門檻去派工，資料表設計不能把問題繞回來。
+--
+-- 為什麼仍保留 finding 風格的證據欄位（rule_code/title/detail/
+-- current_value/baseline_value/value_unit/evidence/trigger_params/
+-- interpretation_limit）：理由與 finding 完全相同——日後要評估「這條
+-- 規則的門檻若改成 X 會剩幾件」、或要把某條規則從 observe 升為 warn，
+-- 沒有這些數值就只能重跑整條管線（歷史原始檔未必還在）。
+--
+-- 去重語意比照 finding 的「bump」路徑：同一 observation_key 持續存在
+-- 時只累加 occurrence_count、覆寫最新數值，不逐日新增一整筆列——週報
+-- 要呈現的是「這台設備目前有哪些觀察項目、持續多久了」，不是一長串
+-- 重複記錄。但刻意不比照 finding 做「已結案 → 重開」那一路（也就沒有
+-- status/closed 概念）：observation 沒有人工簽核可以把它結案，「這件事
+-- 目前是否還在」改用 last_seen_at 是否落在查詢區間內來判斷即可，多一套
+-- 結案流程只是把已經拿掉的簽核複雜度用另一個名字加回來。
+CREATE TABLE observation (
+    observation_id   BIGSERIAL PRIMARY KEY,
+    observation_key  TEXT NOT NULL UNIQUE,        -- {target_type}:{target}:{issue_type}，格式同 finding_key
+    device_id        TEXT   REFERENCES device(device_id) ON DELETE CASCADE,
+    point_id         BIGINT REFERENCES measure_point(point_id) ON DELETE SET NULL,
+    target_type      TEXT NOT NULL CHECK (target_type IN ('device','point','global')),
+    target           TEXT NOT NULL,
+    issue_type       TEXT NOT NULL,
+    family           TEXT NOT NULL CHECK (family IN ('oscillating','monotonic','event','none')),
+    rule_code        TEXT REFERENCES rule_config(rule_code),
+
+    title            TEXT NOT NULL,
+    detail           TEXT,
+
+    -- 追蹤（語意同 finding 對應欄位，但沒有 status/簽核相關欄位）
+    occurrence_count INT NOT NULL DEFAULT 1,
+    first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- 觸發當下的數值與證據，理由同 finding 對應欄位
+    baseline_value   NUMERIC(16,6),
+    current_value    NUMERIC(16,6),
+    value_unit       TEXT  NOT NULL DEFAULT '',
+    evidence         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trigger_params   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    interpretation_limit TEXT NOT NULL DEFAULT '',
+
+    source           TEXT NOT NULL DEFAULT 'rule_engine'
+                     CHECK (source IN ('rule_engine','agent','manual')),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE observation IS
+    'observe 級判定（有偵測價值但沒有可引用外部標準的規則）；不建立 finding、不進簽核鏈、不佔 SLA，'
+    '僅供週報觀察名單與日後評估規則精確率使用。去重採 upsert（同 observation_key 累加 occurrence_count），'
+    '「目前是否仍存在」以 last_seen_at 是否落在查詢區間內判斷，不設 status 欄位';
+COMMENT ON COLUMN observation.observation_key IS
+    '{target_type}:{target}:{issue_type}，格式與 finding.finding_key 相同（見 Finding.make_key）';
+COMMENT ON COLUMN observation.occurrence_count IS
+    '同一觀察項目累計觸發次數；每次 upsert 累加，first_seen_at 不變，用於呈現「已持續多久」';
+COMMENT ON COLUMN observation.baseline_value IS
+    '觸發當下的基準值，供日後回溯評估「若門檻改成 X 會剩幾件」（是否該升為 warn）';
+COMMENT ON COLUMN observation.current_value IS
+    '觸發當下的量測值；同一 observation_key 再次觸發時覆寫為最新一次的值';
+COMMENT ON COLUMN observation.value_unit IS
+    'current_value / baseline_value 的單位';
+COMMENT ON COLUMN observation.evidence IS
+    '判定依據的完整數值（例如各特徵的 σ 分解），供人工回溯查核';
+COMMENT ON COLUMN observation.trigger_params IS
+    '觸發當下 rule_config.params 的快照，理由同 finding.trigger_params：只存數值不存門檻，'
+    '回溯時才分得清是數值變了還是門檻被調過';
+COMMENT ON COLUMN observation.interpretation_limit IS
+    '證據的解讀邊界；observe 級規則本身就沒有可對外交代的門檻依據，這欄更不可省略';
+COMMENT ON COLUMN observation.source IS
+    '建立來源，語意同 finding.source；目前只有 rule_engine 會寫入此表';
+
+CREATE INDEX idx_observation_device    ON observation(device_id, last_seen_at DESC);
+CREATE INDEX idx_observation_last_seen ON observation(last_seen_at DESC);
+
+
+-- =============================================================
 -- 七、報告
 -- =============================================================
 

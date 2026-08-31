@@ -473,6 +473,62 @@ def _fetch_ingestion_audit(
     }
 
 
+def _normalize_observation(row: dict) -> dict[str, Any]:
+    """
+    把 `observation` 的一列轉成週報消費用的正規化結構。
+
+    刻意不沿用 `_normalize_open_finding` 那一套欄位（status/assignee/
+    reply_deadline/is_overdue…）——observation 沒有簽核狀態，硬套上去
+    只會讓它在版面上看起來也需要有人回覆、逾期。這裡只留「這是什麼、
+    數值多少、已經持續多久」，呈現成觀察素材而非待辦事項的取捨要從
+    資料結構這一層就做出來，不能指望版面另外遮起來。
+    """
+    return {
+        "observation_key": row["observation_key"],
+        "rule_code": row.get("rule_code"),
+        "device_label": _device_label(row),
+        "location": _location_label(row),
+        "title": row["title"],
+        "detail": row.get("detail") or "",
+        "interpretation_limit": row.get("interpretation_limit") or "",
+        "evidence": row.get("evidence") or {},
+        "current_value": row.get("current_value"),
+        "baseline_value": row.get("baseline_value"),
+        "value_unit": row.get("value_unit") or "",
+        "occurrence_count": row.get("occurrence_count", 1),
+        "first_seen_at": row.get("first_seen_at"),
+        "last_seen_at": row.get("last_seen_at"),
+    }
+
+
+def _fetch_observations(conn: Connection, start: datetime, end: datetime) -> list[dict]:
+    """
+    取回本期「仍在觀察中」的 observe 級判定：`last_seen_at` 落在本期內，
+    即代表本期至少再被判定一次；`observation` 沒有 status 欄位，
+    「目前是否還在」就是靠這個時間窗口界定，早於本期就不撈——理由見
+    db/schema.sql `observation` 表的說明，不另外維護一套結案流程。
+
+    JOIN device 用 LEFT JOIN 而非 INNER JOIN，理由與
+    `_fetch_resolved_findings` 相同：`observation.device_id` 允許 NULL
+    （對應 `target_type='global'` 的判定，雖目前的 observe 規則都是
+    point 層級，但不假設未來永遠如此）。
+    """
+    sql = """
+        SELECT
+            o.*,
+            d.device_name, d.building, d.floor, d.system_name, d.is_standby,
+            mp.position
+        FROM observation o
+        LEFT JOIN device d ON d.device_id = o.device_id
+        LEFT JOIN measure_point mp ON mp.point_id = o.point_id
+        WHERE o.last_seen_at >= %(start)s AND o.last_seen_at < %(end)s
+        ORDER BY o.last_seen_at DESC
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, {"start": start, "end": end})
+        return [dict(r) for r in cur.fetchall()]
+
+
 def _fetch_device_status_summary(conn: Connection) -> dict[str, Any]:
     """全廠設備狀態摘要（供頁首補充統計，不含個別事項明細）。"""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -501,12 +557,20 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
           "new_findings": [...],       # 本期首次發現，未結案
           "tracking_findings": [...],  # 本期之前就存在，未結案
           "resolved_findings": [...],  # 本期內結案，完全來自 DB
+          "new_observations": [...],       # observe 級：本期首次觀察到
+          "tracking_observations": [...],  # observe 級：本期之前就存在，本期仍再現
+          "observations_by_device": {...}, # {device_id: 本期仍在觀察中的項目數}，供一行式彙總
           "coverage": {...},           # 四態涵蓋率統計
           "coverage_gaps": [...],      # 涵蓋率問題明細（斷線/資料不全/備機閒置，設備面）
           "ingestion_audit": {...},    # 匯入稽核（排程沒跑，系統面；與上者刻意分開判定）
           "device_status_summary": {...},
-          "stats": {"err_count","warn_count","tracking_count","resolved_count","affected_devices"},
+          "stats": {"err_count","warn_count","tracking_count","resolved_count","affected_devices",
+                    "new_observation_count","tracking_observation_count","observed_devices"},
         }
+
+        observation 的「新／持續中」分段方式與 finding 相同（依 first_seen_at
+        是否落在本期），但沒有「已解決」——observation 沒有結案動作，判定
+        沒再觸發就自然不會出現在下一期的查詢結果裡，不需要額外的第三類。
     """
     if period_end < period_start:
         raise ValueError(f"period_end ({period_end}) 早於 period_start ({period_start})")
@@ -540,12 +604,38 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
     resolved_rows = _fetch_resolved_findings(conn, start, end)
     resolved_findings = [_normalize_resolved_finding(r) for r in resolved_rows]
 
+    # observe 級觀察名單：分段依據與 finding 相同（first_seen_at 是否落在
+    # 本期），但母集合是「last_seen_at 落在本期內」（見 _fetch_observations），
+    # 不是「未結案」——observation 沒有 status，用查詢區間本身界定「目前
+    # 是否還在」。
+    observation_rows = _fetch_observations(conn, start, end)
+    new_observations: list[dict[str, Any]] = []
+    tracking_observations: list[dict[str, Any]] = []
+    for row in observation_rows:
+        normalized = _normalize_observation(row)
+        first_seen = row.get("first_seen_at")
+        is_new = first_seen is not None and start <= _as_aware(first_seen) <= end
+        if is_new:
+            new_observations.append(normalized)
+        else:
+            tracking_observations.append(normalized)
+
+    # 依設備彙總計數，供週報用一行文字呈現「哪些設備本週有觀察項目」，
+    # 不必逐條列出仍能讓人掌握分佈——這正是「素材而非待辦清單」的呈現方式。
+    observations_by_device: dict[str, int] = {}
+    for o in new_observations + tracking_observations:
+        dev_key = o["device_label"].split(" / ")[0]
+        observations_by_device[dev_key] = observations_by_device.get(dev_key, 0) + 1
+
     coverage = _fetch_coverage(conn, start, end)
     coverage_gaps = _fetch_coverage_gaps(conn, start, end, period_end)
     ingestion_audit = _fetch_ingestion_audit(conn, period_start, period_end)
     device_status_summary = _fetch_device_status_summary(conn)
 
     affected_devices = {f["device_label"].split(" / ")[0] for f in new_findings + tracking_findings}
+
+    observed_devices = {o["device_label"].split(" / ")[0]
+                        for o in new_observations + tracking_observations}
 
     stats = {
         "err_count": sum(1 for f in new_findings + tracking_findings if f["severity"] == "err"),
@@ -554,12 +644,16 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
         "tracking_count": len(tracking_findings),
         "resolved_count": len(resolved_findings),
         "affected_devices": len(affected_devices),
+        "new_observation_count": len(new_observations),
+        "tracking_observation_count": len(tracking_observations),
+        "observed_devices": len(observed_devices),
     }
 
     logger.info(
-        "週報資料收集完成：新發現 %d、追蹤中 %d、已解決 %d、涵蓋率問題 %d 筆、"
-        "匯入稽核問題 %d 筆（%s ~ %s）",
-        len(new_findings), len(tracking_findings), len(resolved_findings), len(coverage_gaps),
+        "週報資料收集完成：新發現 %d、追蹤中 %d、已解決 %d、觀察名單新增 %d、"
+        "觀察名單持續中 %d、涵蓋率問題 %d 筆、匯入稽核問題 %d 筆（%s ~ %s）",
+        len(new_findings), len(tracking_findings), len(resolved_findings),
+        len(new_observations), len(tracking_observations), len(coverage_gaps),
         len(ingestion_audit["issues"]), period_start, period_end,
     )
     if ingestion_audit["all_missing_dates"]:
@@ -574,6 +668,9 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
         "new_findings": new_findings,
         "tracking_findings": tracking_findings,
         "resolved_findings": resolved_findings,
+        "new_observations": new_observations,
+        "tracking_observations": tracking_observations,
+        "observations_by_device": observations_by_device,
         "coverage": coverage,
         "coverage_gaps": coverage_gaps,
         "ingestion_audit": ingestion_audit,

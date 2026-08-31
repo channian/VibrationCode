@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Iterable
 
@@ -611,7 +612,8 @@ def _insert_new_finding(cur, finding: Finding) -> dict:
         ) VALUES (
             %(finding_key)s, %(device_id)s, %(point_id)s, %(target_type)s, %(target)s,
             %(issue_type)s, %(family)s, %(rule_code)s, %(title)s, %(detail)s, %(severity)s,
-            %(peak_severity)s, %(status)s, now(), %(assigned_to)s, 1, now(), now(),
+            %(peak_severity)s, %(status)s, COALESCE(%(seen_at)s, now()), %(assigned_to)s, 1,
+            COALESCE(%(seen_at)s, now()), COALESCE(%(seen_at)s, now()),
             %(baseline_value)s, %(current_value)s, %(value_unit)s, %(evidence)s,
             %(trigger_params)s, %(interpretation_limit)s, %(needs_expert_measurement)s,
             %(source)s
@@ -629,6 +631,10 @@ def _insert_new_finding(cur, finding: Finding) -> dict:
         "trigger_params": Json(finding.trigger_params or {}),
         "interpretation_limit": finding.interpretation_limit,
         "needs_expert_measurement": finding.needs_expert_measurement,
+        # 判定當下的時間。正式排程每天跑一次，這與 now() 幾乎相同；但匯入
+        # 歷史資料補資料庫時差很多——若一律用 now()，整批歷史事項都會被
+        # 壓成執行當天，任何過去期間的週報都會查不到東西。
+        "seen_at": finding.last_seen_at,
         "source": finding.source,
     })
     return cur.fetchone()
@@ -656,7 +662,7 @@ def _bump_existing_finding(cur, existing: dict, finding: Finding) -> dict:
             baseline_value       = %(baseline_value)s,
             current_value        = %(current_value)s,
             value_unit           = %(value_unit)s,
-            last_seen_at         = now(),
+            last_seen_at         = COALESCE(%(seen_at)s, now()),
             severity             = %(severity)s,
             peak_severity        = %(peak_severity)s,
             detail               = %(detail)s,
@@ -674,6 +680,8 @@ def _bump_existing_finding(cur, existing: dict, finding: Finding) -> dict:
             "evidence": Json(finding.evidence or {}),
             "trigger_params": Json(finding.trigger_params or {}),
             "interpretation_limit": finding.interpretation_limit,
+            # 見 _insert_new_finding 的說明
+            "seen_at": finding.last_seen_at,
             "finding_id": existing["finding_id"],
         },
     )
@@ -687,11 +695,11 @@ def _reopen_finding(cur, existing: dict, finding: Finding) -> dict:
         """
         UPDATE finding SET
             status                   = %(status)s,
-            stage_entered_at         = now(),
+            stage_entered_at         = COALESCE(%(seen_at)s, now()),
             assigned_to              = NULL,
             occurrence_count         = 1,
-            first_seen_at            = now(),
-            last_seen_at             = now(),
+            first_seen_at            = COALESCE(%(seen_at)s, now()),
+            last_seen_at             = COALESCE(%(seen_at)s, now()),
             baseline_value           = %(baseline_value)s,
             current_value            = %(current_value)s,
             value_unit               = %(value_unit)s,
@@ -717,6 +725,10 @@ def _reopen_finding(cur, existing: dict, finding: Finding) -> dict:
             "trigger_params": Json(finding.trigger_params or {}),
             "interpretation_limit": finding.interpretation_limit,
             "needs_expert_measurement": finding.needs_expert_measurement,
+        # 判定當下的時間。正式排程每天跑一次，這與 now() 幾乎相同；但匯入
+        # 歷史資料補資料庫時差很多——若一律用 now()，整批歷史事項都會被
+        # 壓成執行當天，任何過去期間的週報都會查不到東西。
+        "seen_at": finding.last_seen_at,
             "finding_id": existing["finding_id"],
         },
     )
@@ -967,6 +979,116 @@ def get_open_findings(
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
+
+
+# =============================================================
+# 觀察名單（observe 級判定，不進簽核鏈）
+# =============================================================
+#
+# `Observation` 定義在這裡而非 `vibcore/types.py`：概念上它與 `Finding`
+# 屬於同一層級的跨模組契約，但本次任務的檔案歸屬明確排除 types.py，
+# 而目前只有這支模組的 `upsert_observation` 與 `pipeline/daily.py` 需要
+# 用到這個型別，先以資料存取層的區域型別滿足即可，不強行擠進 types.py。
+
+@dataclass
+class Observation:
+    """
+    對應 DB `observation` 表的一列（observe 級判定）。
+
+    刻意不比照 `Finding` 帶 status / stage_entered_at / assigned_to 等
+    簽核欄位——observation 不進簽核鏈，帶著那些欄位只會讓人以為它該被
+    處理（見 db/schema.sql 該表的說明）。證據欄位（rule_code 起到
+    interpretation_limit 為止）則與 Finding 對稱保留，理由相同：日後
+    要回溯評估「門檻改成 X 會剩幾件」，沒有這些數值就只能重跑整條管線。
+    """
+    observation_key: str                     # {target_type}:{target}:{issue_type}
+    device_id: str
+    target_type: str
+    target: str
+    issue_type: str
+    family: str
+    rule_code: str
+    title: str
+    point_id: int | None = None
+    detail: str = ''
+    occurrence_count: int = 1
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    baseline_value: float | None = None
+    current_value: float | None = None
+    value_unit: str = ''
+    evidence: dict = field(default_factory=dict)
+    trigger_params: dict = field(default_factory=dict)
+    interpretation_limit: str = ''
+    source: str = 'rule_engine'
+
+
+def upsert_observation(conn: Connection, observation: Observation) -> dict:
+    """
+    寫入/更新 observe 級判定；去重語意比照 `upsert_finding` 的「bump」
+    路徑——同一 `observation_key` 持續存在時只累加 `occurrence_count`
+    並覆寫最新數值，不逐日新增一整筆歷史列。
+
+    與 `upsert_finding` 不同的是，這裡**不需要先 `SELECT ... FOR UPDATE`
+    再依分支處理**：`upsert_finding` 要鎖列是因為它有三種分支（新建／
+    未結案再現／已結案重開），分支判斷本身就有 race window；而
+    observation 沒有 status，永遠只有一種語意——「這件事現在還在，
+    累加一次」，單一 `INSERT ... ON CONFLICT DO UPDATE` 陳述式在
+    PostgreSQL 底下本身就是原子操作，不會有兩個行程同時讀到舊
+    `occurrence_count` 的問題，額外加鎖只是白增加一次往返。
+
+    `title` 刻意不在 `DO UPDATE` 的欄位清單內——title 是規則的固定描述
+    文字，理由與 `_bump_existing_finding` 對 title 的處理相同：會隨每次
+    觸發變動的是 detail／數值，不是規則本身叫什麼名字。`first_seen_at`
+    同理不在清單內，維持第一次寫入的值，讓「已持續多久」算得出來。
+
+    Returns:
+        寫入後的完整資料列（dict），含 DB 產生的時間戳與累加後的 occurrence_count。
+    """
+    sql = """
+        INSERT INTO observation (
+            observation_key, device_id, point_id, target_type, target, issue_type,
+            family, rule_code, title, detail, occurrence_count, first_seen_at, last_seen_at,
+            baseline_value, current_value, value_unit, evidence, trigger_params,
+            interpretation_limit, source
+        ) VALUES (
+            %(observation_key)s, %(device_id)s, %(point_id)s, %(target_type)s, %(target)s,
+            %(issue_type)s, %(family)s, %(rule_code)s, %(title)s, %(detail)s, 1,
+            COALESCE(%(seen_at)s, now()), COALESCE(%(seen_at)s, now()),
+            %(baseline_value)s, %(current_value)s, %(value_unit)s, %(evidence)s,
+            %(trigger_params)s, %(interpretation_limit)s, %(source)s
+        )
+        ON CONFLICT (observation_key) DO UPDATE SET
+            detail                = EXCLUDED.detail,
+            occurrence_count      = observation.occurrence_count + 1,
+            last_seen_at          = COALESCE(%(seen_at)s, now()),
+            baseline_value        = EXCLUDED.baseline_value,
+            current_value         = EXCLUDED.current_value,
+            value_unit            = EXCLUDED.value_unit,
+            evidence              = EXCLUDED.evidence,
+            trigger_params        = EXCLUDED.trigger_params,
+            interpretation_limit  = EXCLUDED.interpretation_limit,
+            updated_at            = now()
+        RETURNING *
+    """
+    params = {
+        "observation_key": observation.observation_key, "device_id": observation.device_id,
+        "point_id": observation.point_id, "target_type": observation.target_type,
+        "target": observation.target, "issue_type": observation.issue_type,
+        "family": observation.family, "rule_code": observation.rule_code,
+        "title": observation.title, "detail": observation.detail,
+        "baseline_value": observation.baseline_value, "current_value": observation.current_value,
+        "value_unit": observation.value_unit, "evidence": Json(observation.evidence or {}),
+        # 見 _insert_new_finding 的說明：匯入歷史資料時若一律用 now()，
+        # 整批觀察項目都會被壓成執行當天。
+        "seen_at": observation.last_seen_at,
+        "trigger_params": Json(observation.trigger_params or {}),
+        "interpretation_limit": observation.interpretation_limit,
+        "source": observation.source,
+    }
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return dict(cur.fetchone())
 
 
 # =============================================================
