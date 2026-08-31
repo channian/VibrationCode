@@ -286,6 +286,28 @@ python -m validate.offline --data-dir <資料夾> --latest-cadence-only
 執行時若 log 出現「⚠ N 個量測點在觀測期內取樣密度改變」，就是該加這個參數
 的訊號。
 
+### 3.0.1 確認 ISO 機械等級的填寫狀況
+
+`ISO_ZONE` 與 `VEL_HIGH` 的 ISO 模式都需要設備的機械等級
+（CSV 的 `ISO10816_code`，1=Class I…4=Class IV）。未填的設備會安靜地
+退回相對基準判定，不會報錯——所以要主動檢查：
+
+```bash
+python -m validate.iso_readiness --data-dir <資料夾>
+python -m validate.iso_readiness --data-dir <資料夾> --csv output/iso_readiness.csv
+```
+
+它回答兩個問題：**多少台填了等級**，以及**已分級的設備離 ISO 告警門檻
+還有多遠**（headroom = p95 ÷ 門檻，≥1 代表已越線）。
+
+判讀：
+
+- **多數未填** → 補台帳。在那之前 `ISO_ZONE` 觸發 0 次不代表設備健康，
+  只代表它根本沒判定。
+- **都填了、但 headroom 普遍很低（例如 0.4~0.5）** → 這些設備照 ISO 看
+  確實健康，ISO 模式本來就不會觸發。這不是系統故障；此時本系統的價值
+  在趨勢與觀察名單，而不是絕對位準告警。
+
 ### 3.1 先看這三個數字
 
 報告產在 `output/validation/`：
