@@ -33,7 +33,7 @@ import os
 import pandas as pd
 
 from vibcore.io.analytic_reader import _ENCODINGS
-from vibcore.metrics.iso import ISO_THRESHOLDS, iso_alert_threshold
+from vibcore.metrics.iso import ISO_THRESHOLDS, classify_zone, iso_alert_threshold
 from validate.points import _ISO_CODE_MAP
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,12 @@ def collect(data_dir: str, pattern: str = '*.csv') -> pd.DataFrame:
             'iso_alert_threshold': round(threshold, 3) if threshold is not None else None,
             'headroom_ratio': (round(vel_p95 / threshold, 2)
                                if threshold and vel_p95 is not None and threshold > 0 else None),
+            # 兩個 Zone 分開看：中位數代表「這台平常在哪一區運轉」，
+            # p95 代表「偶爾會衝到哪一區」。ISO_ZONE 規則預設在 Zone C
+            # 才告警，所以長期待在 Zone B 的設備不會有任何 Finding——
+            # 那不是異常，但也不是 Zone A，值得在報告裡讓人看見。
+            'zone_median': classify_zone(baseline_proxy, machine_class),
+            'zone_p95': classify_zone(vel_p95, machine_class),
         })
     return pd.DataFrame(rows)
 
@@ -201,6 +207,23 @@ def report(df: pd.DataFrame) -> None:
             print(f'  {r.device_id:16s} {str(r.machine_class):5s} '
                   f'{r.vel_rms_median:7.3f} {r.vel_rms_p95:7.3f} '
                   f'{r.iso_alert_threshold:7.3f} {r.headroom_ratio:9.2f}')
+
+        # ── 全廠 Zone 分佈 ──────────────────────────────────────
+        zc = ready['zone_median'].value_counts()
+        print('\n  平常運轉所在的 ISO Zone（以運轉中 velRMS 中位數判定）：')
+        for z in ('A', 'B', 'C', 'D'):
+            n_z = int(zc.get(z, 0))
+            if n_z:
+                print(f'    Zone {z}：{n_z} 台')
+        in_b_plus = ready[ready['zone_median'].isin(['B', 'C', 'D'])]
+        if not in_b_plus.empty:
+            print(f'\n  ⚠ {len(in_b_plus)} 台的**正常運轉水準**已不在 Zone A：')
+            for r in in_b_plus.sort_values('vel_rms_median', ascending=False).head(10).itertuples():
+                print(f'    {r.device_id:16s} Class {r.machine_class}　中位 {r.vel_rms_median:.3f} mm/s'
+                      f'　Zone {r.zone_median}')
+            print('    ISO 對 Zone B 的定義是「可長期不受限運轉」，因此 ISO_ZONE')
+            print('    （預設 Zone C 才告警）不會為這些設備開單——這是設計如此。')
+            print('    但它們的劣化餘裕比 Zone A 的設備小，趨勢類判定要優先看。')
 
         if len(over) == 0:
             print('\n  ★ 沒有任何已分級設備接近 ISO 告警門檻。')
