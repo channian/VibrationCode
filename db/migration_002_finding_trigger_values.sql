@@ -161,3 +161,39 @@ COMMIT;
 -- 這條路徑目前是壞的，請務必請 schema.sql 的維護者（本次任務要求
 -- 不得由本檔案的作者修改）合併這兩個重複區塊。
 -- =============================================================
+
+
+-- =============================================================
+-- 重建 v_open_finding
+--
+-- 為什麼必須重建：檢視裡的 `SELECT f.*` 在**建立當下**就被展開成當時的
+-- 欄位清單並固定下來，之後對 finding 表新增的欄位不會自動出現在檢視中。
+-- 若不重建，遷移過的資料庫與全新建庫的結構會不一致——實測差異正是
+-- v_open_finding 少了 trigger_params 一欄。這種分歧不會報錯，只會讓
+-- 「用檢視查資料」的程式在兩種環境下拿到不同的欄位。
+-- =============================================================
+
+DROP VIEW IF EXISTS v_open_finding;
+
+CREATE VIEW v_open_finding AS
+SELECT
+    f.*,
+    d.device_name, d.building, d.floor, d.system_name, d.is_standby,
+    mp.position,
+    EXTRACT(DAY FROM now() - f.first_seen_at)::INT       AS days_open,
+    EXTRACT(DAY FROM now() - f.stage_entered_at)::INT    AS days_in_stage,
+    s.sla_days,
+    (s.sla_days IS NOT NULL
+     AND now() - f.stage_entered_at > (s.sla_days || ' days')::INTERVAL) AS is_sla_breached,
+    (SELECT jsonb_build_object(
+                'author', u.display_name, 'role', n.author_role,
+                'note', n.note, 'created_at', n.created_at)
+       FROM finding_note n
+       LEFT JOIN app_user u ON u.user_id = n.author_id
+      WHERE n.finding_id = f.finding_id AND n.is_human
+      ORDER BY n.created_at DESC LIMIT 1)                AS latest_note
+FROM finding f
+JOIN device d        ON d.device_id = f.device_id
+LEFT JOIN measure_point mp ON mp.point_id = f.point_id
+LEFT JOIN sla_config s     ON s.stage = f.status AND s.is_active
+WHERE f.status NOT IN ('closed','auto_resolved','false_positive');

@@ -516,29 +516,25 @@ CREATE TABLE finding (
     occurrence_count INT NOT NULL DEFAULT 1,
     first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- 觸發當下的數值與證據。沒有這些就無法回溯重算——例如三個月後想問
+    -- 「當初若把門檻訂成 3.5σ，這 200 件會剩幾件」，只能重跑整條管線
+    -- （而歷史原始檔未必還在）。門檻要靠實際誤報率迭代，就必須留存。
+    -- baseline_value / current_value 允許 NULL：規則第一次判定時可能還
+    -- 沒有基準，或該規則本來就沒有單一代表數值（例如事件類）。
     baseline_value   NUMERIC(16,6),
     current_value    NUMERIC(16,6),
-    value_unit       TEXT,
-    evidence         JSONB,                       -- 判定依據的完整數值
+    value_unit       TEXT  NOT NULL DEFAULT '',
+    evidence         JSONB NOT NULL DEFAULT '{}'::jsonb,   -- 判定依據的完整數值
+    -- 觸發當下 rule_config.params 的快照。規則參數日後會被調整，只存
+    -- 數值而不存當時的門檻，回溯時就分不清是數值變了還是門檻被調過。
+    trigger_params   JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     -- Agent 護欄（計畫書 §8.2）：此證據能支撐到什麼程度
-    interpretation_limit TEXT,
+    interpretation_limit TEXT NOT NULL DEFAULT '',
 
     escalated_at     TIMESTAMPTZ,                 -- 非 NULL 代表處理中但仍持續惡化
     expected_resolution_date DATE,
     needs_expert_measurement BOOLEAN NOT NULL DEFAULT FALSE,
-
-    -- 觸發當下的數值、門檻與證據。沒有這些就無法回溯重算——例如三個月
-    -- 後想問「當初若把門檻訂成 3.5σ，這 200 件會剩幾件」，只能重跑整條
-    -- 管線（而歷史原始檔未必還在）。門檻要靠實際誤報率迭代，就必須留存。
-    baseline_value   NUMERIC(16,6),
-    current_value    NUMERIC(16,6),
-    value_unit       TEXT NOT NULL DEFAULT '',
-    evidence         JSONB NOT NULL DEFAULT '{}'::jsonb,
-    -- 觸發當下 rule_config.params 的快照。規則參數日後會被調整，
-    -- 只存數值而不存當時的門檻，回溯時就分不清是數值變了還是門檻變了。
-    trigger_params   JSONB NOT NULL DEFAULT '{}'::jsonb,
-    interpretation_limit TEXT NOT NULL DEFAULT '',
 
     source           TEXT NOT NULL DEFAULT 'rule_engine'
                      CHECK (source IN ('rule_engine','agent','manual')),
