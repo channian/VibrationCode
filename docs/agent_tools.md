@@ -456,9 +456,38 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
     "org_analyzable_ratio": 0.83,
     "note": "analyzable_ratio 低於 50% 的量測點，其期間內的趨勢/位準結論信心度不足，週報應標示信心度或略過結論。"
   },
+  "observations": {
+    "new_this_period": [
+      {"observation_key": "point:AHU-601/M1:IMPACT_RISE", "rule_code": "IMPACT_RISE",
+       "device_label": "AHU-601 / M1", "location": "A棟 · 6F · 空調",
+       "title": "衝擊性指標上升", "detail": "accKURT 由 3.1 升至 4.6",
+       "current_value": 4.6, "baseline_value": 3.1, "value_unit": "",
+       "occurrence_count": 3, "interpretation_limit": "kurtosis 上升代表波形衝擊性增加，不指向特定故障。",
+       "first_seen_at": "…", "last_seen_at": "…"}
+    ],
+    "tracking": ["...同上結構，本期之前就存在、本期仍再現..."],
+    "by_device": {"AHU-601": 1, "CHP-101": 1},
+    "new_count": 1,
+    "tracking_count": 1,
+    "note": "observe 級判定：規則觸發了但未達提報門檻……**不要為這些項目開 action**……"
+  },
   "interpretation_limit": "本系統定位為篩選與預警，不做故障診斷……（見 §2）"
 }
 ```
+
+**`observations` 是觀察素材，不是待辦清單。** 這一區是 `observe` 嚴重度的判定：
+規則確實觸發了，但還沒到需要指派給誰處理的程度。結構上刻意**不含** `status` /
+`assigned_to` / `reply_deadline` / 簽核階段——observe 沒有簽核流程，也沒有負責人
+與期限。
+
+**不要為觀察名單的項目開 `action`**：`action` 的定義是「需要有人處理的事」，
+而 observe 的定義正好是「還不需要」。要在週報提及，請寫進 `notes`，例如
+「另有 3 台設備共 5 項指標在觀察中」。項目若持續惡化並越過門檻，規則引擎會
+自動把它升級成 finding，屆時它自然會出現在 `findings_summary.new_this_period`，
+不需要你代為提報。
+
+報告版面上這一區由系統自動排入獨立的「觀察名單」段落，你不必也不能決定
+它要顯示哪些項目。
 
 **三段式對應**（計畫書 §六）：`new_this_period`＝新發現、目前仍開單但
 `first_seen_at` 早於本期＝追蹤中（`tracking_count`）、`resolved_this_period`＝已解決。
@@ -530,8 +559,12 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 ### `send_report`
 
 收 `verdict` / `headline` / `actions[]` / `notes`，本系統負責排版與（未來）寄送。
-**SMTP 尚未設定**：目前僅落庫到 `weekly_report` 表，`delivery.sent` 固定為 `false`，
-寄送介面已預留。
+報告內容（三段式分類、資料品質、observe 觀察名單）一律由系統從資料庫收集並
+排版，`actions` 只用來補強對應事項卡片的敘述——**哪些事項要出現、嚴重度多少、
+走到哪個簽核階段，都不受你的輸入影響**。
+
+**SMTP 尚未設定**：目前僅落庫到 `weekly_report` 表（含完整的報告 HTML），
+`delivery.sent` 固定為 `false`，寄送介面已預留。
 
 **請求 Body**：
 
@@ -542,9 +575,30 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 | `end_date` | date（`YYYY-MM-DD`） | 否（預設今日） | 僅在補產歷史報告時使用，一般情況不要帶 |
 | `verdict` | `"err"` \| `"warn"` \| `"ok"` | 是 | 其他值 → 422 |
 | `headline` | string | 是 | 1–200 字元 |
-| `actions` | array | 否（預設空陣列） | **最多 10 筆**；每筆 `{"level": "err"\|"warn"\|"ok", "text": "1–500 字元"}` |
+| `actions` | array | 否（預設空陣列） | **最多 10 筆**；欄位見下表 |
 | `notes` | string \| null | 否 | 最多 4000 字元 |
 | `building` / `floor` / `system_name` | string \| null | 否 | 供計算 `new_count`/`tracking_count`/`resolved_count` 的範圍篩選 |
+
+**`actions[]` 的欄位**：
+
+| 欄位 | 型別 | 必填 | 說明 |
+|---|---|---|---|
+| `level` | `"err"` \| `"warn"` \| `"ok"` | 是 | 僅作交叉核對。**嚴重度一律以規則引擎的判定為準**，與資料庫不一致時系統記一筆 warning 並採用資料庫的值 |
+| `title` | string | 是※ | 1–200 字元，事項標題 |
+| `detail` | string | 否 | 最多 1000 字元，說明文字 |
+| `suggestion` | string | 否 | 最多 500 字元，建議的下一步 |
+| `target_type` | `"device"` \| `"point"` \| `"global"` | 否 | 與下兩欄合組 `finding_key` |
+| `target` | string | 否 | 例如 `AHU-601/M1` |
+| `issue_type` | string | 否 | 例如 `VEL_HIGH` |
+| `text` | string | 否 | **舊版契約欄位，等同 `title`**，保留以免既有呼叫端中斷；新呼叫請改用 `title` |
+
+※ `title` 與 `text` 至少要給一個，否則 422；兩者都給時以 `title` 為準。
+
+`target_type`/`target`/`issue_type` 三者組成 `{target_type}:{target}:{issue_type}`，
+系統據此把你寫的敘述掛到對應的事項卡片上。**對應不到未結案事項的 action 會被
+忽略**（系統記一筆 warning），不會讓整份報告產不出來——引用到已結案事項是可
+預期的情況，不是致命錯誤。三個欄位不給，該筆 action 就只會落庫，不會出現在
+報告版面上。
 
 **請求範例**：
 
@@ -555,8 +609,19 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
   "verdict": "warn",
   "headline": "今日 3 台設備有未結案事項，1 台衝擊性指標上升需留意",
   "actions": [
-    {"level": "warn", "text": "AHU-601 M1：衝擊性指標持續上升，建議安排專家系統複測"},
-    {"level": "err",  "text": "AHU-602 M1：感測器離線已逾 48 小時，請確認接線與供電"}
+    {
+      "level": "warn",
+      "title": "AHU-601 M1 衝擊性指標持續上升",
+      "detail": "accKURT 由 3.1 升至 4.6，已連續 5 日。",
+      "suggestion": "安排專家系統複測。",
+      "target_type": "point", "target": "AHU-601/M1", "issue_type": "IMPACT_RISE"
+    },
+    {
+      "level": "err",
+      "title": "AHU-602 M1 感測器離線已逾 48 小時",
+      "suggestion": "請確認接線與供電。",
+      "target_type": "point", "target": "AHU-602/M1", "issue_type": "SENSOR_OFFLINE"
+    }
   ],
   "notes": "本日資料涵蓋率正常，AHU-602 涵蓋率不足（見 get_weekly_report_data）"
 }
@@ -574,8 +639,13 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
   "verdict": "warn",
   "headline": "今日 3 台設備有未結案事項，1 台衝擊性指標上升需留意",
   "actions": [
-    {"level": "warn", "text": "AHU-601 M1：衝擊性指標持續上升，建議安排專家系統複測"},
-    {"level": "err",  "text": "AHU-602 M1：感測器離線已逾 48 小時，請確認接線與供電"}
+    {
+      "level": "warn", "title": "AHU-601 M1 衝擊性指標持續上升",
+      "text": "AHU-601 M1 衝擊性指標持續上升",
+      "detail": "accKURT 由 3.1 升至 4.6，已連續 5 日。",
+      "suggestion": "安排專家系統複測。",
+      "target_type": "point", "target": "AHU-601/M1", "issue_type": "IMPACT_RISE"
+    }
   ],
   "notes": "本日資料涵蓋率正常，AHU-602 涵蓋率不足（見 get_weekly_report_data）",
   "new_count": 4, "tracking_count": 0, "resolved_count": 1,
@@ -595,7 +665,7 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 |---|---|---|
 | 1 | **不接受收件人欄位** | 請求 body 的 Pydantic 模型設 `extra="forbid"`：任何不在契約內的欄位（`to`/`recipients`/`cc` 等）一律 **422**，不是被靜默忽略 |
 | 2 | **主旨由系統產生** | 呼叫方不可指定主旨；系統依 `report_type` + `period_label` 產生 |
-| 3 | **只收結構化欄位，不收 raw HTML** | `headline`／`notes`／`actions[].text` 一律在寫入前用 `html.escape()` 轉義；即使傳入 `<script>...</script>`，落庫與回傳內容都會是 `&lt;script&gt;...&lt;/script&gt;` |
+| 3 | **只收結構化欄位，不收 raw HTML** | `headline`／`notes`／`actions` 的文字欄位一律在寫入前用 `html.escape()` 轉義；即使傳入 `<script>...</script>`，落庫的 `agent_payload` 與 API 回傳內容都會是 `&lt;script&gt;...&lt;/script&gt;`。報告 HTML 走另一條路徑——由樣板引擎的 autoescape 處理（刻意不共用同一份已轉義的字串，否則會轉義兩次，讀者會在報告上看到 `&lt;b&gt;` 這種字面值），結果同樣安全：標記一律顯示為文字，不會生效 |
 | 4 | **每日發送次數上限** | 預設 **3** 次／日曆日，環境變數 `VIB_REPORT_DAILY_LIMIT` 可調；超過回 **429**；每次成功呼叫寫入 `audit_log`（`action='send_report'`），失敗（422/429）不計入次數也不寫稽核 |
 
 **驗證錯誤範例**（422，`verdict` 非法值）：

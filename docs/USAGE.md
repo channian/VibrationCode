@@ -559,5 +559,5 @@ SELECT status, count(*), round(avg(EXTRACT(DAY FROM now() - stage_entered_at))) 
 | 項目 | 狀態 |
 |------|------|
 | Dashboard | 需求書已備妥（`DASHBOARD_requirements.md`），尚未開發 |
-| 週報 Email 寄送 | SMTP 未設定；`send_report` 目前只落庫，寄送介面已預留 |
+| 週報 Email 寄送 | SMTP 未設定；`send_report` 目前只落庫（**報告 HTML 已完整產出並存進 `weekly_report.html`**），寄送介面已預留 |
 | 設備 A/B 期間比較 | 需求已納入需求書，尚未實作 |

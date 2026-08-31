@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 #: err/warn/ok 是全系統唯一合法的嚴重度詞彙（對應 finding.severity 的 CHECK 限制）
 Severity = Literal["err", "warn", "ok"]
@@ -27,12 +27,52 @@ DAYS_MAX = 365
 
 
 class ActionItem(BaseModel):
-    """單一建議行動：等級 + 文字描述。"""
+    """
+    單一建議行動：等級 + 敘述，並可帶上對應到系統事項的三個定位欄位。
+
+    `target_type`/`target`/`issue_type` 三者組成 `finding_key`
+    （`{target_type}:{target}:{issue_type}`，與 `finding.finding_key`
+    同一套格式），報表渲染層據此把 agent 寫的敘述掛到對應的事項卡片上。
+    三者都是選填：對應不到任何未結案事項的 action 會被渲染層記一筆
+    warning 後忽略，不會讓整份報告產不出來——agent 引用到已結案事項是
+    可預期的情況，不該是致命錯誤。
+
+    **嚴重度以規則引擎為準**：`level` 只作為交叉核對，與資料庫不一致時
+    渲染層會記 warning 並採用資料庫的值（見 render.`_match_action`）。
+    LLM 不做數值判斷，這條在計畫書 §8.1 就定案了。
+
+    `text` 是舊版契約的欄位，保留為 `title` 的別名：本模型設了
+    `extra="forbid"`，若直接移除，既有以 `{"level","text"}` 呼叫的
+    agent 會開始收到 422，而 `send_report` 是每日排程的終點——那種失敗
+    不會有人即時發現，只會變成「週報這幾週怎麼沒出來」。兩者擇一即可，
+    同時給則以 `title` 為準。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     level: Severity
-    text: str = Field(min_length=1, max_length=500)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    text: str | None = Field(
+        default=None, min_length=1, max_length=500,
+        description="舊版契約欄位，等同 title；新呼叫請改用 title/detail/suggestion。",
+    )
+    detail: str | None = Field(default=None, max_length=1000)
+    suggestion: str | None = Field(default=None, max_length=500)
+
+    target_type: Literal["device", "point", "global"] | None = None
+    target: str | None = Field(default=None, max_length=200)
+    issue_type: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def _require_some_text(self) -> "ActionItem":
+        if not (self.title or self.text):
+            raise ValueError("action 需要 title（或舊版的 text）")
+        return self
+
+    @property
+    def display_title(self) -> str:
+        """渲染與落庫一律用這個值，呼叫端不必各自處理 title/text 的優先序。"""
+        return self.title or self.text or ""
 
 
 class SendReportRequest(BaseModel):

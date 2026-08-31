@@ -223,6 +223,36 @@ section { margin-top: 46px; }
   line-height: 1.7;
 }
 
+/* 觀察名單：刻意做得比 .item 輕——沒有卡片陰影、沒有左側嚴重度色條、
+   字級略小。這一區是「還不需要行動」的素材，視覺重量若跟事項卡片一樣，
+   讀者掃版面時仍會把它當成待辦，那分流就白做了（見 render.py 的
+   `_present_observation`）。 */
+.obs-summary {
+  font-size: .88rem;
+  color: var(--ink-2);
+  background: var(--band);
+  border-radius: 2px;
+  padding: 10px 13px;
+  margin: 0 0 14px;
+  line-height: 1.7;
+}
+.obs {
+  border-bottom: 1px solid var(--rule);
+  padding: 13px 2px;
+}
+.obs:last-child { border-bottom: none; }
+.obs h4 { font-size: .94rem; font-weight: 700; margin: 0 0 7px; line-height: 1.6; }
+.obs p { margin: 0 0 8px; font-size: .88rem; color: var(--ink-2); line-height: 1.7; }
+.obs p:last-child { margin-bottom: 0; }
+.obs .evidence { font-size: .8rem; padding: 8px 11px; margin-bottom: 9px; }
+.obs .limit { font-size: .8rem; margin-bottom: 9px; }
+.obs .dur {
+  font-size: .76rem;
+  color: var(--ink-3);
+  letter-spacing: .02em;
+}
+.flag.new { color: var(--ink-2); background: var(--band); }
+
 .meta {
   display: flex;
   flex-wrap: wrap;
@@ -358,7 +388,7 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>設備振動週報 · {{ period_label }}</title>
+<title>{{ doc_title }} · {{ period_label }}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
@@ -370,8 +400,9 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
 
 <header>
   <div class="masthead">
-    <h1>設備振動週報</h1>
+    <h1>{{ doc_title }}</h1>
     <span class="period mono">{{ period_label }}</span>
+    {% if scope_label %}<span class="period">範圍：{{ scope_label }}</span>{% endif %}
   </div>
 
   <div class="verdict {{ verdict }}">
@@ -391,7 +422,7 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
     <h2>資料品質</h2>
     <span class="src">系統統計</span>
   </div>
-  <p class="secnote">涵蓋率不足的量測點，其判定結果不具參考價值，本週報中已排除其結論。
+  <p class="secnote">涵蓋率不足的量測點，其判定結果不具參考價值，{{ this_report }}中已排除其結論。
     「設備面問題」與「系統面問題」是完全不同的兩件事：前者是感測器本身異常，該找現場工程師；
     後者是每日匯入排程沒有正常執行，資料從一開始就不存在，該找系統排程，不是感測器。</p>
 
@@ -441,14 +472,14 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
 
 <section>
   <div class="sechead">
-    <h2>本週新發現</h2>
+    <h2>{{ period_word }}新發現</h2>
     <span class="count mono">{{ new_findings|length }} 件</span>
     <span class="src">系統依資料庫判定</span>
   </div>
   {% if new_findings %}
     {% for item in new_findings %}{{ finding_card(item) }}{% endfor %}
   {% else %}
-  <p class="empty">本週無新增事項。</p>
+  <p class="empty">{{ period_word }}無新增事項。</p>
   {% endif %}
 </section>
 
@@ -467,7 +498,45 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
 
 <section>
   <div class="sechead">
-    <h2>本週已解決</h2>
+    <h2>觀察名單</h2>
+    <span class="count mono">{{ observations|length }} 項</span>
+    <span class="src">規則判定 · 未達提報門檻</span>
+  </div>
+  <p class="secnote">本區為規則層判定到、但尚未達到需要指派處理的項目，
+    僅供掌握變化趨勢，<b>不需要回覆，也沒有簽核期限</b>。
+    項目若持續惡化並越過門檻，會自動出現在上方的「{{ period_word }}新發現」。</p>
+  {% if observations %}
+    {% if observation_summary %}
+    <p class="obs-summary">{{ observation_summary }}</p>
+    {% endif %}
+    {% for o in observations %}
+    <div class="obs">
+      <div class="row1">
+        <span class="dev mono">{{ o.device_label }}</span>
+        {% if o.location %}<span class="loc">{{ o.location }}</span>{% endif %}
+        {% if o.is_new %}<span class="flag new">本期新增</span>{% endif %}
+      </div>
+      <h4>{{ o.title }}</h4>
+      {% if o.evidence %}
+      <div class="evidence">
+        {% for label, value in o.evidence %}
+        <span>{{ label }} <b class="mono">{{ value }}</b></span>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if o.narrative %}<p>{{ o.narrative }}</p>{% endif %}
+      {% if o.limit_text %}<p class="limit">{{ o.limit_text }}</p>{% endif %}
+      {% if o.duration %}<p class="dur">{{ o.duration }}</p>{% endif %}
+    </div>
+    {% endfor %}
+  {% else %}
+  <p class="empty">本期無觀察中的項目。</p>
+  {% endif %}
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>{{ period_word }}已解決</h2>
     <span class="count mono">{{ resolved_findings|length }} 件</span>
     <span class="src">系統自資料庫擷取</span>
   </div>
@@ -497,7 +566,7 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
     </article>
     {% endfor %}
   {% else %}
-  <p class="empty">本週無事項結案。</p>
+  <p class="empty">{{ period_word }}無事項結案。</p>
   {% endif %}
 </section>
 
@@ -511,7 +580,7 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
     {% for p in notes_paragraphs %}<p>{{ p }}</p>{% endfor %}
   </div>
   {% else %}
-  <p class="empty">本週無額外觀察與建議。</p>
+  <p class="empty">{{ period_word }}無額外觀察與建議。</p>
   {% endif %}
 </section>
 

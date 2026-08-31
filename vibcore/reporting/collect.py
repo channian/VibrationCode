@@ -23,6 +23,7 @@ collect.py — 從資料庫收集週報所需的全部資料
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -34,6 +35,61 @@ from vibcore.db.repository import find_missing_ingestion, get_ingestion_audit
 logger = logging.getLogger(__name__)
 
 Connection = psycopg2.extensions.connection
+
+
+@dataclass(frozen=True)
+class ReportScope:
+    """
+    週報的範圍篩選（棟別／樓層／系統別），三個欄位皆為 `None` 代表全廠。
+
+    存在的理由是 `send_report` 的 `new_count`/`tracking_count`/
+    `resolved_count` 早就支援這三個篩選欄位。若收集層不跟著篩，同一筆
+    `weekly_report` 會出現「計數只算 B 棟、HTML 內文卻列出全廠事項」的
+    矛盾——那種不一致沒有任何錯誤訊息會提醒讀者，只會讓人以為某一邊算錯。
+    要嘛兩邊都篩，要嘛兩邊都不篩，不能只有一邊。
+
+    **匯入稽核（`ingestion_audit`）刻意不套用本篩選**，見
+    `_fetch_ingestion_audit` 的說明：那是排程層級的系統面問題，
+    「B 棟的排程沒跑」不是一個成立的概念。
+    """
+
+    building: str | None = None
+    floor: str | None = None
+    system_name: str | None = None
+
+    @property
+    def is_all(self) -> bool:
+        return self.building is None and self.floor is None and self.system_name is None
+
+    @property
+    def params(self) -> dict[str, Any]:
+        """供 SQL 具名參數展開；鍵名加 `scope_` 前綴避免與既有參數撞名。"""
+        return {
+            "scope_building": self.building,
+            "scope_floor": self.floor,
+            "scope_system": self.system_name,
+        }
+
+    def label(self) -> str:
+        """人可讀的範圍描述，供頁首標示這份報告涵蓋的範圍；全廠回傳空字串。"""
+        parts = [p for p in (self.building, self.floor, self.system_name) if p]
+        return " · ".join(parts)
+
+
+#: 三個篩選條件的 SQL 片段。用 `%(x)s::text IS NULL OR ...` 而非在 Python
+#: 端動態拼 WHERE，是為了讓 SQL 字串保持固定——參數化的值永遠走 psycopg2
+#: 的轉義路徑，不會因為某天有人把使用者輸入接進 `building` 而變成注入點。
+#: 需要 `::text` 顯式轉型，否則 PostgreSQL 無法推斷未知型別參數的型別。
+_SCOPE_SQL = """
+          AND (%(scope_building)s::text IS NULL OR {a}.building = %(scope_building)s)
+          AND (%(scope_floor)s::text IS NULL OR {a}.floor = %(scope_floor)s)
+          AND (%(scope_system)s::text IS NULL OR {a}.system_name = %(scope_system)s)
+"""
+
+
+def _scope_sql(alias: str) -> str:
+    """產生指定資料表別名的範圍篩選 SQL 片段。"""
+    return _SCOPE_SQL.format(a=alias)
 
 #: 視為已結案的狀態（與 vibcore.types.CLOSED_STATUSES 相同，這裡獨立列出
 #: 避免 reporting 模組對 vibcore.types 之外的內部模組產生額外相依）
@@ -184,14 +240,23 @@ def _normalize_resolved_finding(row: dict) -> dict[str, Any]:
     }
 
 
-def _fetch_open_findings(conn: Connection) -> list[dict]:
+def _fetch_open_findings(conn: Connection, scope: ReportScope) -> list[dict]:
     """
     查 `v_open_finding`：未結案事項 + SLA 逾期判定 + 最新人工回覆，全部
     交給 SQL 檢視計算（見 repository.get_open_findings 的設計說明）——
     週報、Dashboard、API 三處若各自重算 SLA 邏輯，遲早會兜不起來。
+
+    範圍篩選直接套在檢視上：`v_open_finding` 已經把 `building`/`floor`/
+    `system_name` 展開成欄位（見 db/schema.sql），不必再 join 一次 device。
+    """
+    sql = """
+        SELECT * FROM v_open_finding v
+        WHERE TRUE
+    """ + _scope_sql("v") + """
+        ORDER BY v.peak_severity DESC, v.stage_entered_at ASC
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM v_open_finding ORDER BY peak_severity DESC, stage_entered_at ASC")
+        cur.execute(sql, scope.params)
         return [dict(r) for r in cur.fetchall()]
 
 
@@ -206,7 +271,9 @@ def _fetch_assignee_names(conn: Connection, user_ids: set[int]) -> dict[int, str
         return {r["user_id"]: r["display_name"] for r in cur.fetchall()}
 
 
-def _fetch_resolved_findings(conn: Connection, start: datetime, end: datetime) -> list[dict]:
+def _fetch_resolved_findings(
+    conn: Connection, start: datetime, end: datetime, scope: ReportScope
+) -> list[dict]:
     """
     本週轉為結案（closed / auto_resolved / false_positive）的事項。
 
@@ -231,14 +298,20 @@ def _fetch_resolved_findings(conn: Connection, start: datetime, end: datetime) -
         LEFT JOIN measure_point mp ON mp.point_id = f.point_id
         WHERE f.status IN %(closed)s
           AND f.resolved_at >= %(start)s AND f.resolved_at < %(end)s
+    """ + _scope_sql("d") + """
         ORDER BY f.resolved_at DESC
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, {"closed": _CLOSED_STATUSES, "start": start, "end": end})
+        cur.execute(
+            sql,
+            {"closed": _CLOSED_STATUSES, "start": start, "end": end, **scope.params},
+        )
         return [dict(r) for r in cur.fetchall()]
 
 
-def _fetch_coverage(conn: Connection, start: datetime, end: datetime) -> dict[str, Any]:
+def _fetch_coverage(
+    conn: Connection, start: datetime, end: datetime, scope: ReportScope
+) -> dict[str, Any]:
     """
     全廠資料涵蓋率：本期每小時聚合列依 `data_status` 分組計數。
 
@@ -254,10 +327,11 @@ def _fetch_coverage(conn: Connection, start: datetime, end: datetime) -> dict[st
         JOIN device d ON d.device_id = mp.device_id
         WHERE ma.ts_hour >= %(start)s AND ma.ts_hour < %(end)s
           AND d.status = 'active' AND mp.is_active
+    """ + _scope_sql("d") + """
         GROUP BY ma.data_status
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, {"start": start, "end": end})
+        cur.execute(sql, {"start": start, "end": end, **scope.params})
         by_status = {r["data_status"]: int(r["hours"]) for r in cur.fetchall()}
 
     ok_hours = by_status.get("ok", 0)
@@ -289,7 +363,7 @@ def _fetch_coverage(conn: Connection, start: datetime, end: datetime) -> dict[st
 
 
 def _fetch_coverage_gaps(
-    conn: Connection, start: datetime, end: datetime, period_end: date
+    conn: Connection, start: datetime, end: datetime, period_end: date, scope: ReportScope
 ) -> list[dict[str, Any]]:
     """
     逐量測點列出本期「涵蓋率有問題」的明細，供資料品質區塊的條列說明。
@@ -310,12 +384,13 @@ def _fetch_coverage_gaps(
         JOIN device d ON d.device_id = mp.device_id
         WHERE ma.ts_hour >= %(start)s AND ma.ts_hour < %(end)s
           AND d.status = 'active' AND mp.is_active
+    """ + _scope_sql("d") + """
         GROUP BY mp.point_id, mp.position, d.device_id, d.device_name,
                  d.building, d.floor, d.system_name, d.is_standby
         ORDER BY no_data_hours DESC, partial_hours DESC
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, {"start": start, "end": end})
+        cur.execute(sql, {"start": start, "end": end, **scope.params})
         rows = [dict(r) for r in cur.fetchall()]
 
     period_end_dt = datetime(period_end.year, period_end.month, period_end.day, tzinfo=timezone.utc) + timedelta(days=1)
@@ -357,9 +432,10 @@ def _fetch_coverage_gaps(
             JOIN device d ON d.device_id = mp.device_id
             LEFT JOIN measurement_agg ma ON ma.point_id = mp.point_id AND ma.ts_hour < %(end)s
             WHERE d.status = 'active' AND mp.is_active AND d.is_standby
+            """ + _scope_sql("d") + """
             GROUP BY mp.point_id, mp.position, d.device_id, d.building, d.floor, d.system_name
             """,
-            {"end": end},
+            {"end": end, **scope.params},
         )
         standby_rows = [dict(r) for r in cur.fetchall()]
 
@@ -396,11 +472,34 @@ def _get_standby_threshold_days(conn: Connection) -> int:
     return _DEFAULT_STANDBY_DAYS
 
 
+def _in_scope(row: dict, scope: ReportScope) -> bool:
+    """
+    位置欄位是否落在範圍內；用於已經查回記憶體、不值得為了篩選再跑一次
+    SQL 的小結果集（目前只有匯入稽核的問題清單）。
+    """
+    if scope.building is not None and row.get("building") != scope.building:
+        return False
+    if scope.floor is not None and row.get("floor") != scope.floor:
+        return False
+    if scope.system_name is not None and row.get("system_name") != scope.system_name:
+        return False
+    return True
+
+
 def _fetch_ingestion_audit(
-    conn: Connection, period_start: date, period_end: date
+    conn: Connection, period_start: date, period_end: date, scope: ReportScope
 ) -> dict[str, Any]:
     """
     收集本期的匯入稽核資訊，供週報把「感測器斷線」與「匯入排程沒跑」分開呈現。
+
+    **範圍篩選在這裡只套用到逐點的問題清單（`issues`），不套用到「當日全廠
+    是否都沒有匯入紀錄」的判定。** 兩者問的不是同一件事：後者是「排程那天
+    到底有沒有跑」，那是一個系統層級的事實，母集合必須是全廠所有量測點——
+    若只看 A 棟的 20 個點都沒紀錄就宣告「全廠皆無匯入」，那句話會在其他棟
+    其實正常匯入的情況下變成假警報，而它的用詞（「當日所有設備的判定不具
+    參考價值」）重到不能出錯。反過來，`issues` 是逐台設備列出來、和涵蓋率
+    清單並排呈現的明細，一份標了「範圍：A 棟」的報告卻在裡面列出 B 棟的
+    設備，讀者只會以為範圍篩選壞了。
 
     刻意獨立於 `_fetch_coverage_gaps` 之外，兩者互不交叉比對——原因見
     `repository.find_missing_ingestion` 的設計說明：只要某量測點某天
@@ -436,6 +535,8 @@ def _fetch_ingestion_audit(
         if all_missing:
             all_missing_dates.append(d)
 
+    # 逐點清單套範圍篩選；上面的 missing_by_date / all_missing_dates 刻意
+    # 用未篩選的 `missing`，理由見本函式 docstring。
     issues: list[dict[str, Any]] = [
         {
             "date": m["date"],
@@ -444,7 +545,7 @@ def _fetch_ingestion_audit(
             "location": _location_label(m),
             "note": "",
         }
-        for m in missing
+        for m in missing if _in_scope(m, scope)
     ]
 
     audit_df = get_ingestion_audit(conn, period_start, period_end)
@@ -453,6 +554,8 @@ def _fetch_ingestion_audit(
         problem_mask = audit_df["status"].isin(_INGEST_PROBLEM_STATUSES)
         has_logged_problem = bool(problem_mask.any())
         for row in audit_df[problem_mask].to_dict("records"):
+            if not _in_scope(row, scope):
+                continue
             label = f'{row["device_id"]} / {row["position"]}' if row.get("position") else row["device_id"]
             issues.append({
                 "date": row["ingest_date"],
@@ -501,7 +604,9 @@ def _normalize_observation(row: dict) -> dict[str, Any]:
     }
 
 
-def _fetch_observations(conn: Connection, start: datetime, end: datetime) -> list[dict]:
+def _fetch_observations(
+    conn: Connection, start: datetime, end: datetime, scope: ReportScope
+) -> list[dict]:
     """
     取回本期「仍在觀察中」的 observe 級判定：`last_seen_at` 落在本期內，
     即代表本期至少再被判定一次；`observation` 沒有 status 欄位，
@@ -522,17 +627,24 @@ def _fetch_observations(conn: Connection, start: datetime, end: datetime) -> lis
         LEFT JOIN device d ON d.device_id = o.device_id
         LEFT JOIN measure_point mp ON mp.point_id = o.point_id
         WHERE o.last_seen_at >= %(start)s AND o.last_seen_at < %(end)s
+    """ + _scope_sql("d") + """
         ORDER BY o.last_seen_at DESC
     """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, {"start": start, "end": end})
+        cur.execute(sql, {"start": start, "end": end, **scope.params})
         return [dict(r) for r in cur.fetchall()]
 
 
-def _fetch_device_status_summary(conn: Connection) -> dict[str, Any]:
-    """全廠設備狀態摘要（供頁首補充統計，不含個別事項明細）。"""
+def _fetch_device_status_summary(conn: Connection, scope: ReportScope) -> dict[str, Any]:
+    """
+    設備狀態摘要（供頁首補充統計，不含個別事項明細）。
+
+    範圍未指定時即為全廠；指定時只計入範圍內的設備，好讓這裡的
+    「共 N 台」與同一份報告其他區塊的事項清單指涉同一個母集合。
+    """
+    sql = "SELECT * FROM v_device_status v WHERE TRUE" + _scope_sql("v")
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM v_device_status")
+        cur.execute(sql, scope.params)
         rows = [dict(r) for r in cur.fetchall()]
     return {
         "total_active_devices": len(rows),
@@ -542,9 +654,68 @@ def _fetch_device_status_summary(conn: Connection) -> dict[str, Any]:
     }
 
 
-def collect_weekly_data(conn: Connection, period_start: date, period_end: date) -> dict[str, Any]:
+def collect_observations(
+    conn: Connection,
+    period_start: date,
+    period_end: date,
+    scope: ReportScope | None = None,
+) -> dict[str, Any]:
+    """
+    只收集 observe 級觀察名單（`collect_weekly_data` 的一個子集）。
+
+    獨立成公開函式，是因為 API 的 `get_weekly_report_data` 需要把觀察
+    名單交給 agent，但不需要（也不該重複計算）整份週報的三段式分類與
+    涵蓋率統計。兩處共用同一份查詢與分段邏輯，避免「agent 看到的觀察
+    名單」和「報告上印出來的觀察名單」在同一輪流程裡對不起來。
+
+    分段依據與 finding 相同（`first_seen_at` 是否落在本期），但沒有
+    「已解決」——observation 沒有結案動作，判定沒再觸發就自然不會出現在
+    下一期的查詢結果裡（母集合是 `last_seen_at` 落在本期內）。
+
+    Returns:
+        `{"new_observations", "tracking_observations", "observations_by_device"}`
+    """
+    scope = scope or ReportScope()
+    start, end = _period_bounds(period_start, period_end)
+
+    observation_rows = _fetch_observations(conn, start, end, scope)
+    new_observations: list[dict[str, Any]] = []
+    tracking_observations: list[dict[str, Any]] = []
+    for row in observation_rows:
+        normalized = _normalize_observation(row)
+        first_seen = row.get("first_seen_at")
+        is_new = first_seen is not None and start <= _as_aware(first_seen) <= end
+        if is_new:
+            new_observations.append(normalized)
+        else:
+            tracking_observations.append(normalized)
+
+    # 依設備彙總計數，供週報用一行文字呈現「哪些設備本期有觀察項目」，
+    # 不必逐條列出仍能讓人掌握分佈——這正是「素材而非待辦清單」的呈現方式。
+    observations_by_device: dict[str, int] = {}
+    for o in new_observations + tracking_observations:
+        dev_key = o["device_label"].split(" / ")[0]
+        observations_by_device[dev_key] = observations_by_device.get(dev_key, 0) + 1
+
+    return {
+        "new_observations": new_observations,
+        "tracking_observations": tracking_observations,
+        "observations_by_device": observations_by_device,
+    }
+
+
+def collect_weekly_data(
+    conn: Connection,
+    period_start: date,
+    period_end: date,
+    scope: ReportScope | None = None,
+) -> dict[str, Any]:
     """
     收集週報所需的全部資料（本期範圍為 `[period_start, period_end]`，皆含）。
+
+    `scope` 不給（或三個欄位皆 `None`）代表全廠；給了則各區塊一律只計入
+    範圍內的設備，理由見 `ReportScope` 的說明——唯一的例外是
+    `ingestion_audit`，那是排程層級的系統面問題，不隨設備位置切分。
 
     回傳的 dict 直接餵給 `render.render_weekly_html`；刻意不回傳 dataclass
     ——這份結構只在 collect → render 這一段內部流動，不是跨模組契約，
@@ -564,6 +735,7 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
           "coverage_gaps": [...],      # 涵蓋率問題明細（斷線/資料不全/備機閒置，設備面）
           "ingestion_audit": {...},    # 匯入稽核（排程沒跑，系統面；與上者刻意分開判定）
           "device_status_summary": {...},
+          "scope": {"building","floor","system_name","label"},  # 全廠時 label 為空字串
           "stats": {"err_count","warn_count","tracking_count","resolved_count","affected_devices",
                     "new_observation_count","tracking_observation_count","observed_devices"},
         }
@@ -575,9 +747,10 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
     if period_end < period_start:
         raise ValueError(f"period_end ({period_end}) 早於 period_start ({period_start})")
 
+    scope = scope or ReportScope()
     start, end = _period_bounds(period_start, period_end)
 
-    open_rows = _fetch_open_findings(conn)
+    open_rows = _fetch_open_findings(conn, scope)
     assignee_ids = {r["assigned_to"] for r in open_rows if r.get("assigned_to")}
     assignee_names = _fetch_assignee_names(conn, assignee_ids)
 
@@ -601,36 +774,21 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
         else:
             tracking_findings.append(normalized)
 
-    resolved_rows = _fetch_resolved_findings(conn, start, end)
+    resolved_rows = _fetch_resolved_findings(conn, start, end, scope)
     resolved_findings = [_normalize_resolved_finding(r) for r in resolved_rows]
 
-    # observe 級觀察名單：分段依據與 finding 相同（first_seen_at 是否落在
-    # 本期），但母集合是「last_seen_at 落在本期內」（見 _fetch_observations），
-    # 不是「未結案」——observation 沒有 status，用查詢區間本身界定「目前
-    # 是否還在」。
-    observation_rows = _fetch_observations(conn, start, end)
-    new_observations: list[dict[str, Any]] = []
-    tracking_observations: list[dict[str, Any]] = []
-    for row in observation_rows:
-        normalized = _normalize_observation(row)
-        first_seen = row.get("first_seen_at")
-        is_new = first_seen is not None and start <= _as_aware(first_seen) <= end
-        if is_new:
-            new_observations.append(normalized)
-        else:
-            tracking_observations.append(normalized)
+    # observe 級觀察名單：與 API 的 get_weekly_report_data 共用同一份收集
+    # 邏輯（見 collect_observations），確保 agent 看到的名單與報告上印出來
+    # 的名單在同一輪流程裡一致。
+    obs = collect_observations(conn, period_start, period_end, scope)
+    new_observations = obs["new_observations"]
+    tracking_observations = obs["tracking_observations"]
+    observations_by_device = obs["observations_by_device"]
 
-    # 依設備彙總計數，供週報用一行文字呈現「哪些設備本週有觀察項目」，
-    # 不必逐條列出仍能讓人掌握分佈——這正是「素材而非待辦清單」的呈現方式。
-    observations_by_device: dict[str, int] = {}
-    for o in new_observations + tracking_observations:
-        dev_key = o["device_label"].split(" / ")[0]
-        observations_by_device[dev_key] = observations_by_device.get(dev_key, 0) + 1
-
-    coverage = _fetch_coverage(conn, start, end)
-    coverage_gaps = _fetch_coverage_gaps(conn, start, end, period_end)
-    ingestion_audit = _fetch_ingestion_audit(conn, period_start, period_end)
-    device_status_summary = _fetch_device_status_summary(conn)
+    coverage = _fetch_coverage(conn, start, end, scope)
+    coverage_gaps = _fetch_coverage_gaps(conn, start, end, period_end, scope)
+    ingestion_audit = _fetch_ingestion_audit(conn, period_start, period_end, scope)
+    device_status_summary = _fetch_device_status_summary(conn, scope)
 
     affected_devices = {f["device_label"].split(" / ")[0] for f in new_findings + tracking_findings}
 
@@ -675,5 +833,11 @@ def collect_weekly_data(conn: Connection, period_start: date, period_end: date) 
         "coverage_gaps": coverage_gaps,
         "ingestion_audit": ingestion_audit,
         "device_status_summary": device_status_summary,
+        "scope": {
+            "building": scope.building,
+            "floor": scope.floor,
+            "system_name": scope.system_name,
+            "label": scope.label(),
+        },
         "stats": stats,
     }

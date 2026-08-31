@@ -13,7 +13,8 @@ Agent 只負責產出 verdict / headline / actions / notes 這類「人話評論
 `collect.collect_weekly_data` 的 docstring。
 """
 
-from vibcore.reporting.collect import collect_weekly_data
+from vibcore.reporting.collect import ReportScope, collect_observations, collect_weekly_data
 from vibcore.reporting.render import render_weekly_html
 
-__all__ = ["collect_weekly_data", "render_weekly_html"]
+__all__ = ["ReportScope", "collect_observations", "collect_weekly_data",
+           "render_weekly_html"]

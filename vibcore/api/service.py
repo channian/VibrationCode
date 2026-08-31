@@ -38,6 +38,8 @@ from vibcore.db import repository
 from vibcore.metrics import iso as iso_mod
 from vibcore.metrics import trend as trend_mod
 from vibcore.pipeline.aggregate import coverage_report
+from vibcore.reporting import collect_weekly_data, render_weekly_html
+from vibcore.reporting.collect import ReportScope, collect_observations
 from vibcore.types import CoverageInfo
 
 logger = logging.getLogger(__name__)
@@ -426,6 +428,15 @@ def get_weekly_report_data(
 
     org_ratio = round(sum(ratios) / len(ratios), 4) if ratios else 0.0
 
+    # observe 級觀察名單：規則判定到、但未達提報門檻的項目。agent 需要看得到
+    # 這一層才能在 notes 裡寫「有幾台在觀察中」，但它**不是待辦清單**——
+    # 回傳結構刻意不含 status/assignee/期限，且在 `note` 明說不要為這些項目
+    # 開 action，免得觀察名單被寫成一堆需要有人回覆的事項。
+    observations = collect_observations(
+        conn, period_start, period_end,
+        ReportScope(building=building, floor=floor, system_name=system_name),
+    )
+
     return {
         "period": {"start": jsonable(period_start), "end": jsonable(period_end), "days": days},
         "findings_summary": {
@@ -449,6 +460,21 @@ def get_weekly_report_data(
             "note": (
                 "analyzable_ratio 低於 50% 的量測點，其期間內的趨勢/位準結論"
                 "信心度不足，週報應標示信心度或略過結論。"
+            ),
+        },
+        "observations": {
+            "new_this_period": jsonable(observations["new_observations"]),
+            "tracking": jsonable(observations["tracking_observations"]),
+            "by_device": observations["observations_by_device"],
+            "new_count": len(observations["new_observations"]),
+            "tracking_count": len(observations["tracking_observations"]),
+            "note": (
+                "observe 級判定：規則觸發了但未達提報門檻，沒有簽核流程、"
+                "沒有負責人、沒有回覆期限。**不要為這些項目開 action**——"
+                "action 的定義是需要有人處理的事，observe 的定義正好是還不需要。"
+                "要提及請寫在 notes，例如「另有 N 台設備 M 項指標在觀察中」。"
+                "項目若持續惡化越過門檻，規則引擎會自動把它升級成 finding，"
+                "屆時自然會出現在 new_this_period。"
             ),
         },
         "interpretation_limit": GUARDRAIL_NOTE,
@@ -491,23 +517,61 @@ def get_event_context(conn, finding_key: str) -> dict:
 # send_report（四道卡控）
 # =============================================================
 
-def _render_placeholder_html(
-    report_type: str, period_label: str, verdict: str, headline: str,
-    actions: list[dict], notes: str | None,
+def _render_report_html(
+    conn,
+    payload: SendReportRequest,
+    period_start: date,
+    period_end: date,
+    raw_agent_payload: dict,
 ) -> str:
     """
-    產生佔位用的排版 HTML；`headline`/`notes`/`actions[].text` 在呼叫前已
-    完成 HTML 轉義，這裡直接內插不會產生 XSS 風險。SMTP 尚未設定，此
-    HTML 目前只落庫供之後的寄送介面使用，本次呼叫不會真的寄出。
+    產出完整報告 HTML：資料由 `collect_weekly_data` 從資料庫收集，
+    agent 的評論只負責補強敘述（見 vibcore.reporting 的分工原則）。
+
+    **這裡傳給渲染層的是未轉義的原文**，與落庫用的 `agent_payload`
+    刻意不同一份。`vibcore.reporting.render` 的 Jinja2 已強制開啟
+    autoescape，再餵它一份 `html.escape()` 過的字串會轉義兩次，讀者在
+    報告上看到的就是 `&lt;b&gt;` 這串字面值。落庫那份維持轉義（見
+    `send_report` 的四道卡控 #3），兩邊的差別只在轉義與否，內容相同。
+
+    渲染失敗不讓整支 API 掛掉：報告內容產不出來時退回一段最小可讀的
+    純文字摘要並記 exception。`send_report` 是排程流程的終點，這裡丟出
+    500 只會讓當期報告整份消失，而 headline 與 verdict 這兩個最關鍵的
+    結論其實不依賴渲染就已經拿到手了。
     """
-    action_items = "".join(f"<li class='lvl-{a['level']}'>{a['text']}</li>" for a in actions)
-    notes_html = f"<p class='notes'>{notes}</p>" if notes else ""
-    label = "週報" if report_type == "weekly" else "日報"
+    try:
+        data = collect_weekly_data(
+            conn, period_start, period_end,
+            ReportScope(
+                building=payload.building,
+                floor=payload.floor,
+                system_name=payload.system_name,
+            ),
+        )
+        return render_weekly_html(data, raw_agent_payload, payload.report_type)
+    except Exception:
+        logger.exception(
+            "報告 HTML 渲染失敗（%s %s ~ %s），改存純文字摘要",
+            payload.report_type, period_start, period_end,
+        )
+        return _render_fallback_html(payload)
+
+
+def _render_fallback_html(payload: SendReportRequest) -> str:
+    """
+    渲染失敗時的最小替代內容；字串在這裡自行轉義（此處是字串拼接，
+    沒有樣板引擎的 autoescape 可倚賴）。
+    """
+    items = "".join(
+        f"<li>{html_escape.escape(a.display_title)}</li>" for a in payload.actions
+    )
+    notes = f"<p>{html_escape.escape(payload.notes)}</p>" if payload.notes else ""
     return (
-        f"<div class='vib-report'><h2>{label} {period_label}</h2>"
-        f"<p class='verdict verdict-{verdict}'>總評：{verdict}</p>"
-        f"<p class='headline'>{headline}</p>"
-        f"<ul class='actions'>{action_items}</ul>{notes_html}</div>"
+        "<div class='vib-report'>"
+        "<p><b>報告排版失敗，以下為未排版的內容。</b></p>"
+        f"<p>總評：{html_escape.escape(payload.verdict)}</p>"
+        f"<p>{html_escape.escape(payload.headline)}</p>"
+        f"<ul>{items}</ul>{notes}</div>"
     )
 
 
@@ -524,13 +588,22 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
     四道卡控：
       1. 收件人由系統設定決定——`SendReportRequest` 結構本身不接受收件人欄位
          （`extra="forbid"`，見 schemas.py）。
-      2. 主旨由系統產生（`_render_placeholder_html` 內的標題列），呼叫方不可自訂。
-      3. 只收結構化欄位；`headline`/`notes`/`actions[].text` 一律 HTML 轉義。
+      2. 主旨由系統產生（報告 HTML 的標題列，見 vibcore.reporting），呼叫方不可自訂。
+      3. 只收結構化欄位；`headline`/`notes`/`actions` 的文字欄位落庫與回傳前
+         一律 HTML 轉義（渲染路徑改走樣板引擎的 autoescape，見
+         `_render_report_html` 為何刻意不共用同一份字串）。
       4. 每日發送次數上限（預設 3，環境變數 `VIB_REPORT_DAILY_LIMIT` 可調），
          超過回 429；每次成功呼叫寫入 `audit_log`。
 
+    報告內容本身（三段式分類、涵蓋率、觀察名單）一律由
+    `vibcore.reporting.collect_weekly_data` 從資料庫收集，agent 送進來的
+    `actions` 只用來補強對應事項卡片的敘述——哪些事項要出現、嚴重度多少、
+    走到哪個簽核階段，都不受 agent 輸入影響（見 collect.py 的 docstring）。
+    `building`/`floor`/`system_name` 同時套用到計數與報告內容，兩者範圍
+    一致（見 `reporting.ReportScope`）。
+
     SMTP 尚未設定：報告存進 `weekly_report` 並回傳結果，`delivery.sent`
-    固定為 False，寄送介面已預留（見 `_render_placeholder_html`）。
+    固定為 False，寄送介面已預留。
     """
     sent_today = queries.count_send_report_today(conn)
     if sent_today >= daily_limit:
@@ -539,10 +612,35 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
             detail=f"已達每日寄送上限（{daily_limit} 次），請明日再試",
         )
 
+    # 兩份 actions：`raw_actions` 給渲染層（Jinja2 autoescape 會處理），
+    # `actions` 是轉義後的版本，供落庫與 API 回傳（四道卡控 #3）。
+    # 差別只在轉義與否，內容相同；理由見 `_render_report_html`。
+    raw_actions = [
+        {
+            "level": a.level,
+            "title": a.display_title,
+            "detail": a.detail,
+            "suggestion": a.suggestion,
+            "target_type": a.target_type,
+            "target": a.target,
+            "issue_type": a.issue_type,
+        }
+        for a in payload.actions
+    ]
     headline = html_escape.escape(payload.headline)
     notes = html_escape.escape(payload.notes) if payload.notes else None
+
+    def _esc(v: str | None) -> str | None:
+        return html_escape.escape(v) if v else v
+
     actions = [
-        {"level": a.level, "text": html_escape.escape(a.text)} for a in payload.actions
+        {**a,
+         "title": _esc(a["title"]), "detail": _esc(a["detail"]),
+         "suggestion": _esc(a["suggestion"]),
+         # `text` 保留在回傳裡，讓既有以舊契約呼叫的 agent 讀回傳時
+         # 仍看得到自己送出去的欄位，不必改讀 title
+         "text": _esc(a["title"])}
+        for a in raw_actions
     ]
 
     period_start, period_end = resolve_period(payload.days, end_date=payload.end_date)
@@ -565,8 +663,14 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         "notes": notes,
         "submitted_at": jsonable(_now()),
     }
-    report_html = _render_placeholder_html(
-        payload.report_type, period_label, payload.verdict, headline, actions, notes
+    report_html = _render_report_html(
+        conn, payload, period_start, period_end,
+        raw_agent_payload={
+            "verdict": payload.verdict,
+            "headline": payload.headline,
+            "actions": raw_actions,
+            "notes": payload.notes,
+        },
     )
 
     row = queries.upsert_weekly_report(
@@ -590,6 +694,8 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         detail={
             "report_id": row["report_id"], "verdict": payload.verdict,
             "headline": headline, "n_actions": len(actions),
+            "scope": {"building": payload.building, "floor": payload.floor,
+                      "system_name": payload.system_name},
         },
     )
 

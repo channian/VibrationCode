@@ -16,6 +16,11 @@ HTML 的 agent 字串一律透過 Jinja2 的 autoescape（本模組建立 Enviro
 {issue_type}` 比對到 `Finding.finding_key`；比對不到的 action 會被
 忽略並記一筆 warning（agent 可能引用了已結案或不存在的事項），不會讓
 整個渲染失敗。
+
+**observe 級觀察名單自成一區，且完全不吃 agent 輸入**：那一區的定義是
+「規則判定到了、但還不到需要有人行動的程度」。只要讓 agent 的建議文字
+掛得上去，它在版面上就會重新長成一份待辦清單，這一層的分流也就白做了
+（同樣的取捨見 collect.`_normalize_observation`）。
 """
 
 from __future__ import annotations
@@ -33,6 +38,27 @@ logger = logging.getLogger(__name__)
 
 #: send_report 契約上限；超過的 action 直接捨棄而非報錯，理由見模組 docstring
 _MAX_ACTIONS = 10
+
+#: 觀察名單一行式彙總最多點名幾台設備；超過的併成「另有 N 台」，
+#: 免得這一行本身長到失去「先掃過分佈」的作用
+_OBSERVATION_SUMMARY_MAX_DEVICES = 8
+
+#: 報告型別 → 版面用語。`send_report` 同一支 API 就收 `report_type`
+#: daily/weekly 兩種，樣板若把「本週」寫死，日報產出來每一段標題都在說
+#: 「本週」，而期間其實只有一天——讀者會直接把報告的涵蓋範圍讀錯，
+#: 這比排版難看嚴重得多。用語集中在這裡，樣板只用變數。
+_REPORT_LABELS: dict[str, dict[str, str]] = {
+    "weekly": {
+        "doc_title": "設備振動週報",
+        "period_word": "本週",
+        "this_report": "本週報",
+    },
+    "daily": {
+        "doc_title": "設備振動日報",
+        "period_word": "本日",
+        "this_report": "本日報",
+    },
+}
 
 _LOCAL_TZ = timezone(timedelta(hours=8))
 
@@ -162,7 +188,13 @@ def _evidence_display(item: dict[str, Any]) -> list[tuple[str, str]]:
     return out
 
 
-def _period_label(period_start: date, period_end: date) -> str:
+def _period_label(period_start: date, period_end: date, report_type: str = "weekly") -> str:
+    """
+    期間標籤。單日區間不標 ISO 週次——`2026-W35 · 08/31 – 08/31` 讀起來
+    像是涵蓋整週卻只列了一天的資料，標成日期才不會誤導。
+    """
+    if report_type == "daily" or period_start == period_end:
+        return f"{period_end:%Y-%m-%d}"
     iso_year, iso_week, _ = period_start.isocalendar()
     return f"{iso_year}-W{iso_week:02d} · {period_start:%m/%d} – {period_end:%m/%d}"
 
@@ -182,8 +214,14 @@ def _index_actions(agent_payload: dict[str, Any] | None) -> dict[str, dict]:
     for a in actions:
         if not isinstance(a, dict):
             continue
-        key = f"{a.get('target_type', 'point')}:{a.get('target', '')}:{a.get('issue_type', '')}"
-        indexed[key] = a
+        target, issue_type = a.get("target"), a.get("issue_type")
+        if not target or not issue_type:
+            # 沒帶定位欄位的 action（例如舊契約只給 level + text）不進索引：
+            # 硬組出 `None:None:None` 這種 key 不可能對應到任何事項，只會在
+            # 下游多噴一行「對應不到」的 warning，把真正該注意的錯誤蓋掉。
+            # 這類 action 仍會落庫，只是不掛到卡片上。
+            continue
+        indexed[f"{a.get('target_type') or 'point'}:{target}:{issue_type}"] = a
     return indexed
 
 
@@ -271,6 +309,61 @@ def _present_open_finding(item: dict[str, Any], action: dict | None, kind: str) 
     }
 
 
+def _present_observation(item: dict[str, Any], kind: str) -> dict[str, Any]:
+    """
+    把一筆 observe 級判定排成觀察名單的一列。
+
+    刻意**不**回傳 severity / severity_label / flags(逾期) / meta(指派、
+    回覆期限、目前階段) 這些欄位——observe 沒有簽核流程，版面上只要出現
+    一個嚴重度徽章或一個「待回覆」欄位，讀者就會把它讀成待辦事項，然後
+    問「這幾件誰要處理」。這個取捨在 collect.`_normalize_observation`
+    已經從資料結構做過一次（那裡就沒撈 status/assignee），這裡只是不要
+    在呈現層又自己補回來。
+
+    `kind` 只用來決定要不要標「本期新增」，不影響其他欄位；持續中的項目
+    以「已觀察 N 次」表達延續性，不套用 finding 那套「第 N 次提出」措辭
+    ——那個措辭隱含「曾經提報給某人」，observe 從來沒有提報過。
+    """
+    duration = ""
+    if kind == "tracking":
+        occurrences = item.get("occurrence_count") or 1
+        duration = f"已觀察 {occurrences} 次"
+        first_seen = _fmt_date(item.get("first_seen_at"))
+        if first_seen and first_seen != "—":
+            duration += f"，最早見於 {first_seen}"
+
+    return {
+        "is_new": kind == "new",
+        "device_label": item["device_label"],
+        "location": item["location"],
+        "title": item["title"],
+        "evidence": _evidence_display(item),
+        "narrative": item.get("detail") or "",
+        "limit_text": (item.get("interpretation_limit") or "").strip(),
+        "duration": duration,
+        "last_seen_label": _fmt_date(item.get("last_seen_at")),
+    }
+
+
+def _observation_summary(by_device: dict[str, int], total: int) -> str:
+    """
+    觀察名單的一行式彙總：哪些設備、各幾項。
+
+    設備多的時候逐條讀完是負擔，但「哪幾台在名單上」本身就是有用的資訊
+    ——這一行讓人先掃過分佈，再決定要不要往下看明細。
+    """
+    if not by_device:
+        return ""
+    ordered = sorted(by_device.items(), key=lambda kv: (-kv[1], kv[0]))
+    shown = ordered[:_OBSERVATION_SUMMARY_MAX_DEVICES]
+    parts = [f"{dev} {n} 項" for dev, n in shown]
+    sentence = f"本期共 {total} 項觀察，分佈於 {len(by_device)} 台設備：" + "、".join(parts)
+    remaining = len(ordered) - len(shown)
+    if remaining > 0:
+        sentence += f"，另有 {remaining} 台各有少量項目"
+    return sentence + "。"
+
+
 def _present_resolved_finding(item: dict[str, Any]) -> dict[str, Any]:
     reply = None
     note = item.get("latest_note")
@@ -300,15 +393,16 @@ def _present_resolved_finding(item: dict[str, Any]) -> dict[str, Any]:
 # 資料品質區塊
 # ──────────────────────────────────────────────────────────
 
-def _gap_sentence(gap: dict[str, Any]) -> str:
+def _gap_sentence(gap: dict[str, Any], period_word: str) -> str:
     if gap["kind"] == "offline":
         since_label = _fmt_datetime(gap["since"])
-        return f"自 {since_label} 起無資料，已連續 {_fmt_hours(gap['gap_hours'])}。本週該點所有指標未評估。"
+        return (f"自 {since_label} 起無資料，已連續 {_fmt_hours(gap['gap_hours'])}。"
+                f"{period_word}該點所有指標未評估。")
     if gap["kind"] == "partial":
         return f"本期累計 {gap['partial_hours']} 小時資料不全，該時段指標已標記為不可信。"
     if gap["kind"] == "standby":
         idle = f"累計未運轉 {gap['idle_days']} 天" if gap.get("idle_days") is not None else "未偵測到運轉紀錄"
-        return (f"備機，本週運轉 {gap['this_week_hours']} 小時，{idle}"
+        return (f"備機，{period_word}運轉 {gap['this_week_hours']} 小時，{idle}"
                 f"（門檻 {gap['threshold_days']} 天）。運轉樣本不足以建立健康基準，"
                 f"僅以離線與試車規則監測。")
     return ""
@@ -342,7 +436,7 @@ def _ingestion_sentence(item: dict[str, Any]) -> str:
     return sentence
 
 
-def _ingestion_banner(all_missing_dates: list[Any]) -> str:
+def _ingestion_banner(all_missing_dates: list[Any], this_report: str) -> str:
     """
     全廠當日無匯入紀錄的警示文字；沒有這幾天就回傳空字串（樣板據此決定是否顯示）。
 
@@ -355,11 +449,12 @@ def _ingestion_banner(all_missing_dates: list[Any]) -> str:
     dates_label = "、".join(_fmt_date(d) for d in sorted(all_missing_dates))
     return (f"{dates_label}：全廠所有量測點當日皆無匯入紀錄，並非設備同時斷線，"
             f"而是匯入排程當天很可能完全沒有執行。當日（含）所有設備的判定"
-            f"不具參考價值，請勿依本週報結論排除異常，並優先確認匯入排程執行狀態。")
+            f"不具參考價值，請勿依{this_report}結論排除異常，並優先確認匯入排程執行狀態。")
 
 
 def _present_quality(
     coverage: dict[str, Any], gaps: list[dict[str, Any]], ingestion_audit: dict[str, Any],
+    period_word: str, this_report: str,
 ) -> dict[str, Any]:
     bar_segments = [
         {"var": "--ok", "pct": coverage["ok_ratio"] * 100},
@@ -374,7 +469,8 @@ def _present_quality(
         {"var": "--crit", "label": "感測器斷線", "pct_label": _fmt_pct(coverage["no_data_ratio"])},
     ]
     gap_items = [
-        {"device_label": g["device_label"], "location": g["location"], "sentence": _gap_sentence(g)}
+        {"device_label": g["device_label"], "location": g["location"],
+         "sentence": _gap_sentence(g, period_word)}
         for g in gaps
     ]
     ingestion_items = [
@@ -390,7 +486,9 @@ def _present_quality(
         "legend": legend,
         "gap_items": gap_items,
         "ingestion_items": ingestion_items,
-        "all_missing_banner": _ingestion_banner(ingestion_audit.get("all_missing_dates") or []),
+        "all_missing_banner": _ingestion_banner(
+            ingestion_audit.get("all_missing_dates") or [], this_report,
+        ),
         "header_ratio_label": _fmt_pct(coverage["header_ratio"]),
     }
 
@@ -411,13 +509,17 @@ def _infer_verdict(data: dict[str, Any]) -> str:
     return "ok"
 
 
-def _fallback_headline(data: dict[str, Any]) -> str:
+def _fallback_headline(data: dict[str, Any], period_word: str) -> str:
     s = data["stats"]
-    return (f"本週新增 {s['new_count']} 件事項，追蹤中 {s['tracking_count']} 件，"
-            f"本週已解決 {s['resolved_count']} 件。")
+    return (f"{period_word}新增 {s['new_count']} 件事項，追蹤中 {s['tracking_count']} 件，"
+            f"{period_word}已解決 {s['resolved_count']} 件。")
 
 
-def render_weekly_html(data: dict[str, Any], agent_payload: dict[str, Any] | None) -> str:
+def render_weekly_html(
+    data: dict[str, Any],
+    agent_payload: dict[str, Any] | None,
+    report_type: str = "weekly",
+) -> str:
     """
     把 `collect_weekly_data` 的輸出與 agent 的結構化評論排版成完整 HTML。
 
@@ -429,11 +531,22 @@ def render_weekly_html(data: dict[str, Any], agent_payload: dict[str, Any] | Non
     Args:
         data: `collect_weekly_data()` 的回傳值。
         agent_payload: `{"verdict","headline","actions","notes"}`，見套件 docstring。
+            **字串一律傳未轉義的原文**：本模組的 Jinja2 已強制開啟
+            autoescape，呼叫端若先自行 `html.escape()` 再傳進來，讀者在
+            報告上看到的會是 `&lt;b&gt;` 這種轉義後的字面值（轉義了兩次）。
+        report_type: `"weekly"`（預設）或 `"daily"`，決定版面用語與期間標籤。
 
     Returns:
         完整、樣式內嵌的 HTML 字串（可直接存檔或作為 email HTML 內文寄送）。
     """
     agent_payload = agent_payload or {}
+    labels = _REPORT_LABELS.get(report_type)
+    if labels is None:
+        logger.warning("report_type=%r 不是合法值，退回 weekly 用語", report_type)
+        labels = _REPORT_LABELS["weekly"]
+        report_type = "weekly"
+    period_word = labels["period_word"]
+
     actions_index = _index_actions(agent_payload)
 
     new_findings = [
@@ -446,6 +559,14 @@ def render_weekly_html(data: dict[str, Any], agent_payload: dict[str, Any] | Non
     ]
     resolved_findings = [_present_resolved_finding(f) for f in data["resolved_findings"]]
 
+    # observe 級觀察名單：agent 的 actions 刻意不比對進來。actions 對應的是
+    # 需要有人行動的事項，而 observe 的定義就是「還不需要行動」；讓 agent
+    # 的建議文字掛到觀察名單上，等於從側門把它變回待辦清單。
+    observations = (
+        [_present_observation(o, "new") for o in data.get("new_observations") or []]
+        + [_present_observation(o, "tracking") for o in data.get("tracking_observations") or []]
+    )
+
     if actions_index:
         logger.warning("agent_payload 有 %d 筆 actions 對應不到任何未結案事項，已忽略：%s",
                         len(actions_index), list(actions_index.keys()))
@@ -455,7 +576,7 @@ def render_weekly_html(data: dict[str, Any], agent_payload: dict[str, Any] | Non
         logger.warning("agent_payload verdict=%r 不是合法值，退回依統計數字判定", verdict)
         verdict = _infer_verdict(data)
 
-    headline = (agent_payload.get("headline") or "").strip() or _fallback_headline(data)
+    headline = (agent_payload.get("headline") or "").strip() or _fallback_headline(data, period_word)
 
     notes_raw = (agent_payload.get("notes") or "").strip()
     notes_paragraphs = [p.strip() for p in notes_raw.split("\n\n") if p.strip()] if notes_raw else []
@@ -465,27 +586,37 @@ def render_weekly_html(data: dict[str, Any], agent_payload: dict[str, Any] | Non
         {"cls": "c", "value": str(s["err_count"]), "label": "嚴重"},
         {"cls": "w", "value": str(s["warn_count"]), "label": "需關注"},
         {"cls": "", "value": str(s["tracking_count"]), "label": "追蹤中"},
-        {"cls": "g", "value": str(s["resolved_count"]), "label": "本週已解決"},
+        {"cls": "g", "value": str(s["resolved_count"]), "label": f"{period_word}已解決"},
         {"cls": "", "value": _fmt_pct(data["coverage"]["header_ratio"]), "label": "資料涵蓋率"},
     ]
 
     ctx = {
-        "period_label": _period_label(data["period_start"], data["period_end"]),
+        "doc_title": labels["doc_title"],
+        "period_word": period_word,
+        "this_report": labels["this_report"],
+        "period_label": _period_label(data["period_start"], data["period_end"], report_type),
         "verdict": verdict,
         "verdict_label": VERDICT_LABELS.get(verdict, verdict),
         "headline": headline,
         "stat_tiles": stat_tiles,
         "quality": _present_quality(
             data["coverage"], data["coverage_gaps"], data.get("ingestion_audit") or {},
+            period_word, labels["this_report"],
         ),
         "new_findings": new_findings,
         "tracking_findings": tracking_findings,
         "resolved_findings": resolved_findings,
+        "observations": observations,
+        "observation_summary": _observation_summary(
+            data.get("observations_by_device") or {}, len(observations),
+        ),
+        "scope_label": (data.get("scope") or {}).get("label") or "",
         "notes_paragraphs": notes_paragraphs,
         "generated_at_label": _fmt_datetime(datetime.now(timezone.utc)),
     }
 
-    logger.info("週報 HTML 渲染完成：verdict=%s 新發現=%d 追蹤中=%d 已解決=%d",
-                verdict, len(new_findings), len(tracking_findings), len(resolved_findings))
+    logger.info("%s HTML 渲染完成：verdict=%s 新發現=%d 追蹤中=%d 已解決=%d 觀察名單=%d",
+                labels["doc_title"], verdict, len(new_findings), len(tracking_findings),
+                len(resolved_findings), len(observations))
 
     return _template.render(**ctx)
