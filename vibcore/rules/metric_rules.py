@@ -257,29 +257,129 @@ def iso_zone(ctx: RuleContext) -> RuleOutcome:
 @register('VEL_HIGH')
 def vel_high(ctx: RuleContext) -> RuleOutcome:
     """
-    velOA 相對基準超過 `sigma`（預設 3.0）個標準差。
+    velOA 相對基準偏高，門檻依 `threshold_mode` 參數擇一：
 
-    只判「偏高」方向——σ 為負代表比基準低，不是本規則要抓的現象。
+    - `'iso'`（**預設**）：門檻錨定到 ISO 10816/20816「告警值該怎麼訂」
+      的原則——告警值 = 基準值 + 0.25 × 該設備 ISO 機械等級的 Zone B
+      上限，且不超過 1.25 × Zone B 上限（封頂）。公式實作於
+      `vibcore.metrics.iso.iso_alert_threshold`，**該原則本身是使用者對
+      條文精神的理解、待日後核對條文原文，不是確定的條文引用**，
+      docstring 與輸出文字都不得寫成「ISO 標準規定……」。
+      Zone 邊界表定義在 velRMS 上（`iso.ISO_THRESHOLDS`），本規則借用
+      同一份 Zone 寬度換算到 velOA 的基準值上——兩者都是已驗證定義的
+      合成值時域純量（見 `config.py` 對 `AGG_SPEC` 的說明），但畢竟是
+      不同量測欄位，借用 Zone 寬度是有意的簡化，不是宣稱 velOA 本身
+      就在 ISO 10816/20816 的分級體系內。
+    - `'sigma'`：原本「相對基準 N 個標準差」的判定，保留作為對照組，
+      供尚未信任 ISO 錨定門檻、或想在敏感度掃描中並列比較的情境使用。
+
+    **這個做法要解決的問題**：原本的 σ 門檻是我們自己訂的一個數字，
+    工程師問「這個數字哪來的」答不出來；調整 σ 高低也只是把件數等比例
+    縮放，不是真的讓門檻更合理。改成 Zone 寬度後，門檻變成**設備等級的
+    函數**——大機器（Zone 較寬）本來就容許較大振動，小機器（Zone 較窄）
+    本來就該抓得更緊，用同一個 σ 對待大小機器並不合理，這件事 Zone 寬度
+    天生就反映了；而且係數的出處是國際標準的分級架構，不是我們憑經驗
+    訂出來的統計量。
+
+    **未分級設備的處理（重要）**：`'iso'` 模式仰賴
+    `iso_mod.evaluate_iso()` 判斷 Zone 邊界是否可用；未分級設備
+    （`applicable is False`，對應 `iso_class_source == 'unset'`）沒有
+    Zone 邊界可查，此時**自動退回 `'sigma'` 模式**，並在 evidence 的
+    `threshold_mode` 欄位如實標記為 `'sigma_fallback'`（不是安靜地假裝
+    照 iso 模式判定完畢）——若未分級時直接不判定，等於讓沒填 ISO 等級的
+    設備完全失去 VEL_HIGH 監測，比退回相對基準判定更糟，也違反本系統
+    「篩選優先於精確」的定位。
+
+    只判「偏高」方向——不論哪種模式，低於門檻（含比基準低）都不是本規則
+    要抓的現象。
     """
     if ctx.baseline is None:
         logger.debug(f"VEL_HIGH：point={ctx.point_id} 尚無基準期，無法判定")
         return RuleOutcome.no_trigger('VEL_HIGH', 'vel_high', 'oscillating')
 
-    stat = ctx.baseline.stats.get('vel_oa')
+    requested_mode = str(ctx.params.get('threshold_mode', 'iso')).lower()
+    if requested_mode not in ('iso', 'sigma'):
+        logger.warning(f"VEL_HIGH：threshold_mode={requested_mode!r} 不合法，改用預設 iso")
+        requested_mode = 'iso'
+
+    # 判定用的欄位隨模式而異，這不是隨意的選擇：
+    #
+    # ISO 10816/20816 的 Zone 邊界是定義在**速度 RMS**（10–1000 Hz）上的。
+    # 拿那些邊界去比 velOA 不是同一個量——實測三台設備
+    # velOA/velRMS 穩定落在 0.74~0.76（ZP 3-5 0.743、CP 10 0.764、
+    # AHU-601 0.756，CV 僅 0.001~0.025），也就是說用 velOA 比對 RMS 邊界，
+    # 實際上要振動高出約三分之一才會觸發，門檻被悄悄放鬆了。
+    #
+    # 另一個理由是一致性：ISO_ZONE 規則判的就是 vel_rms。同一套 Zone
+    # 邊界在兩條規則上用不同的量，兩者遲早會互相矛盾。
+    #
+    # sigma 模式是純相對判定，與 ISO 分級體系無關，維持原本的 vel_oa
+    # 不變（改動它會讓既有校準結果無法比較）。
+    metric = 'vel_rms' if requested_mode == 'iso' else 'vel_oa'
+
+    stat = ctx.baseline.stats.get(metric)
     if stat is None:
-        logger.debug(f"VEL_HIGH：point={ctx.point_id} 基準期缺少 vel_oa 統計量")
+        logger.debug(f"VEL_HIGH：point={ctx.point_id} 基準期缺少 {metric} 統計量")
         return RuleOutcome.no_trigger('VEL_HIGH', 'vel_high', 'oscillating')
 
-    current = _latest_ok_value(ctx, 'vel_oa')
+    current = _latest_ok_value(ctx, metric)
     if current is None:
-        logger.debug(f"VEL_HIGH：point={ctx.point_id} 無可用（ok）的 vel_oa 資料")
+        logger.debug(f"VEL_HIGH：point={ctx.point_id} 無可用（ok）的 {metric} 資料")
         return RuleOutcome.no_trigger('VEL_HIGH', 'vel_high', 'oscillating')
 
     sigma_th = float(ctx.params.get('sigma', 3.0))
     sigma = stat.sigma_of(current)
-    triggered = sigma >= sigma_th
+
+    machine_class = None
+    bc_boundary = None
+    iso_cap = None
+    iso_threshold = None
+    mode = requested_mode
+
+    if requested_mode == 'iso':
+        iso_result = iso_mod.evaluate_iso(ctx.agg, ctx.device, ctx.baseline)
+        if not iso_result.applicable:
+            # 未分級：沒有 Zone 邊界可用，退回 sigma 而非不判定（見上方 docstring）。
+            logger.debug(f"VEL_HIGH：point={ctx.point_id} 未分級（{iso_result.class_source}），"
+                         "自動退回 sigma 模式")
+            mode = 'sigma_fallback'
+        else:
+            machine_class = iso_result.machine_class
+            bc_boundary = iso_mod.ISO_THRESHOLDS[machine_class]['bc']
+            iso_cap = 1.25 * bc_boundary
+            iso_threshold = iso_mod.iso_alert_threshold(stat.median, machine_class)
+
+    if mode == 'iso':
+        triggered = iso_threshold is not None and current >= iso_threshold
+    else:  # 'sigma' 或 'sigma_fallback'
+        triggered = sigma >= sigma_th
+
     if not triggered:
         return RuleOutcome.no_trigger('VEL_HIGH', 'vel_high', 'oscillating')
+
+    if mode == 'iso':
+        title = '速度整體值超過 ISO 錨定告警門檻'
+        detail = (f'最近一次量測 velRMS = {current:.3f} mm/s，'
+                   f'依機械等級 {machine_class} 的 ISO 10816/20816 Zone 邊界換算，'
+                   f'告警門檻為 {iso_threshold:.3f} mm/s'
+                   f'（基準期中位數 {stat.median:.3f} + 0.25 × Zone B 上限 {bc_boundary:.2f}，'
+                   f'封頂 {iso_cap:.2f}），已達或超過。')
+        interpretation_limit = (
+            '本判定的告警門檻依 ISO 10816/20816 告警設定原則（基準值加計 Zone B 上限一定比例、'
+            '並設封頂）換算而來，該原則為使用者對條文精神的理解，尚待核對條文原文，'
+            '正式引用前不應視為確定的標準文字；本判定僅反映整體振動速度是否超過此換算位準，'
+            '不涉及特定成因判別，亦未與其他指標交叉比對，建議參考同一量測點的其他指標'
+            '並視情況安排複測。'
+        )
+    else:
+        note = '（設備未分級，自動退回相對基準判定）' if mode == 'sigma_fallback' else ''
+        title = '速度整體值相對基準偏高'
+        detail = (f'最近一次量測 {metric} = {current:.3f} mm/s，相對基準期中位數 '
+                   f'{stat.median:.3f} mm/s 高出 {sigma:.1f}σ（門檻 {sigma_th:.1f}σ）{note}。')
+        interpretation_limit = (
+            '本判定僅反映整體振動速度相對該量測點自身歷史基準的統計偏離，不涉及特定成因判別，'
+            '亦未與其他指標交叉比對；建議參考同一量測點的其他指標並視情況安排複測。'
+        )
 
     return RuleOutcome(
         triggered=True,
@@ -287,19 +387,22 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
         issue_type='vel_high',
         family='oscillating',
         severity='warn',
-        title='速度整體值相對基準偏高',
-        detail=(f'最近一次量測 velOA = {current:.3f} mm/s，相對基準期中位數 '
-                f'{stat.median:.3f} mm/s 高出 {sigma:.1f}σ（門檻 {sigma_th:.1f}σ）。'),
-        interpretation_limit=(
-            '本判定僅反映整體振動速度相對該量測點自身歷史基準的統計偏離，不涉及特定成因判別，'
-            '亦未與其他指標交叉比對；建議參考同一量測點的其他指標並視情況安排複測。'
-        ),
+        title=title,
+        detail=detail,
+        interpretation_limit=interpretation_limit,
         current_value=current,
         baseline_value=stat.median,
         value_unit='mm/s',
         evidence={
+            'threshold_mode': mode,               # 實際採用的模式：iso | sigma | sigma_fallback
+            'requested_mode': requested_mode,      # 呼叫端原本要求的模式
+            'iso_threshold_mm_s': round(iso_threshold, 3) if iso_threshold is not None else None,
+            'bc_boundary_mm_s': bc_boundary,
+            'iso_cap_mm_s': iso_cap,
+            'machine_class': machine_class,
             'sigma': round(sigma, 2),
             'sigma_threshold': sigma_th,
+            'baseline_median': stat.median,
             'baseline_std': stat.std,
             'baseline_n': stat.n,
         },
@@ -335,6 +438,42 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
     這樣當基準期沒有逐軸統計量時（見下），逐軸通道恆為不觸發，整條規則
     會自然退化成加入逐軸通道之前的原始行為，不需要另外分支。
 
+    **kurtosis 絕對值判準（`threshold_mode` 參數，`'convention'` 預設 /
+    `'sigma'` 原行為）**：
+
+    accKURT 是 Pearson 定義的峰度，常態分布下為 3。業界常以
+    **kurtosis > 4** 作為「訊號中出現明顯衝擊成分」的經驗判準——**這是
+    業界慣例，不是正式標準**，與 `VEL_HIGH` 錨定的 ISO 10816/20816 分級
+    架構性質不同，不應在文件或輸出文字中稱其為標準。
+
+    `threshold_mode='convention'`（預設）時，凡涉及 kurtosis 的判定
+    （合成 `acc_kurt` 與逐軸 `acc_kurt_axis_max`）都改成**絕對值門檻與
+    相對基準 σ 門檻同時滿足才算該通道上升**（AND，不是原本的 OR/單一
+    判定）：
+    - 絕對值門檻：`kurt_absolute`（預設 4.0），kurtosis 絕對值超過此值
+    - 相對值門檻：原本的 `kurt_sigma` / `kurt_axis_sigma`
+
+    **為什麼要 AND 而不是只看其中一項**：
+    - 只看相對值（原行為）：一台本來就很安靜的機器（基準期 kurtosis
+      可能只有 3.1、3.2），只要微幅上升就能湊到 3σ，但 kurtosis 3.2
+      在物理上根本稱不上有衝擊——σ 判定在這種情況下把「雜訊等級的
+      波動」放大成告警。
+    - 只看絕對值：忽略了「這對這台機器而言是不是異常」，跨機台比較時
+      會失去個體基準的意義，且絕對值本身只是業界慣例，單獨作為觸發
+      條件說服力不足。
+    - 兩者同時滿足，才代表「這台機器目前的峰度已經到了業界認定有衝擊
+      成分的量級，而且相對它自己的過去也是顯著上升」——兩種依據互補，
+      任一項單獨都不足以支撐告警。
+
+    `crest`（波峰因子）**維持原本純 σ 判定，不套用絕對值門檻**：業界
+    對 crest factor 沒有提供類似「> 4」這樣普遍公認的經驗數值，本次
+    只找到 kurtosis 的業界慣例，故不虛構一個 crest 的絕對值門檻；
+    這是本次改動刻意的不對稱，不是遺漏。
+
+    `threshold_mode='sigma'` 時，kurtosis 判定完全恢復成加入絕對值門檻
+    之前的行為（純 σ 判定，`kurt_absolute` 不生效），供敏感度掃描與
+    `'convention'` 模式並列比較。
+
     參數（沿用既有的 `crest_sigma` 命名風格）：
     - `crest_sigma`（預設 2.5）：合成 accCREST 的 σ 門檻
     - `kurt_sigma`（預設 2.5）：合成 accKURT 的 σ 門檻
@@ -343,8 +482,12 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
       （與 crest_axis_sigma 給同一預設值，是因為目前沒有證據支持逐軸
       kurt 比合成值更敏感或更不敏感——見上方 ZP 3-5 的反例，故不預設
       偏鬆或偏緊，留給使用端依實際資料校準）
+    - `kurt_absolute`（建議預設 4.0）：kurtosis 絕對值判準，見上
+    - `threshold_mode`（`'convention'` 預設 / `'sigma'`）：見上
     - `require_both`（預設 False）：語意同原本，只是分別套用在合成與
-      逐軸兩個通道上（見上）
+      逐軸兩個通道上（見上）；與 `kurt_absolute` 的 AND 是兩層不同的
+      條件——`require_both` 決定「crest 與 kurt 是否都要上升」，
+      `kurt_absolute` 只影響「kurt 這一項本身怎麼算作上升」
 
     基準期缺少 `acc_crest_axis_max` / `acc_kurt_axis_max` 的統計量時
     （既有資料庫的基準期都是這種情況，因為這兩個聚合欄位是後來才加的），
@@ -360,13 +503,33 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
     crest_axis_th = float(ctx.params.get('crest_axis_sigma', 2.5))
     kurt_axis_th = float(ctx.params.get('kurt_axis_sigma', 2.5))
     require_both = bool(ctx.params.get('require_both', False))
+    kurt_absolute = float(ctx.params.get('kurt_absolute', 4.0))
+
+    mode = str(ctx.params.get('threshold_mode', 'convention')).lower()
+    if mode not in ('convention', 'sigma'):
+        logger.warning(f"IMPACT_RISE：threshold_mode={mode!r} 不合法，改用預設 convention")
+        mode = 'convention'
 
     crest_val, crest_stat, crest_sigma, crest_up = _sigma_channel(ctx, 'acc_crest', crest_th)
-    kurt_val, kurt_stat, kurt_sigma, kurt_up = _sigma_channel(ctx, 'acc_kurt', kurt_th)
+    kurt_val, kurt_stat, kurt_sigma, kurt_sigma_up = _sigma_channel(ctx, 'acc_kurt', kurt_th)
     crest_axis_val, crest_axis_stat, crest_axis_sigma, crest_axis_up = \
         _sigma_channel(ctx, 'acc_crest_axis_max', crest_axis_th)
-    kurt_axis_val, kurt_axis_stat, kurt_axis_sigma, kurt_axis_up = \
+    kurt_axis_val, kurt_axis_stat, kurt_axis_sigma, kurt_axis_sigma_up = \
         _sigma_channel(ctx, 'acc_kurt_axis_max', kurt_axis_th)
+
+    # kurtosis 絕對值判準：'convention' 模式下，σ 上升與絕對值超標要
+    # 同時成立才算該通道上升；'sigma' 模式維持原本純 σ 判定（見 docstring）。
+    # kurt_val/kurt_axis_val 為 None（無資料/無基準統計量）時 abs() 判定
+    # 直接視為 False，與 `_sigma_channel` 對缺資料通道「視為不可用」的
+    # 既有慣例一致，不需要另外特判。
+    kurt_abs_up = kurt_val is not None and abs(kurt_val) > kurt_absolute
+    kurt_axis_abs_up = kurt_axis_val is not None and abs(kurt_axis_val) > kurt_absolute
+    if mode == 'convention':
+        kurt_up = kurt_sigma_up and kurt_abs_up
+        kurt_axis_up = kurt_axis_sigma_up and kurt_axis_abs_up
+    else:
+        kurt_up = kurt_sigma_up
+        kurt_axis_up = kurt_axis_sigma_up
 
     if all(s is None for s in (crest_sigma, kurt_sigma, crest_axis_sigma, kurt_axis_sigma)):
         logger.debug(f"IMPACT_RISE：point={ctx.point_id} 無可用的衝擊性指標資料或基準統計量")
@@ -381,7 +544,9 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
 
     # 挑 σ 最大者作為呈現用的主要數值（不代表「哪個更重要」，只是取較顯著者）。
     # 四個候選中缺資料/缺基準統計量的通道 sigma 為 None 已被濾掉；只剩合成
-    # 兩通道時，這一步與加入逐軸通道之前完全等價。
+    # 兩通道時，這一步與加入逐軸通道之前完全等價。注意這裡仍以 σ（不是
+    # kurt_absolute）挑主要數值——絕對值門檻只用來決定「算不算上升」，
+    # 不改變「哪個通道最顯著」的排序依據。
     candidates = [
         ('acc_crest', crest_val, crest_stat, crest_sigma),
         ('acc_kurt', kurt_val, kurt_stat, kurt_sigma),
@@ -409,6 +574,9 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
         detail += '僅逐軸最大值（三軸取大）超標、合成訊號未達門檻，衝擊可能集中在單一方向。'
     elif trigger_source == 'both':
         detail += '合成訊號與逐軸最大值同步超標，屬整體性變化。'
+    if mode == 'convention' and (kurt_up or kurt_axis_up):
+        detail += (f'峰度同時滿足相對基準上升與絕對值門檻（> {kurt_absolute:.1f}，'
+                   '業界慣例、非正式標準）兩項條件。')
 
     return RuleOutcome(
         triggered=True,
@@ -421,7 +589,8 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
         interpretation_limit=(
             '波峰因子（Crest）與峰度（Kurtosis）反映振動訊號中衝擊成分的強弱，兩者上升通常代表'
             '週期性衝擊事件增加，常見於軸承劣化、潤滑不足或機件鬆動等情況，'
-            '本系統無法區分具體成因；逐軸最大值可用於察覺衝擊是否集中在單一方向，'
+            '本系統無法區分具體成因；峰度另外採用業界慣用的絕對值判準（非正式標準），'
+            '須與相對基準的上升同時成立才計入判定；逐軸最大值可用於察覺衝擊是否集中在單一方向，'
             '但感測器可能貼錯方向，本系統刻意不保留是哪一軸，因此無法指出實際方向，'
             '仍建議安排專家量測系統複測以確認。'
         ),
@@ -429,6 +598,7 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
         baseline_value=primary_stat.median,
         value_unit=_unit(primary_metric),
         evidence={
+            'threshold_mode': mode,
             'primary_metric': primary_metric,
             'trigger_source': trigger_source,
             'crest_current': crest_val,
@@ -437,12 +607,15 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
             'kurt_current': kurt_val,
             'kurt_sigma': round(kurt_sigma, 2) if kurt_sigma is not None else None,
             'kurt_threshold_sigma': kurt_th,
+            'kurt_absolute_threshold': kurt_absolute,
+            'kurt_absolute_exceeded': kurt_abs_up,
             'crest_axis_current': crest_axis_val,
             'crest_axis_sigma': round(crest_axis_sigma, 2) if crest_axis_sigma is not None else None,
             'crest_axis_threshold_sigma': crest_axis_th,
             'kurt_axis_current': kurt_axis_val,
             'kurt_axis_sigma': round(kurt_axis_sigma, 2) if kurt_axis_sigma is not None else None,
             'kurt_axis_threshold_sigma': kurt_axis_th,
+            'kurt_axis_absolute_exceeded': kurt_axis_abs_up,
             'require_both': require_both,
         },
     )

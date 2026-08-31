@@ -404,13 +404,25 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      '{"alert_zone":"C"}',
      'velRMS 對照機械等級的 Zone A/B/C/D；未分級設備不套用'),
     ('VEL_HIGH',           '速度整體值偏高',   'oscillating', 'vel_high',         'warn',
-     '{"sigma":3.0}',
+     -- threshold_mode='iso'：門檻 = 基準 + 0.25 × Zone B 上限（封頂 1.25 倍），
+     --   隨機械等級而異，來源是國際標準的分級架構而非我們自訂的統計量。
+     --   注意 iso 模式判的是 velRMS——Zone 邊界就是定義在速度 RMS 上，
+     --   拿去比 velOA（實測約為 velRMS 的 0.75 倍）會讓門檻悄悄鬆掉三分之一。
+     --   設備未分級時自動退回 sigma，並在 evidence 標記 sigma_fallback。
+     -- sigma 保留為對照組，供敏感度掃描並列比較。
+     '{"threshold_mode":"iso","sigma":3.0}',
      'velOA 相對基準超過 N 個標準差'),
     ('IMPACT_RISE',        '衝擊性指標上升',   'monotonic',   'impact_rise',      'warn',
      -- 逐軸門檻與合成值同量級：實測 crest 是逐軸較大、kurt 反而是合成
      -- 較大（見 docs/DATA_CONTRACT.md §3.3），沒有證據支持哪一邊該偏鬆，
      -- 故給相同預設值。
-     '{"crest_sigma":2.5,"kurt_sigma":2.5,'
+     -- kurt_absolute=4.0：accKURT 是 Pearson 定義，常態分布為 3，業界慣以
+     --   超過 4 視為訊號中出現衝擊成分。這是業界通則不是正式標準。
+     --   與 σ 判定取 AND：純相對判定會讓本來就安靜的機器因微幅上升就告警，
+     --   而 kurtosis 3.2 在物理上根本不算有衝擊。
+     --   crest 沒有對應的公認經驗值，故僅 kurtosis 套用絕對門檻。
+     '{"threshold_mode":"convention","kurt_absolute":4.0,'
+     '"crest_sigma":2.5,"kurt_sigma":2.5,'
      '"crest_axis_sigma":2.5,"kurt_axis_sigma":2.5,"require_both":false}',
      'accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
     ('DEGRADE_TREND',      '指標持續劣化',     'monotonic',   'degradation_trend','observe',

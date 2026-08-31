@@ -83,6 +83,58 @@ def classify_zone(vel_rms: float | None, machine_class: str | None) -> str | Non
     return 'D'
 
 
+def iso_alert_threshold(baseline_value: float | None, machine_class: str | None) -> float | None:
+    """
+    依 ISO 10816/20816 對「告警值該怎麼訂」的原則，把該量測點的基準值換算成
+    一個錨定到 Zone 寬度的告警絕對值，供 `metric_rules.py` 的 `VEL_HIGH`
+    在 `threshold_mode='iso'` 時使用。
+
+    **待核對**：以下公式是使用者對 ISO 10816/20816 告警設定原則的理解，
+    我方無法查證條文原文，因此在能拿到標準文件核對之前，**不得**把它
+    寫成「ISO 標準規定……」這樣的確定語氣，只能陳述為「依此理解換算」。
+    公式與係數（0.25 / 1.25）都可能之後被核對後修正。
+
+    公式：
+        告警值 = 基準值 + 0.25 × Zone B 上限（bc_boundary）
+        且告警值不超過 1.25 × Zone B 上限（封頂）
+
+    Zone B 上限（即 `ISO_THRESHOLDS[machine_class]['bc']`）取自
+    `db/schema.sql` 的 `iso_threshold` seed，是本函式唯一的外部依據來源；
+    機械等級是設備等級（馬力/基礎剛性）的代理變數，Zone 越寬代表該等級
+    設備本來就容許越大的振動，門檻因此隨設備等級自動縮放，不是我們對
+    全廠設備套同一個統計倍數。
+
+    以 Class II（bc=2.80）、基準 0.45 mm/s 為例：
+    告警 = 0.45 + 0.25×2.80 = 1.15 mm/s（未觸及封頂 1.25×2.80=3.50）。
+
+    Args:
+        baseline_value: 該量測點在基準期的代表值（呼叫端通常傳中位數）。
+        machine_class: 'I' | 'II' | 'III' | 'IV'；不在 `ISO_THRESHOLDS`
+            中（含 None，對應未分級設備）一律回傳 None。
+
+    Returns:
+        告警門檻絕對值（與 `baseline_value` 同單位）；`machine_class`
+        無法識別或 `baseline_value` 缺值時回傳 None——**不是** 0 或其他
+        預設值，呼叫端必須自行決定「算不出門檻」時要不要退回其他判定
+        方式（`VEL_HIGH` 的做法是退回 sigma 模式，見 metric_rules.py）。
+    """
+    if machine_class not in ISO_THRESHOLDS:
+        return None
+    if baseline_value is None:
+        return None
+    try:
+        b = float(baseline_value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(b):
+        return None
+
+    bc = ISO_THRESHOLDS[machine_class]['bc']
+    raw = b + 0.25 * bc
+    cap = 1.25 * bc
+    return min(raw, cap)
+
+
 def _latest_ok_vel_rms(agg: pd.DataFrame) -> float | None:
     """取最近一筆 `data_status == 'ok'` 的 velRMS，作為「目前」水準。"""
     if agg is None or agg.empty or 'vel_rms' not in agg.columns:

@@ -50,14 +50,22 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             description='velRMS 對照機械等級的 Zone A/B/C/D；未分級設備不套用'),
         RuleConfigRow(
             'VEL_HIGH', '速度整體值偏高', 'oscillating', 'vel_high', 'warn',
-            {'sigma': 3.0},
+            # threshold_mode='iso' 的門檻隨機械等級而異（Class I~IV 分別是
+            # 0.90 / 1.15 / 1.58 / 2.23 mm/s，以基準 0.45 計），來源是國際
+            # 標準的分級架構。iso 模式判 velRMS——Zone 邊界定義在速度 RMS
+            # 上，比 velOA 會讓門檻鬆掉三分之一。
+            {'threshold_mode': 'iso', 'sigma': 3.0},
             description='velOA 相對基準超過 N 個標準差'),
         RuleConfigRow(
             'IMPACT_RISE', '衝擊性指標上升', 'monotonic', 'impact_rise', 'warn',
             # 逐軸門檻與合成值同量級：沒有證據支持逐軸 kurt 比合成值更敏感
             # 或更不敏感（實測 crest 是逐軸較大、kurt 反而是合成較大），
             # 故不預設偏鬆或偏緊。
-            {'crest_sigma': 2.5, 'kurt_sigma': 2.5,
+            # kurt_absolute=4.0 是業界通則（Pearson kurtosis 常態為 3），
+            # 與 σ 取 AND：kurtosis 3.2 在物理上不算有衝擊，不該只因為
+            # 相對基準上升就告警。crest 沒有對應的公認經驗值故不設絕對門檻。
+            {'threshold_mode': 'convention', 'kurt_absolute': 4.0,
+             'crest_sigma': 2.5, 'kurt_sigma': 2.5,
              'crest_axis_sigma': 2.5, 'kurt_axis_sigma': 2.5,
              'require_both': False},
             description='accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
