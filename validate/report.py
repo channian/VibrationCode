@@ -5,11 +5,12 @@ report.py — 把回測結果轉成人看得懂的報表
 
   coverage.csv               每台設備/量測點的資料涵蓋率
   gaps.csv                   斷線／資料不全區段清單，依時長排序
-  finding_stats_by_rule.csv  依規則的觸發統計（含 category 欄位）
-  finding_stats_by_device.csv 依設備的觸發統計
-  trigger_density.csv        每台設備每週觸發密度，依 RuleCategory 分開算
-                              （判斷會不會誤報洪水的關鍵表）
-  episodes_detail.csv        每一個觸發事件的明細（含 category 欄位）
+  finding_stats_by_rule.csv  依規則的觸發統計（含 category、severity、is_actionable 欄位）
+  finding_stats_by_device.csv 依設備的觸發統計（err/warn/observe 分開計數）
+  trigger_density.csv        每台設備每週觸發密度，依 RuleCategory × 是否進SLA
+                              兩個正交維度分開算（判斷會不會誤報洪水、
+                              以及會不會誤把觀察名單當工作量的關鍵表）
+  episodes_detail.csv        每一個觸發事件的明細（含 category、is_actionable 欄位）
   threshold_sensitivity.csv  門檻敏感度掃描（有跑掃描才會產生）
   summary.txt / summary.html 摘要
 
@@ -25,6 +26,17 @@ IT／儀電；其餘「設備狀態可能有變化」的規則，處置者是設
 密度」，數字會被資料可用性問題撐大，讓人誤以為設備普遍不穩定、進而
 誤判要加派工程師人力或調鬆振動門檻——但真正該處理的是感測器佈建。
 分類依據見 `vibcore.rules.engine.RULE_CATEGORY` 的說明。
+
+**分類（category）與嚴重度（severity）是兩個正交的維度，不能混為一談**：
+分類講的是「誰處置」（設備工程師 vs IT／儀電），嚴重度講的是「要不要
+派工」（`err`／`warn` 會建立 Finding、進 SLA、佔簽核產能；`observe` 只
+進週報觀察名單，不建立 Finding）。哪些規則是 `observe`、為什麼，見
+`vibcore.types` 的說明——本質上是「有沒有可引用的外部標準」：ISO 門檻、
+ISO 告警原則可以在被問「門檻哪來的」時答得出來，自訂的統計門檻（例如
+Mahalanobis 3σ）答不出來，用答不出來的數字派工會拖累整條簽核鏈的公信力。
+兩個維度因此都要各自呈現、各自小計，密度更要分開算——理由與 category
+分開算密度完全對稱：只要把「不算工作量」的件數併進「算工作量」的件數，
+無論是哪個維度上的併算，都會讓密度數字失真、誤導人力與門檻決策。
 """
 
 from __future__ import annotations
@@ -36,6 +48,7 @@ import os
 import pandas as pd
 
 from vibcore.rules.engine import RULE_CATEGORY, RuleCategory, rule_category
+from vibcore.types import SEVERITY_OBSERVE, is_actionable
 
 from validate.backtest import BacktestResult, span_weeks
 from validate.rule_defaults import RuleConfigRow
@@ -91,11 +104,26 @@ def _safe_write(path: str, writer, max_retry: int = 3) -> str:
     raise PermissionError(f"多次嘗試後仍無法寫入 {path}（或其備用檔名）")
 
 
+def _ensure_actionable_col(episodes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    補上 `is_actionable` 欄位（若缺）。
+
+    `backtest.py` 已經在事件層算好這欄，正常情況下不會缺；這裡重算只是
+    防呆——避免上游漏接或呼叫端自己組了一份 episodes_df 時，報表整批
+    因為 KeyError 而生不出來，而是安靜地用同一套判準補上。
+    """
+    if 'is_actionable' in episodes_df.columns:
+        return episodes_df
+    df = episodes_df.copy()
+    df['is_actionable'] = df['severity'].map(is_actionable)
+    return df
+
+
 def _finding_stats_by_rule(episodes_df: pd.DataFrame,
                             rule_configs: dict[str, RuleConfigRow]) -> pd.DataFrame:
     active_rules = pd.DataFrame([
         {'rule_code': r.rule_code, 'rule_name': r.rule_name, 'family': r.family, 'severity': r.severity,
-         'category': rule_category(r.rule_code)}
+         'is_actionable': is_actionable(r.severity), 'category': rule_category(r.rule_code)}
         for r in rule_configs.values() if r.is_active
     ])
     if episodes_df.empty:
@@ -131,6 +159,9 @@ def _finding_stats_by_device(episodes_df: pd.DataFrame, result: BacktestResult) 
         base['n_episodes'] = 0
         base['n_err'] = 0
         base['n_warn'] = 0
+        # observe 級不建立 Finding，但仍要在這張表算清楚——否則
+        # n_err + n_warn 會少於 n_episodes，看報表的人會以為算錯了
+        base['n_observe'] = 0
         base['n_distinct_rules'] = 0
         return base
 
@@ -138,10 +169,11 @@ def _finding_stats_by_device(episodes_df: pd.DataFrame, result: BacktestResult) 
         n_episodes=('device_id', 'size'),
         n_err=('severity', lambda s: int((s == 'err').sum())),
         n_warn=('severity', lambda s: int((s == 'warn').sum())),
+        n_observe=('severity', lambda s: int((s == SEVERITY_OBSERVE).sum())),
         n_distinct_rules=('rule_code', 'nunique'),
     ).reset_index()
     out = base.merge(g, on='device_id', how='left')
-    for col in ('n_episodes', 'n_err', 'n_warn', 'n_distinct_rules'):
+    for col in ('n_episodes', 'n_err', 'n_warn', 'n_observe', 'n_distinct_rules'):
         out[col] = out[col].fillna(0).astype(int)
     return out.sort_values('n_episodes', ascending=False).reset_index(drop=True)
 
@@ -167,70 +199,118 @@ def _device_span_weeks(result: BacktestResult) -> dict[str, float]:
     return {d: span_weeks(lo, hi) for d, (lo, hi) in spans.items()}
 
 
-def _finding_stats_by_device_category(episodes_df: pd.DataFrame, result: BacktestResult) -> pd.DataFrame:
+#: `_finding_stats_by_device_breakdown` 展開的四個象限（category × 是否
+#: 進 SLA）欄名，供該函式與 `_trigger_density` 共用，避免兩處欄名各寫
+#: 一次而漂移
+_BREAKDOWN_COUNT_COLS = [
+    'n_equipment_sla', 'n_equipment_observe',
+    'n_data_availability_sla', 'n_data_availability_observe',
+]
+
+
+def _finding_stats_by_device_breakdown(episodes_df: pd.DataFrame, result: BacktestResult) -> pd.DataFrame:
     """
-    每台設備依 `RuleCategory` 分開的觸發次數——密度必須分開算（見模組
-    docstring），所以在合計之前就要先把「這台設備這次回測期間各分類
-    各觸發幾件」拆出來，供 `_trigger_density` 使用。
+    每台設備依「分類（誰處置）× 是否進 SLA（要不要派工）」兩個正交維度
+    拆出的觸發次數——這兩個維度都各自影響密度該怎麼算（見模組
+    docstring），所以在合計之前就要先把「這台設備這次回測期間，四個
+    象限各觸發幾件」拆出來，供 `_trigger_density` 使用。
+
+    目前資料可用性類的規則清一色是 err/warn（見
+    `vibcore.rules.engine.RULE_CATEGORY` 與 `validate.rule_defaults`），
+    `n_data_availability_observe` 因此恆為 0；仍保留這一欄是為了將來
+    某條資料可用性規則也被降為 observe 時，這裡不必跟著改。
     """
     all_devices = sorted({pc.point.device.device_id for pc in result.point_contexts})
     device_names = {pc.point.device.device_id: pc.point.device.device_name for pc in result.point_contexts}
     base = pd.DataFrame({'device_id': all_devices})
     base['device_name'] = base['device_id'].map(device_names)
-    base['n_equipment'] = 0
-    base['n_data_availability'] = 0
+    for col in _BREAKDOWN_COUNT_COLS:
+        base[col] = 0
 
     if episodes_df.empty:
         return base
 
-    df = episodes_df.copy()
+    df = _ensure_actionable_col(episodes_df).copy()
     df['category'] = df['rule_code'].map(rule_category)
-    g = (df.groupby(['device_id', 'category']).size().unstack(fill_value=0)
-         .reindex(columns=[RuleCategory.EQUIPMENT, RuleCategory.DATA_AVAILABILITY], fill_value=0)
-         .rename(columns={RuleCategory.EQUIPMENT: 'n_equipment',
-                          RuleCategory.DATA_AVAILABILITY: 'n_data_availability'})
+    bucket_map = {
+        (RuleCategory.EQUIPMENT, True): 'n_equipment_sla',
+        (RuleCategory.EQUIPMENT, False): 'n_equipment_observe',
+        (RuleCategory.DATA_AVAILABILITY, True): 'n_data_availability_sla',
+        (RuleCategory.DATA_AVAILABILITY, False): 'n_data_availability_observe',
+    }
+    df['bucket'] = list(zip(df['category'], df['is_actionable']))
+    df['bucket'] = df['bucket'].map(bucket_map)
+    g = (df.groupby(['device_id', 'bucket']).size().unstack(fill_value=0)
+         .reindex(columns=_BREAKDOWN_COUNT_COLS, fill_value=0)
          .reset_index())
-    out = base.drop(columns=['n_equipment', 'n_data_availability']).merge(g, on='device_id', how='left')
-    for col in ('n_equipment', 'n_data_availability'):
+    out = base.drop(columns=_BREAKDOWN_COUNT_COLS).merge(g, on='device_id', how='left')
+    for col in _BREAKDOWN_COUNT_COLS:
         out[col] = out[col].fillna(0).astype(int)
     return out
 
 
 def _trigger_density(episodes_df: pd.DataFrame, result: BacktestResult) -> pd.DataFrame:
     """
-    每台設備每週觸發密度——**判斷會不會誤報洪水的關鍵指標**。
+    每台設備每週觸發密度——**判斷會不會誤報洪水、以及會不會誤把「觀察
+    名單」當成「工作量」的關鍵指標**。
 
     分母是**該設備自己**的觀測期間（週），分子是該設備的事件數；沒有
     觸發過的設備也要出現在表裡（值為 0），否則平均值會被「有問題的設備」
     帶偏，看不出真實的全廠負荷。
 
-    **`equipment_per_week` 與 `data_availability_per_week` 分開算、不合併
-    成單一密度**：兩者處置者不同（設備工程師 vs IT／儀電），合併計算會
-    讓佔比常過半的資料可用性問題把「工程師該擔心的密度」灌爆（見模組
-    docstring）。`episodes_per_week` 仍保留原本的合計密度，供想看整體
-    告警量的人參考，但校準振動門檻、估算工程師工作量請用
-    `equipment_per_week`。
+    密度依兩個正交維度分開算，一律不合併成單一數字：
+
+    - **分類（category）**：`equipment_*` 與 `data_availability_*` 分開，
+      因為處置者不同（設備工程師 vs IT／儀電），合併會讓佔比常過半的
+      資料可用性問題把「工程師該擔心的密度」灌爆。
+    - **是否進 SLA（is_actionable）**：`*_sla` 與 `*_observe` 分開，因為
+      只有進 SLA 的件數會建立 Finding、佔用簽核產能，才代表工程師的
+      實際工作量；observe 級只是列進週報觀察名單（見 `vibcore.types`
+      對 `SEVERITY_OBSERVE` 的說明），把它併進「工作量」一樣會讓數字
+      失真，效果與誤把資料可用性問題併進設備狀態密度完全一樣。
+
+    `equipment_sla_per_week` 才是**校準振動門檻、估算工程師工作量**唯一
+    該用的數字。`equipment_per_week`／`data_availability_per_week`／
+    `episodes_per_week` 仍保留原始合計密度供想看整體告警量／簽核產能佔用
+    量的人參考，但不可直接拿來估人力——合計裡混了不算工作量的 observe
+    件數。
     """
     device_weeks = _device_span_weeks(result)
-    by_device = _finding_stats_by_device_category(episodes_df, result)
+    by_device = _finding_stats_by_device_breakdown(episodes_df, result)
+    by_device['n_equipment'] = by_device['n_equipment_sla'] + by_device['n_equipment_observe']
+    by_device['n_data_availability'] = (by_device['n_data_availability_sla']
+                                         + by_device['n_data_availability_observe'])
     by_device['n_episodes'] = by_device['n_equipment'] + by_device['n_data_availability']
     by_device['span_weeks'] = by_device['device_id'].map(device_weeks).fillna(0.0).round(2)
 
     def _density(n: int, weeks: float) -> float:
         return round(n / weeks, 3) if weeks else 0.0
 
-    by_device['equipment_per_week'] = by_device.apply(
-        lambda r: _density(r['n_equipment'], r['span_weeks']), axis=1)
-    by_device['data_availability_per_week'] = by_device.apply(
-        lambda r: _density(r['n_data_availability'], r['span_weeks']), axis=1)
-    by_device['episodes_per_week'] = by_device.apply(
-        lambda r: _density(r['n_episodes'], r['span_weeks']), axis=1)
+    density_specs = [
+        ('n_equipment_sla', 'equipment_sla_per_week'),
+        ('n_equipment_observe', 'equipment_observe_per_week'),
+        ('n_equipment', 'equipment_per_week'),
+        ('n_data_availability_sla', 'data_availability_sla_per_week'),
+        ('n_data_availability_observe', 'data_availability_observe_per_week'),
+        ('n_data_availability', 'data_availability_per_week'),
+        ('n_episodes', 'episodes_per_week'),
+    ]
+    for n_col, density_col in density_specs:
+        by_device[density_col] = by_device.apply(
+            lambda r, n_col=n_col: _density(r[n_col], r['span_weeks']), axis=1)
 
-    cols = ['device_id', 'device_name', 'n_equipment', 'n_data_availability', 'n_episodes',
-            'span_weeks', 'equipment_per_week', 'data_availability_per_week', 'episodes_per_week']
-    # 依「設備狀態類」密度排序——那才是工程師要看、決定要不要調門檻或
-    # 加派人力的數字（見 `_build_summary_text` 的排行榜說明）
-    return by_device[cols].sort_values('equipment_per_week', ascending=False).reset_index(drop=True)
+    cols = ['device_id', 'device_name',
+            'n_equipment_sla', 'n_equipment_observe', 'n_equipment',
+            'n_data_availability_sla', 'n_data_availability_observe', 'n_data_availability',
+            'n_episodes', 'span_weeks',
+            'equipment_sla_per_week', 'equipment_observe_per_week', 'equipment_per_week',
+            'data_availability_sla_per_week', 'data_availability_observe_per_week',
+            'data_availability_per_week', 'episodes_per_week']
+    # 依「設備狀態類・進SLA」密度排序——那才是工程師要看、決定要不要調
+    # 門檻或加派人力的數字（見 `_build_summary_text` 的排行榜說明）；
+    # 全部都是 observe 的極端情況下這欄會全是 0，排序仍穩定（pandas 對
+    # 全等值的排序不拋例外，只是失去區分度，符合預期而非壞掉）。
+    return by_device[cols].sort_values('equipment_sla_per_week', ascending=False).reset_index(drop=True)
 
 
 def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConfigRow],
@@ -269,58 +349,90 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
                          f"{g['gap_start']} ～ {g['gap_end']}（{g['hours']:.0f} 小時）")
         lines.append('')
 
+    lines.append('-- 嚴重度分級說明 --')
+    lines.append('  observe 級是給「有偵測價值但沒有可引用的外部標準」的規則用的')
+    lines.append('  （本次為 STEP_CHANGE／AXIS_SHIFT／SPECTRAL_SHIFT／TEMP_RISE／DEGRADE_TREND）：')
+    lines.append('  只進本週報的觀察名單，不建立 Finding、不佔 SLA、不需簽核。下面統計裡這幾條')
+    lines.append('  規則觸發次數可能不少，但完全不算進「工作量」——這是設計如此，不是漏算。')
+    lines.append('')
+
     lines.append('-- Finding 觸發統計 --')
-    lines.append('  兩類處置者不同（見 vibcore.rules.engine.RULE_CATEGORY），分開列示、各自小計，')
-    lines.append('  不要把兩邊的次數加在一起當「觸發密度」看，否則會誤判設備狀態的嚴重程度。')
-    grand_total = 0
+    lines.append('  以下依兩個正交維度呈現：先依分類分區（見 vibcore.rules.engine.RULE_CATEGORY，')
+    lines.append('  決定「誰處置」），區內再依嚴重度標示、小計「進SLA」與「僅觀察」（決定')
+    lines.append('  「要不要派工」）。兩個維度都不要相加當單一數字看，否則會誤判嚴重程度或工作量。')
+    grand_sla = 0
+    grand_observe = 0
+    has_actionable_col = 'is_actionable' in stats_by_rule.columns
     for cat in (RuleCategory.EQUIPMENT, RuleCategory.DATA_AVAILABILITY):
         subset = stats_by_rule[stats_by_rule['category'] == cat] if 'category' in stats_by_rule.columns \
             else stats_by_rule.iloc[0:0]
-        subtotal = int(subset['n_episodes'].sum()) if not subset.empty else 0
-        grand_total += subtotal
+        if has_actionable_col:
+            sla_subset = subset[subset['is_actionable']]
+            observe_subset = subset[~subset['is_actionable']]
+        else:
+            sla_subset, observe_subset = subset, subset.iloc[0:0]
+        subtotal_sla = int(sla_subset['n_episodes'].sum()) if not sla_subset.empty else 0
+        subtotal_observe = int(observe_subset['n_episodes'].sum()) if not observe_subset.empty else 0
+        grand_sla += subtotal_sla
+        grand_observe += subtotal_observe
         lines.append('')
-        lines.append(f"  【{_CATEGORY_LABELS[cat]}】小計 {subtotal} 件")
+        lines.append(f"  【{_CATEGORY_LABELS[cat]}】小計 {subtotal_sla + subtotal_observe} 件"
+                     f"（進SLA {subtotal_sla} 件／僅觀察 {subtotal_observe} 件）")
         for _, r in subset.iterrows():
-            lines.append(f"    {r['rule_code']:20s} {r['rule_name']:14s} "
+            sla_label = '進SLA ' if r.get('is_actionable', True) else '僅觀察'
+            lines.append(f"    {r['rule_code']:20s} {r['rule_name']:14s} [{r['severity']:>7s}/{sla_label}] "
                          f"觸發 {int(r['n_episodes']):4d} 次　影響 {int(r['n_devices_affected']):3d} 台設備")
     lines.append('')
-    lines.append(f"  合計：{grand_total} 件")
+    lines.append(f"  合計：{grand_sla + grand_observe} 件（進SLA {grand_sla} 件／僅觀察 {grand_observe} 件）")
     lines.append('')
 
     lines.append('-- 觸發密度 --')
-    lines.append('  「設備狀態類」密度才是拿來校準振動門檻、估算工程師工作量的依據；')
-    lines.append('  「資料可用性類」密度反映的是感測器／通訊／量程等佈建品質，該處置的是')
-    lines.append('  IT／儀電，不能拿來加派工程師人力或調鬆振動門檻。')
+    lines.append('  只有「進SLA」的件數會建立 Finding、佔用簽核產能，才是工程師的實際工作量；')
+    lines.append('  「僅觀察」的件數只是列進週報觀察名單，沒有可引用的外部標準支撐，不該拿來')
+    lines.append('  估算人力或校準門檻（理由同上「嚴重度分級說明」）。「設備狀態類」與')
+    lines.append('  「資料可用性類」則因處置者不同（設備工程師 vs IT／儀電）分開列，同樣不可')
+    lines.append('  相加。合計欄仍保留，供想看整體告警量／簽核產能佔用量的人參考，但不可')
+    lines.append('  直接用於門檻校準或人力估算。')
     lines.append('')
-    lines.append('  前 10 高「設備狀態類」觸發密度（依此排序，工程師優先看這裡；')
-    lines.append('  同列附上同期資料可用性件數供對照）：')
-    for _, d in density.sort_values('equipment_per_week', ascending=False).head(10).iterrows():
-        lines.append(f"  {d['device_id']:15s} 設備狀態 {d['equipment_per_week']:.2f} 件/週"
-                     f"（{int(d['n_equipment'])} 件 / {d['span_weeks']:.1f} 週）"
+    lines.append('  前 10 高「設備狀態類・進SLA」觸發密度（依此排序 — 這是工程師實際要盯的')
+    lines.append('  數字；同列附上同設備「僅觀察」與同期「資料可用性」件數供對照，不列入排序）：')
+    for _, d in density.sort_values('equipment_sla_per_week', ascending=False).head(10).iterrows():
+        lines.append(f"  {d['device_id']:15s} 進SLA {d['equipment_sla_per_week']:.2f} 件/週"
+                     f"（{int(d['n_equipment_sla'])} 件 / {d['span_weeks']:.1f} 週）"
+                     f"　僅觀察 {int(d['n_equipment_observe'])} 件"
                      f"　同期資料可用性 {int(d['n_data_availability'])} 件")
     lines.append('')
     # 全廠平均用「總事件數 / 各設備觀測週數總和」——每台設備觀測期間可能
     # 不同（新裝設備、中途停用等），用單一共同期間當分母會系統性算錯
     # （見 `_device_span_weeks` 說明），必須逐台加總分母才正確。
     fleet_device_weeks = density['span_weeks'].sum()
-    fleet_equipment = int(density['n_equipment'].sum())
-    fleet_data_availability = int(density['n_data_availability'].sum())
-    fleet_total = fleet_equipment + fleet_data_availability
+    fleet_equipment_sla = int(density['n_equipment_sla'].sum())
+    fleet_equipment_observe = int(density['n_equipment_observe'].sum())
+    fleet_data_availability_sla = int(density['n_data_availability_sla'].sum())
+    fleet_data_availability_observe = int(density['n_data_availability_observe'].sum())
+    fleet_equipment_total = fleet_equipment_sla + fleet_equipment_observe
+    fleet_data_availability_total = fleet_data_availability_sla + fleet_data_availability_observe
+    fleet_total = fleet_equipment_total + fleet_data_availability_total
     fleet_devices = len(density) or 1
 
     def _fleet_density(n: int) -> float:
         return n / fleet_device_weeks if fleet_device_weeks else 0.0
 
-    equipment_density = _fleet_density(fleet_equipment)
-    lines.append(f"  全廠平均－設備狀態類：{equipment_density:.2f} 件/設備/週"
-                 f"（{fleet_equipment} 件 / {fleet_devices} 台設備 / 觀測週數總和 {fleet_device_weeks:.1f} 週）"
+    equipment_sla_density = _fleet_density(fleet_equipment_sla)
+    lines.append(f"  全廠平均－設備狀態類・進SLA：{equipment_sla_density:.2f} 件/設備/週"
+                 f"（{fleet_equipment_sla} 件 / {fleet_devices} 台設備 / 觀測週數總和 {fleet_device_weeks:.1f} 週）"
                  "　★ 校準門檻、估算工程師工作量請用這個數字")
-    lines.append(f"  全廠平均－資料可用性類：{_fleet_density(fleet_data_availability):.2f} 件/設備/週"
-                 f"（{fleet_data_availability} 件）　→ 反映佈建品質，處置者是 IT／儀電")
-    lines.append(f"  全廠平均－合計：{_fleet_density(fleet_total):.2f} 件/設備/週"
-                 f"（{fleet_total} 件，兩類相加僅供參考整體告警量，不可直接用於門檻校準）")
-    if equipment_density > 2:
-        lines.append("  ⚠ 設備狀態類平均每台每週超過 2 件，四階段簽核可能很快就會塞爆，"
+    lines.append(f"  全廠平均－設備狀態類・僅觀察：{_fleet_density(fleet_equipment_observe):.2f} 件/設備/週"
+                 f"（{fleet_equipment_observe} 件）　→ 列入觀察名單，不建立Finding、不佔SLA、不算工作量")
+    lines.append(f"  全廠平均－設備狀態類合計：{_fleet_density(fleet_equipment_total):.2f} 件/設備/週"
+                 f"（{fleet_equipment_total} 件，進SLA+僅觀察相加，僅供參考整體告警量，不可用於人力估算）")
+    lines.append(f"  全廠平均－資料可用性類：{_fleet_density(fleet_data_availability_total):.2f} 件/設備/週"
+                 f"（{fleet_data_availability_total} 件，進SLA {fleet_data_availability_sla} 件／"
+                 f"僅觀察 {fleet_data_availability_observe} 件）　→ 反映佈建品質，處置者是 IT／儀電")
+    lines.append(f"  全廠平均－總合計：{_fleet_density(fleet_total):.2f} 件/設備/週"
+                 f"（{fleet_total} 件，四象限全部相加，僅供參考整體告警量，不可直接用於門檻校準或人力估算）")
+    if equipment_sla_density > 2:
+        lines.append("  ⚠ 設備狀態類「進SLA」平均每台每週超過 2 件，四階段簽核可能很快就會塞爆，"
                      "建議檢視門檻敏感度表後調鬆")
     lines.append('')
 
@@ -367,13 +479,14 @@ def _build_summary_html(text_summary: str, stats_by_rule: pd.DataFrame,
 </style></head>
 <body>
 <h1>離線回測摘要</h1>
+<p class="note">observe 級是給「有偵測價值但沒有可引用的外部標準」的規則用的，只進觀察名單，不建立 Finding、不佔 SLA——下面表格裡的 is_actionable / severity 欄位即標示這件事，觀察名單件數不代表工作量。</p>
 <pre>{text_summary}</pre>
 <h2>Finding 觸發統計－{_CATEGORY_LABELS[RuleCategory.EQUIPMENT]}</h2>
 {_df_to_html(stats_equipment)}
 <h2>Finding 觸發統計－{_CATEGORY_LABELS[RuleCategory.DATA_AVAILABILITY]}</h2>
 {_df_to_html(stats_data_avail)}
-<h2>觸發密度（依設備，依設備狀態類密度排序）</h2>
-<p class="note">equipment_per_week 才是校準門檻、估算工程師工作量的依據；data_availability_per_week 反映佈建品質，處置者是 IT／儀電。</p>
+<h2>觸發密度（依設備，依「設備狀態類・進SLA」密度排序）</h2>
+<p class="note">equipment_sla_per_week 才是校準門檻、估算工程師工作量的依據；equipment_observe_per_week 只是觀察名單，不算工作量；data_availability_* 反映佈建品質，處置者是 IT／儀電；*_per_week（不帶 _sla/_observe 後綴）為對應合計，僅供參考整體告警量，不可直接用於人力估算。</p>
 {_df_to_html(density)}
 <h2>門檻敏感度掃描</h2>
 {sweep_html}
@@ -403,8 +516,10 @@ def write_reports(result: BacktestResult, rule_configs: dict[str, RuleConfigRow]
     written['trigger_density'] = _safe_write_csv(
         density, os.path.join(out_dir, 'trigger_density.csv'))
     # 明細表補上 category 欄位——單看 rule_code 要對照分類表才知道處置者
-    # 是誰，直接落欄位讓人在 Excel 裡就能篩選/樞紐分析，不必回頭查表
-    episodes_out = result.episodes_df.copy()
+    # 是誰，直接落欄位讓人在 Excel 裡就能篩選/樞紐分析，不必回頭查表。
+    # is_actionable 正常來自 backtest.py（見 `_make_episode_row`），這裡
+    # 用 `_ensure_actionable_col` 補一道防線，理由同函式 docstring。
+    episodes_out = _ensure_actionable_col(result.episodes_df).copy()
     episodes_out['category'] = episodes_out['rule_code'].map(rule_category)
     written['episodes'] = _safe_write_csv(
         episodes_out, os.path.join(out_dir, 'episodes_detail.csv'))

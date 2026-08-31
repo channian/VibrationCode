@@ -560,6 +560,7 @@ def _row_to_finding(row: dict) -> Finding:
         baseline_value=float(row["baseline_value"]) if row["baseline_value"] is not None else None,
         current_value=float(row["current_value"]) if row["current_value"] is not None else None,
         value_unit=row["value_unit"] or "", evidence=row["evidence"] or {},
+        trigger_params=row["trigger_params"] or {},
         interpretation_limit=row["interpretation_limit"] or "",
         escalated_at=row["escalated_at"],
         needs_expert_measurement=row["needs_expert_measurement"], source=row["source"],
@@ -605,14 +606,15 @@ def _insert_new_finding(cur, finding: Finding) -> dict:
             finding_key, device_id, point_id, target_type, target, issue_type, family,
             rule_code, title, detail, severity, peak_severity, status, stage_entered_at,
             assigned_to, occurrence_count, first_seen_at, last_seen_at, baseline_value,
-            current_value, value_unit, evidence, interpretation_limit,
+            current_value, value_unit, evidence, trigger_params, interpretation_limit,
             needs_expert_measurement, source
         ) VALUES (
             %(finding_key)s, %(device_id)s, %(point_id)s, %(target_type)s, %(target)s,
             %(issue_type)s, %(family)s, %(rule_code)s, %(title)s, %(detail)s, %(severity)s,
             %(peak_severity)s, %(status)s, now(), %(assigned_to)s, 1, now(), now(),
             %(baseline_value)s, %(current_value)s, %(value_unit)s, %(evidence)s,
-            %(interpretation_limit)s, %(needs_expert_measurement)s, %(source)s
+            %(trigger_params)s, %(interpretation_limit)s, %(needs_expert_measurement)s,
+            %(source)s
         ) RETURNING *
     """
     cur.execute(sql, {
@@ -624,6 +626,7 @@ def _insert_new_finding(cur, finding: Finding) -> dict:
         "status": finding.status, "assigned_to": finding.assigned_to,
         "baseline_value": finding.baseline_value, "current_value": finding.current_value,
         "value_unit": finding.value_unit, "evidence": Json(finding.evidence or {}),
+        "trigger_params": Json(finding.trigger_params or {}),
         "interpretation_limit": finding.interpretation_limit,
         "needs_expert_measurement": finding.needs_expert_measurement,
         "source": finding.source,
@@ -632,26 +635,46 @@ def _insert_new_finding(cur, finding: Finding) -> dict:
 
 
 def _bump_existing_finding(cur, existing: dict, finding: Finding) -> dict:
-    """既有問題再現：只累加次數、更新最新讀數，不動 first_seen_at / stage_entered_at。"""
+    """
+    既有問題再現：只累加次數、更新最新讀數，不動 first_seen_at / stage_entered_at。
+
+    觸發當下的數值／門檻／證據欄位（baseline_value, current_value, value_unit,
+    evidence, trigger_params, interpretation_limit）一律覆寫成本次觸發的值，
+    刻意不比照 `upsert_measure_point` 對 install_date / axis_energy_baseline
+    採用的 COALESCE 保留舊值寫法：那兩欄是「一次性設定、不該被平常的更新
+    覆蓋」，但這裡工程師開單頁看到的是「現在多嚴重」，不是「第一次觸發時
+    多嚴重」——尤其 baseline 可能因為重新偵測而變動、trigger_params 是
+    「這一次」的門檻快照，若沿用舊值，前面提到的『回溯重算』就會用錯門檻。
+    真正需要「保留第一次」語意的是 first_seen_at / stage_entered_at，
+    這兩欄本來就不在這次 UPDATE 的欄位清單內，維持原樣。
+    """
     new_peak = _max_severity(existing["peak_severity"], finding.severity)
     cur.execute(
         """
         UPDATE finding SET
-            occurrence_count = occurrence_count + 1,
-            current_value    = %(current_value)s,
-            last_seen_at     = now(),
-            severity         = %(severity)s,
-            peak_severity    = %(peak_severity)s,
-            detail           = %(detail)s,
-            evidence         = %(evidence)s,
-            updated_at       = now()
+            occurrence_count     = occurrence_count + 1,
+            baseline_value       = %(baseline_value)s,
+            current_value        = %(current_value)s,
+            value_unit           = %(value_unit)s,
+            last_seen_at         = now(),
+            severity             = %(severity)s,
+            peak_severity        = %(peak_severity)s,
+            detail               = %(detail)s,
+            evidence             = %(evidence)s,
+            trigger_params       = %(trigger_params)s,
+            interpretation_limit = %(interpretation_limit)s,
+            updated_at           = now()
         WHERE finding_id = %(finding_id)s
         RETURNING *
         """,
         {
-            "current_value": finding.current_value, "severity": finding.severity,
+            "baseline_value": finding.baseline_value, "current_value": finding.current_value,
+            "value_unit": finding.value_unit, "severity": finding.severity,
             "peak_severity": new_peak, "detail": finding.detail,
-            "evidence": Json(finding.evidence or {}), "finding_id": existing["finding_id"],
+            "evidence": Json(finding.evidence or {}),
+            "trigger_params": Json(finding.trigger_params or {}),
+            "interpretation_limit": finding.interpretation_limit,
+            "finding_id": existing["finding_id"],
         },
     )
     return cur.fetchone()
@@ -671,10 +694,12 @@ def _reopen_finding(cur, existing: dict, finding: Finding) -> dict:
             last_seen_at             = now(),
             baseline_value           = %(baseline_value)s,
             current_value            = %(current_value)s,
+            value_unit               = %(value_unit)s,
             severity                 = %(severity)s,
             peak_severity            = %(severity)s,
             detail                   = %(detail)s,
             evidence                 = %(evidence)s,
+            trigger_params           = %(trigger_params)s,
             interpretation_limit     = %(interpretation_limit)s,
             escalated_at             = NULL,
             needs_expert_measurement = %(needs_expert_measurement)s,
@@ -686,8 +711,10 @@ def _reopen_finding(cur, existing: dict, finding: Finding) -> dict:
         """,
         {
             "status": status, "baseline_value": finding.baseline_value,
-            "current_value": finding.current_value, "severity": finding.severity,
+            "current_value": finding.current_value, "value_unit": finding.value_unit,
+            "severity": finding.severity,
             "detail": finding.detail, "evidence": Json(finding.evidence or {}),
+            "trigger_params": Json(finding.trigger_params or {}),
             "interpretation_limit": finding.interpretation_limit,
             "needs_expert_measurement": finding.needs_expert_measurement,
             "finding_id": existing["finding_id"],

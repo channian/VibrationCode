@@ -45,7 +45,7 @@ from vibcore.metrics.baseline import detect_baseline
 from vibcore.pipeline.aggregate import aggregate_hourly, coverage_report, rollup_daily
 from vibcore.rules import evaluate_all, outcome_to_finding
 from vibcore.types import (
-    CLOSED_STATUSES, DeviceContext, Finding, RuleContext,
+    CLOSED_STATUSES, DeviceContext, Finding, RuleContext, is_actionable,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,19 @@ ESCALATE_MIN_DELTA_PCT = 5.0
 
 @dataclass
 class PointResult:
-    """單一量測點的處理結果。"""
+    """
+    單一量測點的處理結果。
+
+    `triggered` / `observed` 在規則判定完成的當下（`process_point`）就依
+    `RuleOutcome.severity` 分好——是否 actionable 只取決於嚴重度本身，
+    與後續是否真的寫入 DB 無關，不必等到 `persist_findings` 才知道。
+
+        triggered — 會建立/更新 Finding、進 SLA 簽核鏈的規則代碼
+        observed  — observe 級：僅供週報觀察名單參考，不建立 Finding
+
+    兩者都要留，理由見 `persist_findings` 的說明：observe 級判定若完全
+    不留痕跡，週報就沒有素材、使用者也會誤以為系統什麼都沒偵測到。
+    """
     device_id: str
     position: str
     point_id: int | None = None
@@ -70,6 +82,7 @@ class PointResult:
     agg_hours: int = 0
     coverage: dict = field(default_factory=dict)
     triggered: list[str] = field(default_factory=list)
+    observed: list[str] = field(default_factory=list)
     error: str | None = None
 
     @property
@@ -83,6 +96,7 @@ class DailyRunResult:
     run_date: date
     points: list[PointResult] = field(default_factory=list)
     findings_upserted: int = 0
+    observed_count: int = 0
     auto_resolved: int = 0
     escalated: int = 0
     started_at: datetime | None = None
@@ -99,6 +113,7 @@ class DailyRunResult:
     def summary(self) -> str:
         return (f"{self.run_date}：量測點 {self.n_ok} 成功 / {self.n_failed} 失敗，"
                 f"事項 upsert {self.findings_upserted}、"
+                f"觀察名單（不進 SLA）{self.observed_count}、"
                 f"自動結案 {self.auto_resolved}、標記惡化 {self.escalated}")
 
 
@@ -191,7 +206,7 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
         # 「查無資料」，看起來像設備沒運轉。
         daily = rollup_daily(agg, agg_cfg)
         if not daily.empty:
-            repo.bulk_insert_daily(conn, point_id, daily)
+            repo.upsert_daily(conn, point_id, daily)
 
         cov_ratio = result.coverage.get('analyzable_ratio', 0.0)
         _record_ingestion(
@@ -236,7 +251,11 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
         )
         rule_configs = repo.get_rule_configs(conn)
         outcomes = evaluate_all(ctx, rule_configs)
-        result.triggered = [o.rule_code for o in outcomes]
+        # 依嚴重度分兩桶：actionable（err/warn）進 triggered、其餘
+        # （目前只有 observe）進 observed。分類只看 outcome.severity，
+        # 與後面 persist_findings 是否真的寫入 DB 無關。
+        result.triggered = [o.rule_code for o in outcomes if is_actionable(o.severity)]
+        result.observed = [o.rule_code for o in outcomes if not is_actionable(o.severity)]
         result._outcomes = outcomes          # type: ignore[attr-defined]
         result._ctx = ctx                    # type: ignore[attr-defined]
 
@@ -276,14 +295,26 @@ def _is_worse(new_value: float | None, old_value: float | None,
     return (new_dist - old_dist) / old_dist * 100 >= ESCALATE_MIN_DELTA_PCT
 
 
-def persist_findings(conn, results: list[PointResult]) -> tuple[int, int]:
+def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
     """
     把規則判定結果寫入資料庫，並偵測惡化。
 
+    `observe` 級判定（`is_actionable()` 為 False）**不建立 Finding**——
+    不佔 SLA、不進簽核鏈，理由見 `vibcore.types.SEVERITY_OBSERVE` 的說明：
+    這類規則沒有可對外交代的門檻依據，拿去派工只會讓簽核鏈失去公信力。
+
+    但也不能安靜丟掉：完全不留痕跡的話，等累積足夠回饋要把某條規則從
+    observe 升為 warn 時就沒有歷史數據可用，週報的觀察名單也會沒有素材，
+    使用者更可能誤以為系統這段時間什麼都沒偵測到。因此這裡只計數、不落庫
+    ——`PointResult.observed`（已在 `process_point` 依嚴重度分類好）供
+    呼叫端在執行摘要中呈現。若之後要讓觀察名單能被週報引用真正的數值
+    （而不只是計數），需要另外的落庫位置（例如新表或欄位），但那屬於
+    `db/schema.sql` 的變動範圍，這一輪先讓計數與清單在回傳物件裡可見。
+
     Returns:
-        (upsert 筆數, 標記惡化筆數)
+        (upsert 筆數, 標記惡化筆數, observe 級判定筆數)
     """
-    n_upsert = n_escalate = 0
+    n_upsert = n_escalate = n_observed = 0
     existing = {f['finding_key']: f for f in repo.get_open_findings(conn)}
 
     for r in results:
@@ -293,6 +324,10 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int]:
             continue
 
         for outcome in outcomes:
+            if not is_actionable(outcome.severity):
+                n_observed += 1
+                continue
+
             finding = outcome_to_finding(outcome, ctx)
             prev = existing.get(finding.finding_key)
             try:
@@ -316,7 +351,7 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int]:
                 except Exception as e:
                     logger.warning(f"標記惡化失敗（{finding.finding_key}）：{e}")
 
-    return n_upsert, n_escalate
+    return n_upsert, n_escalate, n_observed
 
 
 def auto_resolve_quiet(conn, quiet_days: int = DEFAULT_QUIET_DAYS) -> int:
@@ -393,7 +428,9 @@ def run_daily(conn, data_dir: str, run_date: date | None = None,
         # 單一設備失敗不影響其餘設備（見模組說明）
         result.points.append(process_point(conn, meta, df, run_date, agg_cfg=agg_cfg))
 
-    result.findings_upserted, result.escalated = persist_findings(conn, result.points)
+    result.findings_upserted, result.escalated, result.observed_count = (
+        persist_findings(conn, result.points)
+    )
     result.auto_resolved = auto_resolve_quiet(conn, quiet_days)
     result.finished_at = datetime.now(timezone.utc)
 

@@ -33,7 +33,7 @@ import pandas as pd
 
 from vibcore.config import DEFAULT_AGG, DEFAULT_TREND, AggregateConfig
 from vibcore.pipeline.aggregate import aggregate_hourly, coverage_report, summarize_gaps
-from vibcore.types import RuleContext
+from vibcore.types import RuleContext, is_actionable
 
 from validate.baseline_stub import compute_axis_energy_baseline, compute_baseline
 from validate.points import PointSeries
@@ -133,6 +133,10 @@ def _make_episode_row(pc: PointContext, rule_row: RuleConfigRow,
         'family': rule_row.family,
         'issue_type': rule_row.issue_type,
         'severity': rule_row.severity,
+        # 是否會在正式系統建立 Finding、進入簽核鏈——直接在事件層算好，
+        # 下游（report.py）就不必各自 import vibcore.types 重算一次判準，
+        # 也不會有兩處判準漂移的風險。
+        'is_actionable': is_actionable(rule_row.severity),
         'episode_start': start,
         'episode_end': end,
         'duration_days': duration_days,
@@ -224,7 +228,8 @@ def run_backtest(points: list[PointSeries],
     episodes_df = (pd.DataFrame(episode_rows).sort_values('episode_start').reset_index(drop=True)
                    if episode_rows else pd.DataFrame(columns=[
                        'device_id', 'device_name', 'point_id', 'position', 'rule_code', 'rule_name',
-                       'family', 'issue_type', 'severity', 'episode_start', 'episode_end', 'duration_days']))
+                       'family', 'issue_type', 'severity', 'is_actionable', 'episode_start', 'episode_end',
+                       'duration_days']))
 
     non_empty = [pc for pc in point_contexts if not pc.agg.empty]
     span_start = min((pc.agg['ts_hour'].min() for pc in non_empty), default=None)
