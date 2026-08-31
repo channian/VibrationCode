@@ -32,6 +32,7 @@ import os
 
 import pandas as pd
 
+from vibcore.io.analytic_reader import _ENCODINGS
 from vibcore.metrics.iso import ISO_THRESHOLDS, iso_alert_threshold
 from validate.points import _ISO_CODE_MAP
 
@@ -41,22 +42,54 @@ logger = logging.getLogger(__name__)
 _WANTED = ('Name', 'ISO10816_code', 'RPM', 'velRMS')
 
 
-def _read_min(path: str) -> pd.DataFrame | None:
-    """只讀需要的欄位；分隔符自動判斷（實測檔案為 tab 分隔）。"""
-    for sep in ('\t', ','):
+def _sniff(path: str) -> tuple[str, str, list[str]] | None:
+    """
+    找出這個檔案的編碼與分隔符，並回傳欄位清單。
+
+    編碼必須逐一嘗試：現場的匯出檔常是 cp950（繁體 Windows 預設），
+    直接用 UTF-8 讀會拋 UnicodeDecodeError。沿用
+    `vibcore.io.analytic_reader` 的 `_ENCODINGS` 順序，讓這支工具與
+    正式管線對同一批檔案的判讀一致。
+
+    分隔符用「首行的 tab 與逗號孰多」判斷，而不是交給 pandas 的
+    `sep=None` 嗅探——後者需要 python engine，在 200~670 欄的檔案上
+    明顯較慢，而這裡只是要挑四個欄位。
+    """
+    last_err = None
+    for enc in _ENCODINGS:
         try:
-            head = pd.read_csv(path, sep=sep, nrows=0)
-        except Exception:
+            with open(path, 'r', encoding=enc) as f:
+                header = f.readline()
+        except (UnicodeDecodeError, OSError) as e:
+            last_err = e
             continue
-        if len(head.columns) < 5:
-            continue
-        cols = [c for c in _WANTED if c in head.columns]
-        if 'Name' not in cols or 'velRMS' not in cols:
-            logger.warning(f"{os.path.basename(path)} 缺少 Name 或 velRMS 欄，略過")
-            return None
-        return pd.read_csv(path, sep=sep, usecols=cols)
-    logger.warning(f"{os.path.basename(path)} 無法解析，略過")
+        sep = '\t' if header.count('\t') >= header.count(',') else ','
+        cols = [c.strip() for c in header.rstrip('\n\r').split(sep)]
+        if len(cols) >= 5:
+            return enc, sep, cols
+        last_err = ValueError(f"以 {enc} 讀出的首行只切出 {len(cols)} 欄")
+    logger.warning(f"{os.path.basename(path)} 無法解析（{last_err}），略過")
     return None
+
+
+def _read_min(path: str) -> pd.DataFrame | None:
+    """只讀需要的四個欄位；編碼與分隔符先探測過再讀。"""
+    sniffed = _sniff(path)
+    if sniffed is None:
+        return None
+    enc, sep, cols = sniffed
+
+    wanted = [c for c in _WANTED if c in cols]
+    missing = [c for c in ('Name', 'velRMS') if c not in cols]
+    if missing:
+        logger.warning(f"{os.path.basename(path)} 缺少必要欄位 {missing}，略過"
+                       f"（實際欄位共 {len(cols)} 個，前幾個：{cols[:6]}）")
+        return None
+    try:
+        return pd.read_csv(path, sep=sep, usecols=wanted, encoding=enc)
+    except Exception as e:
+        logger.warning(f"{os.path.basename(path)} 讀取失敗（{type(e).__name__}: {e}），略過")
+        return None
 
 
 def collect(data_dir: str, pattern: str = '*.csv') -> pd.DataFrame:
