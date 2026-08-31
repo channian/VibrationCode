@@ -368,7 +368,12 @@ CREATE TABLE rule_config (
     rule_name   TEXT NOT NULL,
     family      TEXT NOT NULL CHECK (family IN ('oscillating','monotonic','event','none')),
     issue_type  TEXT NOT NULL,
-    severity    TEXT NOT NULL DEFAULT 'warn' CHECK (severity IN ('err','warn')),
+    -- observe：有偵測價值但**沒有可引用的外部標準**的規則（例如多變量
+    -- 偏離、頻譜重心位移）。這類只進週報的觀察名單，不建立 Finding、
+    -- 不進 SLA、不需簽核。理由：拿一個我們自訂的統計量去派工，工程師
+    -- 問「這個門檻哪來的」時我們答不出來，簽核鏈很快就會失去公信力。
+    -- 等累積足夠的 false_positive 回饋、門檻站得住腳了，再升為 warn。
+    severity    TEXT NOT NULL DEFAULT 'warn' CHECK (severity IN ('err','warn','observe')),
     params      JSONB NOT NULL DEFAULT '{}'::jsonb,
     is_active   BOOLEAN NOT NULL DEFAULT TRUE,
     description TEXT,
@@ -408,16 +413,16 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      '{"crest_sigma":2.5,"kurt_sigma":2.5,'
      '"crest_axis_sigma":2.5,"kurt_axis_sigma":2.5,"require_both":false}',
      'accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
-    ('DEGRADE_TREND',      '指標持續劣化',     'monotonic',   'degradation_trend','warn',
+    ('DEGRADE_TREND',      '指標持續劣化',     'monotonic',   'degradation_trend','observe',
      '{"min_days":14,"min_r2":0.3,"slope_pct_per_month":10}',
      '回歸斜率持續惡化；須在聚合後的獨立樣本上計算'),
-    ('SPECTRAL_SHIFT',     '頻譜重心上移',     'monotonic',   'spectral_shift',   'warn',
+    ('SPECTRAL_SHIFT',     '頻譜重心上移',     'monotonic',   'spectral_shift',   'observe',
      '{"shift_pct":15,"min_days":14}',
      'accWeightedMeanFreq 持續上移，代表能量往高頻移動'),
-    ('AXIS_SHIFT',         '軸能量分佈偏移',   'monotonic',   'axis_shift',       'warn',
+    ('AXIS_SHIFT',         '軸能量分佈偏移',   'monotonic',   'axis_shift',       'observe',
      '{"ratio_delta":0.15}',
      '排序後三軸能量佔比相對基準偏移'),
-    ('STEP_CHANGE',        '多變量突變',       'monotonic',   'step_change',      'warn',
+    ('STEP_CHANGE',        '多變量突變',       'monotonic',   'step_change',      'observe',
      '{"mahalanobis_sigma":3.0}',
      '特徵向量偏離基準；輸出各特徵標準化偏離量而非 0–100 分數'),
     ('ORIENTATION_CHANGE', '感測器方向改變',   'event',       'orientation_change','warn',
@@ -442,7 +447,7 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
     ('ISO_CLASS_SUSPECT',  'ISO 等級存疑',     'event',       'iso_class_suspect','warn',
      '{"frontend_consecutive_readings":3}',
      '基準期中位數已超過所指派等級的 B/C 界，等級可能填錯或機器本有問題'),
-    ('TEMP_RISE',          '溫度相對基準上升', 'oscillating', 'temp_rise',        'warn',
+    ('TEMP_RISE',          '溫度相對基準上升', 'oscillating', 'temp_rise',        'observe',
      -- sigma 與 IMPACT_RISE 同量級；另有 consecutive_readings 把關，
      -- 兩道防線一起收斂假警報。vibration_co_rise_sigma 只影響敘述措辭
      -- （同期振動是否也偏離），不影響是否觸發。
@@ -480,8 +485,8 @@ CREATE TABLE finding (
 
     title            TEXT NOT NULL,
     detail           TEXT,
-    severity         TEXT NOT NULL CHECK (severity IN ('err','warn','ok')),
-    peak_severity    TEXT NOT NULL CHECK (peak_severity IN ('err','warn','ok')),
+    severity         TEXT NOT NULL CHECK (severity IN ('err','warn','observe','ok')),
+    peak_severity    TEXT NOT NULL CHECK (peak_severity IN ('err','warn','observe','ok')),
 
     -- 四階段簽核
     status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN (
@@ -510,6 +515,18 @@ CREATE TABLE finding (
     escalated_at     TIMESTAMPTZ,                 -- 非 NULL 代表處理中但仍持續惡化
     expected_resolution_date DATE,
     needs_expert_measurement BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- 觸發當下的數值、門檻與證據。沒有這些就無法回溯重算——例如三個月
+    -- 後想問「當初若把門檻訂成 3.5σ，這 200 件會剩幾件」，只能重跑整條
+    -- 管線（而歷史原始檔未必還在）。門檻要靠實際誤報率迭代，就必須留存。
+    baseline_value   NUMERIC(16,6),
+    current_value    NUMERIC(16,6),
+    value_unit       TEXT NOT NULL DEFAULT '',
+    evidence         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- 觸發當下 rule_config.params 的快照。規則參數日後會被調整，
+    -- 只存數值而不存當時的門檻，回溯時就分不清是數值變了還是門檻變了。
+    trigger_params   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    interpretation_limit TEXT NOT NULL DEFAULT '',
 
     source           TEXT NOT NULL DEFAULT 'rule_engine'
                      CHECK (source IN ('rule_engine','agent','manual')),

@@ -62,19 +62,19 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
              'require_both': False},
             description='accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
         RuleConfigRow(
-            'DEGRADE_TREND', '指標持續劣化', 'monotonic', 'degradation_trend', 'warn',
+            'DEGRADE_TREND', '指標持續劣化', 'monotonic', 'degradation_trend', 'observe',
             {'min_days': 14, 'min_r2': 0.3, 'slope_pct_per_month': 10},
             description='回歸斜率持續惡化；須在聚合後的獨立樣本上計算'),
         RuleConfigRow(
-            'SPECTRAL_SHIFT', '頻譜重心上移', 'monotonic', 'spectral_shift', 'warn',
+            'SPECTRAL_SHIFT', '頻譜重心上移', 'monotonic', 'spectral_shift', 'observe',
             {'shift_pct': 15, 'min_days': 14},
             description='accWeightedMeanFreq 持續上移，代表能量往高頻移動'),
         RuleConfigRow(
-            'AXIS_SHIFT', '軸能量分佈偏移', 'monotonic', 'axis_shift', 'warn',
+            'AXIS_SHIFT', '軸能量分佈偏移', 'monotonic', 'axis_shift', 'observe',
             {'ratio_delta': 0.15},
             description='排序後三軸能量佔比相對基準偏移'),
         RuleConfigRow(
-            'STEP_CHANGE', '多變量突變', 'monotonic', 'step_change', 'warn',
+            'STEP_CHANGE', '多變量突變', 'monotonic', 'step_change', 'observe',
             {'mahalanobis_sigma': 3.0},
             description='特徵向量偏離基準；輸出各特徵標準化偏離量而非 0–100 分數'),
         RuleConfigRow(
@@ -85,7 +85,7 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             {'ratio_delta': 0.25, 'consecutive_readings': 3, 'min_energy_ratio': 0.3},
             description='軸能量分佈排列跳變，疑似感測器重貼或更換'),
         RuleConfigRow(
-            'TEMP_RISE', '溫度相對基準上升', 'oscillating', 'temp_rise', 'warn',
+            'TEMP_RISE', '溫度相對基準上升', 'oscillating', 'temp_rise', 'observe',
             # sigma 與 IMPACT_RISE 同量級；另有 consecutive_readings 把關，
             # 兩道防線一起收斂假警報。vibration_co_rise_sigma 只影響敘述
             # 措辭（同期振動是否也偏離），不影響是否觸發。

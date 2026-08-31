@@ -221,6 +221,31 @@ FINDING_AUTO_RESOLVED = 'auto_resolved'
 FINDING_FALSE_POSITIVE = 'false_positive'
 
 #: 正常簽核鏈的順序
+#: 嚴重度。err / warn 會建立 Finding 並進入簽核鏈；observe 不會。
+#:
+#: `observe` 是給「有偵測價值但沒有可引用的外部標準」的規則用的
+#: （例如多變量偏離、頻譜重心位移、溫度相對上升）。這類判定只進週報的
+#: 觀察名單，不建立 Finding、不佔 SLA、不需簽核。
+#:
+#: 為什麼要分這一級：ISO_ZONE 的門檻是國際標準訂的、VEL_HIGH 可錨定
+#: 到 ISO 的告警設定原則，這些拿去派工，工程師問「門檻哪來的」我們答得
+#: 出來。但 Mahalanobis 距離超過 3σ 是我們自己訂的，答不出來。用答不出
+#: 來的數字派工，簽核鏈很快就會失去公信力，連帶拖累有依據的那幾條。
+#:
+#: 等累積足夠的 false_positive 回饋、門檻站得住腳之後，再逐條升為 warn。
+SEVERITY_ERR = 'err'
+SEVERITY_WARN = 'warn'
+SEVERITY_OBSERVE = 'observe'
+
+#: 會建立 Finding 並進入簽核流程的嚴重度
+ACTIONABLE_SEVERITIES = (SEVERITY_ERR, SEVERITY_WARN)
+
+
+def is_actionable(severity: str) -> bool:
+    """此嚴重度是否該建立 Finding 並進入 SLA。"""
+    return severity in ACTIONABLE_SEVERITIES
+
+
 SIGNOFF_CHAIN = (FINDING_OPEN, FINDING_ENGINEER, FINDING_SUPERVISOR,
                  FINDING_EXPERT, FINDING_CLOSED)
 
@@ -253,6 +278,9 @@ class Finding:
     current_value: float | None = None
     value_unit: str = ''
     evidence: dict = field(default_factory=dict)
+    #: 觸發當下 rule_config.params 的快照。只存數值而不存當時的門檻，
+    #: 回溯時就分不清是數值變了還是門檻被調過。
+    trigger_params: dict = field(default_factory=dict)
     interpretation_limit: str = ''
     escalated_at: datetime | None = None
     needs_expert_measurement: bool = False

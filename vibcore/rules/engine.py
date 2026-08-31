@@ -199,6 +199,8 @@ def outcome_to_finding(outcome: RuleOutcome, ctx: RuleContext) -> Finding:
         current_value=outcome.current_value,
         value_unit=outcome.value_unit,
         evidence=outcome.evidence,
+        # 留存觸發當下的門檻，之後才有辦法回溯重算「若門檻是 X 會剩幾件」
+        trigger_params=dict(ctx.params or {}),
         interpretation_limit=outcome.interpretation_limit,
         last_seen_at=ctx.now,
         first_seen_at=ctx.now,
