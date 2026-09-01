@@ -83,10 +83,22 @@ CREATE TABLE device (
     is_vfd            BOOLEAN NOT NULL DEFAULT FALSE,
     is_standby        BOOLEAN NOT NULL DEFAULT FALSE,   -- 備機
     -- ISO 10816 分級
-    iso_machine_class TEXT CHECK (iso_machine_class IN ('I','II','III','IV')),
+    -- ISO 10816-3 / 20816-3 分類。**群組與基礎剛性兩者齊備才能判定 Zone**
+    -- ——同一群組下剛性與柔性的 A/B 界可差近一倍（Group 2 為 1.40 vs 2.30），
+    -- 缺一即退回未分類，不猜。先前這裡是 Class I~IV（ISO 2372 舊分類），
+    -- 與本系統引用的告警設定原則（ISO 10816-3 §5.4.1）不是同一份文件，
+    -- 2026-09 已更正，見 vibcore/metrics/iso.py 的 ISO_THRESHOLDS。
+    iso_machine_group TEXT CHECK (iso_machine_group IN ('1','2','3','4')),
+    iso_foundation    TEXT CHECK (iso_foundation IN ('rigid','flexible')),
+    -- 泵浦驅動型式，用於區分 Group 4（整合）與 Group 3（外接）。
+    -- 僅供台帳記錄與稽核，Zone 判定直接讀 iso_machine_group 不從此推導。
+    iso_driver_type   TEXT CHECK (iso_driver_type IN ('integrated','external')),
     iso_class_source  TEXT NOT NULL DEFAULT 'unset'
                       CHECK (iso_class_source IN ('unset','frontend','manual_override')),
     iso_class_verified_at TIMESTAMPTZ,
+    -- 最後一次保養／大修。基準期不得早於此時點（ISO 10816-3 §5.4.1 要求
+    -- 大修、換軸承、基礎變更後重建 baseline）；為 NULL 時不限制。
+    last_maintenance_at   TIMESTAMPTZ,
     -- 歸屬
     owner_group       TEXT,
     owner_user_id     BIGINT REFERENCES app_user(user_id),
@@ -98,8 +110,12 @@ CREATE TABLE device (
 COMMENT ON COLUMN device.iso_class_source IS
     'unset=未分級（不套 Zone 判定）；frontend=前端程式由工程師分類；manual_override=人工覆寫';
 COMMENT ON COLUMN device.is_standby IS '備機；未運轉不判異常，另受 STANDBY_NO_RUNTIME 規則監測';
-COMMENT ON COLUMN device.iso_machine_class IS
-    'ISO 10816 機械等級 I~IV，決定 iso_threshold 套用哪一組 Zone 門檻；為 NULL 時等同 iso_class_source=unset，不套用 Zone 判定';
+COMMENT ON COLUMN device.iso_machine_group IS
+    'ISO 10816-3 機器群組 1~4；與 iso_foundation 一起決定套用哪一組 Zone 門檻。任一為 NULL 即不套用 Zone 判定';
+COMMENT ON COLUMN device.iso_foundation IS
+    '基礎剛性 rigid/flexible；Zone 邊界同時取決於群組與基礎，缺此欄無法判定 Zone';
+COMMENT ON COLUMN device.last_maintenance_at IS
+    '最後一次保養／大修時點；基準期掃描不得選在此之前的窗口（ISO 10816-3 §5.4.1）';
 COMMENT ON COLUMN device.status IS
     'active=正常監測中；inactive=暫停監測（不觸發新 Finding，但保留歷史資料）；decommissioned=已報廢（不再匯入新資料）';
 
@@ -176,6 +192,16 @@ CREATE TABLE measurement_agg (
     -- 可能貼錯方向，軸標籤不可信。
     acc_crest_axis_max  NUMERIC(12,6),
     acc_kurt_axis_max   NUMERIC(12,6),
+    -- 衝擊型指標的 median 通道。max 回答「這小時最尖的一刻」，median 回答
+    -- 「這小時的代表性形狀」——規則判定用的是後者。kurtosis 的業界判準
+    -- （常態=3、>4 視為出現衝擊）講的是一段訊號的峰度，不是 3600 個滾動窗
+    -- 峰度的最大值；實測 AHU-601 逐筆中位數 2.37、僅 2.6% 超過 4，但每小時
+    -- 取 max 後幾乎必然遠超過 4，拿去比對該判準等於門檻恆為真。
+    -- 完整實測數據見 vibcore/config.py 對 acc_kurt_median 的說明。
+    acc_crest_median       NUMERIC(12,6),
+    acc_kurt_median        NUMERIC(12,6),
+    acc_crest_axis_median  NUMERIC(12,6),
+    acc_kurt_axis_median   NUMERIC(12,6),
     -- 溫度（°C）。與振動獨立的唯一物理通道：「振動上升但溫度持平」與
     -- 「兩者一起上升」對現場的意義不同。可能是感測器內部溫度而非軸承座
     -- 溫度（見 docs/DATA_CONTRACT.md §3.1），故僅用於與自身基準比的相對
@@ -226,6 +252,11 @@ CREATE TABLE measurement_daily (
     -- 等於在週報裡不存在——小時層有值也沒用。
     acc_crest_axis_max NUMERIC(12,6),
     acc_kurt_axis_max  NUMERIC(12,6),
+    -- median 通道（理由見 measurement_agg 同名欄位的說明）
+    acc_crest_median       NUMERIC(12,6),
+    acc_kurt_median        NUMERIC(12,6),
+    acc_crest_axis_median  NUMERIC(12,6),
+    acc_kurt_axis_median   NUMERIC(12,6),
     temp_avg      NUMERIC(8,3),
     temp_max      NUMERIC(8,3),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -340,13 +371,19 @@ COMMENT ON COLUMN point_baseline.source IS
     'auto=由 detect_baseline() 自動掃描選定；manual=人工指定的基準期範圍';
 
 -- ISO 10816 / 20816 Zone 門檻（velRMS mm/s），可由管理員調整
+-- ISO 10816-3 / 20816-3 評估分區。主鍵是 (群組, 基礎剛性) 而非單一等級
+-- ——Zone 邊界同時取決於兩者，例如 Group 2 剛性的 A/B 界 1.40、柔性 2.30。
+-- 這張表是全系統 Zone 判定與 VEL_HIGH 門檻的唯一數值來源，
+-- 上線前應由振動專家對照條文原文核對。
 CREATE TABLE iso_threshold (
-    machine_class TEXT PRIMARY KEY CHECK (machine_class IN ('I','II','III','IV')),
+    machine_group TEXT NOT NULL CHECK (machine_group IN ('1','2','3','4')),
+    foundation    TEXT NOT NULL CHECK (foundation IN ('rigid','flexible')),
     label         TEXT NOT NULL,
     ab_boundary   NUMERIC(8,3) NOT NULL,
     bc_boundary   NUMERIC(8,3) NOT NULL,
     cd_boundary   NUMERIC(8,3) NOT NULL,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (machine_group, foundation)
 );
 
 COMMENT ON COLUMN iso_threshold.ab_boundary IS
@@ -356,11 +393,15 @@ COMMENT ON COLUMN iso_threshold.bc_boundary IS
 COMMENT ON COLUMN iso_threshold.cd_boundary IS
     'Zone C/D 分界；超過即 Zone D（可能造成損壞，通常需立即處理）';
 
-INSERT INTO iso_threshold (machine_class, label, ab_boundary, bc_boundary, cd_boundary) VALUES
-    ('I',   'Class I（< 15 kW）',        0.71,  1.80,  4.50),
-    ('II',  'Class II（15–75 kW）',      1.12,  2.80,  7.10),
-    ('III', 'Class III（大型剛性基礎）',  1.80,  4.50, 11.20),
-    ('IV',  'Class IV（大型柔性基礎）',   2.80,  7.10, 18.00);
+INSERT INTO iso_threshold (machine_group, foundation, label, ab_boundary, bc_boundary, cd_boundary) VALUES
+    ('1', 'rigid',    'Group 1 大型機（300 kW–50 MW；馬達軸高 H ≥ 315 mm）· 剛性基礎', 2.30, 4.50,  7.10),
+    ('1', 'flexible', 'Group 1 大型機 · 柔性基礎',                                      3.50, 7.10, 11.00),
+    ('2', 'rigid',    'Group 2 中型機（15 kW < P ≤ 300 kW；馬達軸高 160 ≤ H < 315 mm）· 剛性基礎', 1.40, 2.80, 4.50),
+    ('2', 'flexible', 'Group 2 中型機 · 柔性基礎',                                      2.30, 4.50,  7.10),
+    ('3', 'rigid',    'Group 3 泵浦（> 15 kW，外接驅動）· 剛性基礎',                    2.30, 4.50,  7.10),
+    ('3', 'flexible', 'Group 3 泵浦（外接驅動）· 柔性基礎',                              3.50, 7.10, 11.00),
+    ('4', 'rigid',    'Group 4 泵浦（> 15 kW，整合驅動）· 剛性基礎',                    1.40, 2.80,  4.50),
+    ('4', 'flexible', 'Group 4 泵浦（整合驅動）· 柔性基礎',                              2.30, 4.50,  7.10);
 
 -- 規則門檻設定（比照 HVM 的 get_alert_thresholds：只有查到的閾值才算數）
 CREATE TABLE rule_config (
@@ -401,8 +442,11 @@ COMMENT ON COLUMN rule_config.description IS
 
 INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, params, description) VALUES
     ('ISO_ZONE',           'ISO 位準分級',     'oscillating', 'iso_zone_exceed',  'err',
-     '{"alert_zone":"C"}',
-     'velRMS 對照機械等級的 Zone A/B/C/D；未分級設備不套用'),
+     -- consecutive_readings：需連續幾筆可信資料都達告警 Zone 才觸發。
+     --   依 ISO 10816-3 §5.4 的實務建議（設定確認時間，避免啟動／停機／
+     --   製程瞬變誤動作）。小時級資料上只看單筆等於每天擲骰子。
+     '{"alert_zone":"C","consecutive_readings":3}',
+     'velRMS 對照 ISO 10816-3 的 Zone A/B/C/D；未分類或適用範圍外的設備不套用'),
     ('VEL_HIGH',           '速度整體值偏高',   'oscillating', 'vel_high',         'warn',
      -- threshold_mode='iso'：門檻 = 基準 + 0.25 × Zone B 上限（封頂 1.25 倍），
      --   隨機械等級而異，來源是國際標準的分級架構而非我們自訂的統計量。
@@ -410,25 +454,24 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      --   拿去比 velOA（實測約為 velRMS 的 0.75 倍）會讓門檻悄悄鬆掉三分之一。
      --   設備未分級時自動退回 sigma，並在 evidence 標記 sigma_fallback。
      -- sigma 保留為對照組，供敏感度掃描並列比較。
-     '{"threshold_mode":"iso","sigma":3.0}',
-     'velOA 相對基準超過 N 個標準差'),
+     -- consecutive_readings：同 ISO_ZONE，見該處說明。
+     '{"threshold_mode":"iso","sigma":3.0,"consecutive_readings":3}',
+     'velRMS 相對 ISO 錨定門檻偏高（未分類時退回相對基準 σ 判定）'),
     ('IMPACT_RISE',        '衝擊性指標上升',   'monotonic',   'impact_rise',      'observe',
+     -- 判定用 median 通道（acc_*_median），不用 max。kurtosis 的業界判準
+     --   講的是一段訊號的峰度，不是每小時 3600 個滾動窗峰度的最大值；
+     --   實測 AHU-601 逐筆中位數 2.37、僅 2.6% 超過 4，但取區塊最大值後
+     --   30/60/114 筆各為 7.17/13.49/19.00，median 則恆為 2.37。
+     -- 原本的 kurt_absolute=4.0 與 threshold_mode 已移除：那道絕對門檻套在
+     --   取最大值的 accKURT 上實測恆為真，AND 條件完全沒有把關，
+     --   convention 模式早已退化成 sigma 模式。留著只會讓人誤以為有防線。
      -- 逐軸門檻與合成值同量級：實測 crest 是逐軸較大、kurt 反而是合成
-     -- 較大（見 docs/DATA_CONTRACT.md §3.3），沒有證據支持哪一邊該偏鬆，
-     -- 故給相同預設值。
-     -- 嚴重度為 observe：kurtosis>4 這個業界通則實測在本廠設備上**沒有
-     -- 鑑別力**——ZP 3-5 的逐筆 accKURT 中位數就是 4.53（100% 超過 4），
-     -- CP 10 是 3.60、AHU-601 是 2.37。該通則假設健康機器的 kurtosis 接近
-     -- 常態值 3，但這裡有機器的基線本來就在 4.5。既然找不到可辯護的外部
-     -- 依據，就不該進 SLA（見 vibcore/types.py 的 SEVERITY_OBSERVE）。
-     -- 待 false_positive 回饋累積出真實精確率後再評估升為 warn。
-     -- kurt_absolute=4.0：accKURT 是 Pearson 定義，常態分布為 3，業界慣以
-     --   超過 4 視為訊號中出現衝擊成分。這是業界通則不是正式標準。
-     --   與 σ 判定取 AND：純相對判定會讓本來就安靜的機器因微幅上升就告警，
-     --   而 kurtosis 3.2 在物理上根本不算有衝擊。
-     --   crest 沒有對應的公認經驗值，故僅 kurtosis 套用絕對門檻。
-     '{"threshold_mode":"convention","kurt_absolute":4.0,'
-     '"crest_sigma":2.5,"kurt_sigma":2.5,'
+     --   較大（見 docs/DATA_CONTRACT.md §3.3），沒有證據支持哪一邊該偏鬆。
+     -- 嚴重度維持 observe：本廠實測 kurtosis 與振動量值反向（三台 accOA
+     --   1137.6/504.8/129.7 對應 accKURT 中位數 2.37/3.60/4.53），
+     --   跨設備的絕對判準不成立，改用純相對判定後仍需累積誤報回饋才知道
+     --   精確率，暫不進 SLA（見 vibcore/types.py 的 SEVERITY_OBSERVE）。
+     '{"crest_sigma":2.5,"kurt_sigma":2.5,'
      '"crest_axis_sigma":2.5,"kurt_axis_sigma":2.5,"require_both":false}',
      'accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
     ('DEGRADE_TREND',      '指標持續劣化',     'monotonic',   'degradation_trend','observe',
@@ -756,7 +799,7 @@ WHERE f.status NOT IN ('closed','auto_resolved','false_positive');
 CREATE VIEW v_device_status AS
 SELECT
     d.device_id, d.device_name, d.building, d.floor, d.system_name,
-    d.is_standby, d.iso_machine_class, d.iso_class_source,
+    d.is_standby, d.iso_machine_group, d.iso_foundation, d.iso_class_source,
     COUNT(DISTINCT mp.point_id)                                      AS n_points,
     COUNT(f.finding_id) FILTER (WHERE f.severity = 'err')            AS n_err,
     COUNT(f.finding_id) FILTER (WHERE f.severity = 'warn')           AS n_warn,

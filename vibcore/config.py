@@ -86,6 +86,7 @@ META_COLS = (
 AGG_MEAN = 'mean'      # 代表性水準
 AGG_MAX = 'max'        # 極值，不可平均
 AGG_MIN = 'min'        # 極小值（目前僅溫度用）
+AGG_MEDIAN = 'median'  # 代表性水準，且對窗口長度不敏感（見下方衝擊型指標說明）
 AGG_AT_MAX = 'at_max'  # 取「主振幅最大時」對應的值
 
 #: 進入 Tier 1 資料庫的精選欄位 → (來源欄位, 聚合方式)
@@ -135,8 +136,23 @@ AGG_SPEC: dict[str, tuple[str, str]] = {
     'acc_rms_z':  ('accRMS_z',  AGG_MEAN),
     'acc_oa':     ('accOA',     AGG_MEAN),
     'acc_peak':   ('accPEAK',   AGG_MAX),
-    'acc_crest':  ('accCREST',  AGG_MAX),
-    'acc_kurt':   ('accKURT',   AGG_MAX),
+    # 衝擊型指標同時保留 max 與 median，兩者回答不同問題，缺一不可：
+    #
+    #   max    「這一小時內最劇烈的那一刻有多尖」——衝擊事件不可被平均掉，
+    #           這是當初只存 max 的理由，仍然成立。
+    #   median 「這一小時的代表性形狀」——判定要比對的是這個。
+    #
+    # 為什麼非得補上 median：kurtosis 的業界判準（常態=3、超過 4 視為出現
+    # 衝擊）講的是**一段訊號的峰度**，不是 3600 個滾動窗峰度的最大值。
+    # 以 AHU-601 實測，逐筆中位數 2.37、僅 2.6% 超過 4，但每 30/60/114 筆
+    # 取最大值後平均已達 7.17/13.49/19.00（超過 4 的比例 14%/33%/50%）；
+    # 中位數則不論區塊多大都穩定在 2.37。正式聚合是每小時 3600 筆取 max，
+    # 偏高的幅度只會更大——拿它去比對「>4」這個判準，門檻等於恆為真。
+    # 這是規則層 IMPACT_RISE 判定要改用 median 通道的原因。
+    'acc_crest':        ('accCREST',  AGG_MAX),
+    'acc_kurt':         ('accKURT',   AGG_MAX),
+    'acc_crest_median': ('accCREST',  AGG_MEDIAN),
+    'acc_kurt_median':  ('accKURT',   AGG_MEDIAN),
     'acc_skew':   ('accSKEW',   AGG_MEAN),
     # 位移（mm）
     'disp_rms':   ('dispRMS',   AGG_MEAN),
@@ -165,6 +181,14 @@ AGG_SPEC: dict[str, tuple[str, str]] = {
 AXIS_IMPACT_COLS: dict[str, tuple[str, str, str]] = {
     'acc_crest_axis_max': ('accCREST_x', 'accCREST_y', 'accCREST_z'),
     'acc_kurt_axis_max':  ('accKURT_x',  'accKURT_y',  'accKURT_z'),
+}
+
+#: 逐軸衝擊指標的 median 版本：仍是逐列先取三軸最大（「哪一個方向最尖」是
+#: 每一筆當下的事實，不該被小時內的統計方式改變），但小時層改取中位數。
+#: 理由與 AGG_SPEC 的 acc_kurt_median 相同，見該處說明。
+AXIS_IMPACT_MEDIAN_COLS: dict[str, tuple[str, str, str]] = {
+    'acc_crest_axis_median': ('accCREST_x', 'accCREST_y', 'accCREST_z'),
+    'acc_kurt_axis_median':  ('accKURT_x',  'accKURT_y',  'accKURT_z'),
 }
 
 #: `at_max` 聚合的參考欄位（取此欄最大時對應的值）

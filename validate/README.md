@@ -7,18 +7,24 @@
 「這套規則跑過去 N 個月的資料，量級合不合理」——上線前先看過這份報告，
 再決定門檻要不要調。
 
-> **重要**：撰寫本框架當下，規則層（`VEL_HIGH`／`IMPACT_RISE`／
-> `AXIS_SHIFT`／`ORIENTATION_CHANGE`／`SENSOR_OFFLINE`／`DATA_QUALITY`／
-> `SENSOR_SATURATION`／`STANDBY_NO_RUNTIME` 共 8 條）尚未有對應的
-> `vibcore.rules` 模組，本框架用可替換的 stub 頂上讓回測先跑得通，但
-> **這 8 條規則用 stub 跑出來的建議門檻只能當量級參考，不能直接拿去
-> 上線**——每次執行 `summary.txt` 開頭都會列出「這次回測哪些是真實模組、
-> 哪些還是 stub」，務必先看這段再看數字。已經接上真實模組、回測結果可信
-> 的規則：`ISO_ZONE`／`ISO_CLASS_SUSPECT`（`vibcore.metrics.iso`）、
-> `STEP_CHANGE`（`vibcore.metrics.deviation`）、`DEGRADE_TREND`／
-> `SPECTRAL_SHIFT`（`vibcore.metrics.trend`），基準期計算也已接上
-> `vibcore.metrics.baseline`。真實規則模組完成後如何接上，見下方「模組
-> 如何逐一換成真實實作」。
+> **狀態（2026-09）**：14 條規則**全部已接上真實模組**，不再有 stub。
+> `validate/rules_stub.py` 保留簡化版僅作為 `vibcore.rules` 無法匯入時的
+> 退路，正常執行不會用到；每次執行 `summary.txt` 開頭仍會列出「這次哪些
+> 是真實模組、哪些是 stub」，以此為準。
+
+> **ISO 分類的前提**：ISO 10816-3 的 Zone 判定需要「機器群組」與「基礎
+> 剛性」兩項，而 Analytic CSV 兩項都沒有（`ISO10816_code` 的語意也未經
+> 確認，見 `docs/DATA_CONTRACT.md` §3.1b）。因此**預設所有設備都是未
+> 分類**，`ISO_ZONE` 不觸發、`VEL_HIGH` 走 `sigma_fallback`。
+> 要跑 ISO 相關的回測，必須明確給定假設：
+>
+> ```bash
+> # 單一假設
+> python -m validate.offline --data-dir data/ --assume-iso 3/rigid
+>
+> # 八種組合的對照表（供專家會議決策，只需 Analytic CSV，不必跑完整回測）
+> python -m validate.iso_readiness --data-dir data/ --compare
+> ```
 
 ## 需要準備什麼資料
 

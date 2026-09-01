@@ -235,7 +235,7 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 }
 ```
 
-**給 Agent 的提示**：`iso_class_source: "unset"` 代表這台設備尚未分級，`get_device_status`
+**給 Agent 的提示**：`iso_class_source: "unset"` 代表這台設備尚未分類（ISO 10816-3 的 Zone 判定需要「機器群組」與「基礎剛性」兩項，缺一即為未分類），`get_device_status`
 與 `get_device_trend` 對它不會給出 ISO Zone；報告中應寫「未分級，以相對基準與趨勢監測」，
 不可假設一個等級。
 

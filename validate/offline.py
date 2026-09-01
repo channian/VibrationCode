@@ -34,7 +34,7 @@ import pandas as pd
 from vibcore.config import DEFAULT_AGG
 from validate.backtest import run_backtest, sweep_threshold
 from validate.baseline_stub import USING_REAL_BASELINE
-from validate.points import load_points, trim_points
+from validate.points import load_points, parse_iso_assumption, trim_points
 from validate.report import write_reports
 from validate.rule_defaults import load_rule_configs
 from validate.rules_stub import (
@@ -74,6 +74,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument('--device-meta', default=None,
                    help='JSON 檔，補充 is_standby / iso_machine_class 等台帳資訊'
                         '（Analytic CSV 本身不含這些欄位）')
+    p.add_argument('--assume-iso', default=None, metavar='GROUP/FOUNDATION',
+                   help='ISO 分類假設，例如 3/rigid。Analytic CSV 沒有「基礎剛性」欄位，'
+                        '不給則所有設備視為未分類（ISO_ZONE 不觸發、VEL_HIGH 走 sigma_fallback）。'
+                        '用來做「若這批設備其實是 X 分類，告警量會變多少」的敏感度分析')
     p.add_argument('--rule-config', default=None,
                    help='JSON 檔，整批覆寫規則參數（不給則用 db/schema.sql 的預設 seed）')
     p.add_argument('--out-dir', default='output/validation', help='報告輸出目錄')
@@ -184,7 +188,15 @@ def main(argv: list[str] | None = None) -> int:
                         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
                         datefmt='%H:%M:%S')
 
-    points = load_points(args.data_dir, args.pattern, args.device_meta)
+    try:
+        assume_iso = parse_iso_assumption(args.assume_iso)
+    except ValueError as e:
+        logger.error(str(e))
+        return 2
+    if assume_iso is not None:
+        logger.info(f"ISO 分類假設：{'/'.join(assume_iso)}"
+                    "（這是假設值，不是台帳實際資料——報告引用時務必註明）")
+    points = load_points(args.data_dir, args.pattern, args.device_meta, assume_iso=assume_iso)
     if not points:
         logger.error(f"{args.data_dir} 沒有讀到任何量測點資料，中止")
         return 1

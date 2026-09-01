@@ -290,7 +290,8 @@ def write_dataset(out_dir: str) -> tuple[list[str], str]:
 
     meta = {
         'DEV-STANDBY': {'is_standby': True},
-        'DEV-DEGRADE': {'iso_machine_class': 'I', 'iso_class_source': 'frontend'},
+        'DEV-DEGRADE': {'iso_machine_group': '2', 'iso_foundation': 'rigid',
+                        'iso_class_source': 'manual_override'},
     }
     meta_path = os.path.join(out_dir, 'device_meta.json')
     with open(meta_path, 'w', encoding='utf-8') as f:

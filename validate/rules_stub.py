@@ -152,20 +152,32 @@ def _get_iso_evaluator():
 
 _evaluate_iso, USING_REAL_ISO = _get_iso_evaluator()
 
-#: 內建簡化版門檻，僅在 vibcore.metrics.iso 無法匯入時使用（見上方模組說明）
+#: 內建簡化版門檻，僅在 vibcore.metrics.iso 無法匯入時使用（見上方模組說明）。
+#: 鍵為 '群組/基礎剛性'，數值同 ISO 10816-3（與真實模組保持一致，
+#: 否則 stub 與真實模組會給出不同的 Zone，讓回測結果無法互相比較）。
 _FALLBACK_ISO_THRESHOLDS = {
-    'I':   {'ab': 0.71, 'bc': 1.80, 'cd': 4.50},
-    'II':  {'ab': 1.12, 'bc': 2.80, 'cd': 7.10},
-    'III': {'ab': 1.80, 'bc': 4.50, 'cd': 11.20},
-    'IV':  {'ab': 2.80, 'bc': 7.10, 'cd': 18.00},
+    '1/rigid':    {'ab': 2.30, 'bc': 4.50, 'cd': 7.10},
+    '1/flexible': {'ab': 3.50, 'bc': 7.10, 'cd': 11.00},
+    '2/rigid':    {'ab': 1.40, 'bc': 2.80, 'cd': 4.50},
+    '2/flexible': {'ab': 2.30, 'bc': 4.50, 'cd': 7.10},
+    '3/rigid':    {'ab': 2.30, 'bc': 4.50, 'cd': 7.10},
+    '3/flexible': {'ab': 3.50, 'bc': 7.10, 'cd': 11.00},
+    '4/rigid':    {'ab': 1.40, 'bc': 2.80, 'cd': 4.50},
+    '4/flexible': {'ab': 2.30, 'bc': 4.50, 'cd': 7.10},
 }
+
+
+def _device_iso_key(device) -> str | None:
+    """設備的 '群組/基礎剛性' 鍵；任一缺失回傳 None（等同未分類）。"""
+    g, f = device.iso_machine_group, device.iso_foundation
+    return f'{g}/{f}' if g and f else None
 _ZONE_ORDER = ('A', 'B', 'C', 'D')
 
 
-def _fallback_zone(vel_rms: float | None, machine_class: str | None) -> str | None:
-    if machine_class not in _FALLBACK_ISO_THRESHOLDS or vel_rms is None or pd.isna(vel_rms):
+def _fallback_zone(vel_rms: float | None, iso_key: str | None) -> str | None:
+    if iso_key not in _FALLBACK_ISO_THRESHOLDS or vel_rms is None or pd.isna(vel_rms):
         return None
-    th = _FALLBACK_ISO_THRESHOLDS[machine_class]
+    th = _FALLBACK_ISO_THRESHOLDS[iso_key]
     if vel_rms <= th['ab']:
         return 'A'
     if vel_rms <= th['bc']:
@@ -189,7 +201,7 @@ def rule_iso_zone(ctx: RuleContext) -> RuleOutcome:
             triggered=triggered, rule_code='ISO_ZONE', issue_type='iso_zone_exceed',
             family='oscillating', severity='err' if triggered else 'warn',
             title=f'ISO 位準 Zone {iso.zone}' if triggered else '',
-            detail=f'velRMS={iso.vel_rms}，機械等級 {iso.machine_class}，判定 Zone {iso.zone}',
+            detail=f'velRMS={iso.vel_rms}，ISO 分類 {iso.machine_class}，Zone {iso.zone}',
             interpretation_limit=_TRIAGE_LIMIT,
             current_value=iso.vel_rms, value_unit='mm/s',
             evidence={'zone': iso.zone, 'thresholds': iso.thresholds, 'alert_zone': alert_zone},
@@ -198,9 +210,9 @@ def rule_iso_zone(ctx: RuleContext) -> RuleOutcome:
     # ── 內建簡化版（vibcore.metrics.iso 不可用時）──────────────
     row = _latest_ok_row(agg_asof)
     vel_rms = float(row['vel_rms']) if row is not None and not pd.isna(row.get('vel_rms')) else None
-    if ctx.device.iso_class_source == 'unset' or ctx.device.iso_machine_class is None:
+    if ctx.device.iso_class_source == 'unset' or _device_iso_key(ctx.device) is None:
         return RuleOutcome.no_trigger('ISO_ZONE', 'iso_zone_exceed', 'oscillating')
-    zone = _fallback_zone(vel_rms, ctx.device.iso_machine_class)
+    zone = _fallback_zone(vel_rms, _device_iso_key(ctx.device))
     triggered = zone is not None and _ZONE_ORDER.index(zone) >= _ZONE_ORDER.index(alert_zone)
     return RuleOutcome(triggered=triggered, rule_code='ISO_ZONE', issue_type='iso_zone_exceed',
                         family='oscillating', severity='err' if triggered else 'warn',
@@ -221,10 +233,11 @@ def rule_iso_class_suspect(ctx: RuleContext) -> RuleOutcome:
             severity='warn', title='ISO 等級疑似誤填' if iso.is_class_suspect else '',
             detail=iso.suspect_reason, interpretation_limit=_TRIAGE_LIMIT,
         )
-    if ctx.baseline is None or ctx.device.iso_class_source == 'unset' or ctx.device.iso_machine_class is None:
+    if ctx.baseline is None or ctx.device.iso_class_source == 'unset' \
+            or _device_iso_key(ctx.device) is None:
         return RuleOutcome.no_trigger('ISO_CLASS_SUSPECT', 'iso_class_suspect', 'event')
     stat = ctx.baseline.stats.get('vel_rms')
-    th = _FALLBACK_ISO_THRESHOLDS.get(ctx.device.iso_machine_class)
+    th = _FALLBACK_ISO_THRESHOLDS.get(_device_iso_key(ctx.device))
     triggered = bool(stat and th and stat.median > th['bc'])
     return RuleOutcome(triggered=triggered, rule_code='ISO_CLASS_SUSPECT',
                         issue_type='iso_class_suspect', family='event', severity='warn',

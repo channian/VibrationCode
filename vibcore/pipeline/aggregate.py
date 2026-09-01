@@ -24,8 +24,8 @@ import numpy as np
 import pandas as pd
 
 from vibcore.config import (
-    AGG_SPEC, AGG_MEAN, AGG_MAX, AGG_MIN, AGG_AT_MAX, AT_MAX_REFERENCE,
-    AXIS_ENERGY_COLS, AXIS_IMPACT_COLS, NOMINAL_INTERVALS_SEC,
+    AGG_SPEC, AGG_MEAN, AGG_MAX, AGG_MIN, AGG_MEDIAN, AGG_AT_MAX, AT_MAX_REFERENCE,
+    AXIS_ENERGY_COLS, AXIS_IMPACT_COLS, AXIS_IMPACT_MEDIAN_COLS, NOMINAL_INTERVALS_SEC,
     AggregateConfig, DEFAULT_AGG, DataStatus,
 )
 
@@ -119,6 +119,8 @@ def _aggregate_running(sub_run: pd.DataFrame) -> dict:
             out[target] = float(col.max())
         elif how == AGG_MIN:
             out[target] = float(col.min())
+        elif how == AGG_MEDIAN:
+            out[target] = float(col.median())
         elif how == AGG_AT_MAX:
             if idx_at_max is not None and idx_at_max in sub_run.index:
                 val = pd.to_numeric(pd.Series([sub_run.at[idx_at_max, source]]),
@@ -136,13 +138,19 @@ def _aggregate_running(sub_run: pd.DataFrame) -> dict:
 
 def _axis_impact_max(sub_run: pd.DataFrame) -> dict:
     """
-    逐軸衝擊型指標取「三軸中最大」，再取該小時的最大值。
+    逐軸衝擊型指標：先逐列取「三軸中最大」，再對該小時取 max 與 median。
 
     合成欄（accCREST / accKURT）是對合成訊號另外算的，不是三軸的極值——
     單一方向的衝擊在合成訊號裡會被其他兩軸稀釋。實測 ZP 3-5：三軸
     crest 為 4.65/5.01/4.30，合成欄卻是 4.08，低於任一軸。合成值本身
     沒錯（見 docs/DATA_CONTRACT.md §二），但要抓「某一方向開始出現衝擊」
     就需要逐軸的極值。
+
+    **兩層取值的意義不同，不要混淆**：逐列的「三軸取最大」問的是「這一筆
+    當下哪個方向最尖」，那是每筆資料本身的事實；小時層的 max/median 問的
+    才是「這一小時要用哪個數字代表」。所以逐列一律取最大，小時層才分兩種
+    ——median 供規則判定（對窗口長度不敏感），max 保留供證據呈現與回溯，
+    理由見 config.py 對 `acc_kurt_median` 的說明。
 
     刻意只取極值、不保留是哪一軸——感測器可能貼錯方向，軸標籤不可信。
     """
@@ -155,6 +163,15 @@ def _axis_impact_max(sub_run: pd.DataFrame) -> dict:
         vals = sub_run[present].apply(pd.to_numeric, errors='coerce')
         row_max = vals.max(axis=1).dropna()
         out[target] = float(row_max.max()) if not row_max.empty else None
+
+    for target, cols in AXIS_IMPACT_MEDIAN_COLS.items():
+        present = [c for c in cols if c in sub_run.columns]
+        if not present:
+            out[target] = None
+            continue
+        vals = sub_run[present].apply(pd.to_numeric, errors='coerce')
+        row_max = vals.max(axis=1).dropna()
+        out[target] = float(row_max.median()) if not row_max.empty else None
     return out
 
 
@@ -162,6 +179,7 @@ def _empty_metrics() -> dict:
     """無可用指標時的空值列；一律用 NaN 以免下游出現 None/NaN 混用。"""
     out = {t: np.nan for t in AGG_SPEC}
     out.update({t: np.nan for t in AXIS_IMPACT_COLS})
+    out.update({t: np.nan for t in AXIS_IMPACT_MEDIAN_COLS})
     out['axis_energy_sorted'] = None
     return out
 

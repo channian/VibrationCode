@@ -39,6 +39,18 @@ ASSERTIVE_PATTERNS = (
     r'(?:即將|將於)[^，。；]{0,10}(?:失效|損壞|故障)',
 )
 
+#: 故障詞彙的**術語例外**：這些詞組雖然含有故障詞彙，但屬於分類或量測
+#: 術語，不是在指稱故障成因，比對前先從文字中移除。
+#:
+#: 「基礎」在故障語境是指基礎鬆動／基礎不良，但 ISO 10816-3 的機器分類
+#: 本身就用「剛性基礎／柔性基礎」描述支撐條件（見 metrics/iso.py），
+#: 這個詞組會出現在每一筆 ISO 相關的判定文字裡。不做例外的話，等於逼
+#: 每個作者在分類敘述後面加一句無意義的免責語，久了就會有人乾脆改寫
+#: `FAULT_TERMS`——那才是真正危險的結果。
+TERM_EXCEPTIONS = (
+    '剛性基礎', '柔性基礎', '基礎剛性',
+)
+
 #: 免責語——出現故障詞彙時，需要其中至少一個同時存在。
 HEDGE_MARKERS = (
     '無法區分', '不代表', '不判定', '不是成因', '非成因',
@@ -63,8 +75,14 @@ def check_text(text: str) -> list[str]:
         for m in re.finditer(pattern, text):
             problems.append(f'斷言句式：「{m.group(0)}」')
 
+    # 先移除術語例外再比對故障詞彙（見 TERM_EXCEPTIONS）。只影響詞彙比對，
+    # 不影響上面的斷言句式檢查——「疑似基礎鬆動」那類句子照樣會被擋。
+    scrubbed = text
+    for exc in TERM_EXCEPTIONS:
+        scrubbed = scrubbed.replace(exc, '')
+
     # 故障詞彙需與免責語同時出現
-    used = [t for t in FAULT_TERMS if t in text]
+    used = [t for t in FAULT_TERMS if t in scrubbed]
     if used and not any(h in text for h in HEDGE_MARKERS):
         problems.append(
             f'提及 {"、".join(used)} 但缺少免責語'

@@ -34,7 +34,7 @@ import pandas as pd
 import psycopg2.extensions
 from psycopg2.extras import Json, execute_values
 
-from vibcore.config import AGG_SPEC, AXIS_IMPACT_COLS
+from vibcore.config import AGG_SPEC, AXIS_IMPACT_COLS, AXIS_IMPACT_MEDIAN_COLS
 from vibcore.types import (
     CLOSED_STATUSES,
     FINDING_AUTO_RESOLVED,
@@ -58,14 +58,21 @@ Connection = psycopg2.extensions.connection
 #: 寫入 measurement_agg 的指標欄。AGG_SPEC 之外還要加上 AXIS_IMPACT_COLS
 #: ——那組是跨三軸取極值算出來的，不是單一來源欄位的聚合，所以不在
 #: AGG_SPEC 裡；漏掉的話會安靜地不寫入，欄位永遠是 NULL。
-_AGG_METRIC_COLS: tuple[str, ...] = tuple(AGG_SPEC.keys()) + tuple(AXIS_IMPACT_COLS.keys())
+_AGG_METRIC_COLS: tuple[str, ...] = (tuple(AGG_SPEC.keys())
+                                    + tuple(AXIS_IMPACT_COLS.keys())
+                                    + tuple(AXIS_IMPACT_MEDIAN_COLS.keys()))
 
 #: 每日 rollup 的欄位。週報與長期趨勢讀的是日層，這裡漏掉的欄位在週報裡
 #: 等於不存在——小時層算得再細也沒用。
 _DAILY_METRIC_COLS: tuple[str, ...] = (
     "running_hours", "vel_rms", "vel_oa", "acc_rms", "acc_oa", "acc_peak",
     "acc_crest", "acc_kurt", "disp_p2p", "acc_weighted_mean_freq",
-    "acc_crest_axis_max", "acc_kurt_axis_max", "temp_avg", "temp_max",
+    "acc_crest_axis_max", "acc_kurt_axis_max",
+    # 日層也要帶 median 通道：週報與長期趨勢讀的是日層，規則判定改用
+    # median 之後若這裡沒跟上，週報看到的仍是偏高的 max（見 config.py）
+    "acc_crest_median", "acc_kurt_median",
+    "acc_crest_axis_median", "acc_kurt_axis_median",
+    "temp_avg", "temp_max",
 )
 
 _SEVERITY_RANK = {"ok": 0, "warn": 1, "err": 2}
@@ -113,29 +120,45 @@ def upsert_device(conn: Connection, device: DeviceContext) -> str:
     寫入/更新設備台帳。
 
     `DeviceContext` 只涵蓋規則判定所需的子集欄位（見 types.py），
-    `device` 表另有 rated_power_kw / owner_group 等純管理性欄位不在
-    契約內——這裡刻意不去動那些欄位（不寫入 INSERT 清單），交由台帳
-    管理介面直接對 DB 操作，避免這支函式的呼叫端不小心用預設值覆蓋掉
-    管理員手動填寫的資料。
+    `device` 表另有 owner_group 等純管理性欄位不在契約內——這裡刻意不去動
+    那些欄位（不寫入 INSERT 清單），交由台帳管理介面直接對 DB 操作，避免
+    這支函式的呼叫端不小心用預設值覆蓋掉管理員手動填寫的資料。
+
+    `rated_power_kw` 原本也在「純管理性」那一類，2026-09 起納入契約：
+    ISO 20816-3 的適用範圍下限（> 15 kW）需要它，缺這個欄位就無法擋掉
+    範圍外的設備（見 metrics/iso.py 的 `iso_scope_reason`）。
     """
     sql = """
         INSERT INTO device (device_id, device_name, building, floor, system_name,
-                             machine_type, rated_rpm, fmf_hz, is_standby,
-                             iso_machine_class, iso_class_source, updated_at)
+                             machine_type, rated_power_kw, rated_rpm, fmf_hz, is_standby,
+                             iso_machine_group, iso_foundation, iso_driver_type,
+                             iso_class_source, last_maintenance_at, updated_at)
         VALUES (%(device_id)s, %(device_name)s, %(building)s, %(floor)s, %(system_name)s,
-                %(machine_type)s, %(rated_rpm)s, %(fmf_hz)s, %(is_standby)s,
-                %(iso_machine_class)s, %(iso_class_source)s, now())
+                %(machine_type)s, %(rated_power_kw)s, %(rated_rpm)s, %(fmf_hz)s, %(is_standby)s,
+                %(iso_machine_group)s, %(iso_foundation)s, %(iso_driver_type)s,
+                %(iso_class_source)s, %(last_maintenance_at)s, now())
         ON CONFLICT (device_id) DO UPDATE SET
             device_name       = EXCLUDED.device_name,
             building          = EXCLUDED.building,
             floor             = EXCLUDED.floor,
             system_name       = EXCLUDED.system_name,
-            machine_type      = EXCLUDED.machine_type,
+            machine_type      = COALESCE(EXCLUDED.machine_type, device.machine_type),
             rated_rpm         = EXCLUDED.rated_rpm,
             fmf_hz            = EXCLUDED.fmf_hz,
             is_standby        = EXCLUDED.is_standby,
-            iso_machine_class = EXCLUDED.iso_machine_class,
-            iso_class_source  = EXCLUDED.iso_class_source,
+            -- 以下為**台帳管理欄位**：來源是管理介面或工程師，不是 Analytic
+            -- CSV。每日排程用 CSV 組出來的 DeviceContext 這些欄位一律是
+            -- NULL，若直接寫 EXCLUDED 就會每天把管理員設好的值清成 NULL
+            -- ——而且不會報錯，只會讓 ISO 判定某天起安靜地全部退回未分類。
+            -- 用 COALESCE：有給值才更新，沒給就保留台帳原值。
+            rated_power_kw    = COALESCE(EXCLUDED.rated_power_kw, device.rated_power_kw),
+            iso_machine_group = COALESCE(EXCLUDED.iso_machine_group, device.iso_machine_group),
+            iso_foundation    = COALESCE(EXCLUDED.iso_foundation, device.iso_foundation),
+            iso_driver_type   = COALESCE(EXCLUDED.iso_driver_type, device.iso_driver_type),
+            last_maintenance_at = COALESCE(EXCLUDED.last_maintenance_at, device.last_maintenance_at),
+            iso_class_source  = CASE WHEN EXCLUDED.iso_class_source = 'unset'
+                                     THEN device.iso_class_source
+                                     ELSE EXCLUDED.iso_class_source END,
             updated_at        = now()
         RETURNING device_id
     """
@@ -146,10 +169,14 @@ def upsert_device(conn: Connection, device: DeviceContext) -> str:
         "floor": device.floor or None,
         "system_name": device.system_name or None,
         "machine_type": device.machine_type or None,
+        "rated_power_kw": device.rated_power_kw,
         "rated_rpm": device.rated_rpm,
         "fmf_hz": device.fmf_hz,
         "is_standby": device.is_standby,
-        "iso_machine_class": device.iso_machine_class,
+        "iso_machine_group": device.iso_machine_group,
+        "iso_foundation": device.iso_foundation,
+        "iso_driver_type": device.iso_driver_type,
+        "last_maintenance_at": device.last_maintenance_at,
         "iso_class_source": device.iso_class_source,
     }
     with conn.cursor() as cur:
@@ -166,8 +193,12 @@ def _row_to_device_context(row: dict) -> DeviceContext:
         system_name=row["system_name"] or "",
         machine_type=row["machine_type"] or "",
         is_standby=row["is_standby"],
-        iso_machine_class=row["iso_machine_class"],
+        iso_machine_group=row["iso_machine_group"],
+        iso_foundation=row["iso_foundation"],
+        iso_driver_type=row.get("iso_driver_type"),
+        last_maintenance_at=row.get("last_maintenance_at"),
         iso_class_source=row["iso_class_source"],
+        rated_power_kw=float(row["rated_power_kw"]) if row.get("rated_power_kw") is not None else None,
         rated_rpm=float(row["rated_rpm"]) if row["rated_rpm"] is not None else None,
         fmf_hz=float(row["fmf_hz"]) if row["fmf_hz"] is not None else None,
     )
@@ -1105,10 +1136,10 @@ def get_rule_configs(conn: Connection, active_only: bool = True) -> dict[str, di
 
 
 def get_iso_thresholds(conn: Connection) -> dict[str, dict]:
-    """回傳 `{machine_class: {ab_boundary, bc_boundary, cd_boundary, label, ...}}`。"""
+    """回傳 `{"群組/基礎剛性": {ab_boundary, bc_boundary, cd_boundary, label, ...}}`。"""
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM iso_threshold")
-        return {r["machine_class"]: dict(r) for r in cur.fetchall()}
+        return {f'{r["machine_group"]}/{r["foundation"]}': dict(r) for r in cur.fetchall()}
 
 
 def get_sla_config(conn: Connection, active_only: bool = True) -> dict[str, int]:

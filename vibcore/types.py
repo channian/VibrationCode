@@ -85,16 +85,18 @@ class IsoResult:
     """
     ISO 10816/20816 位準分級結果。
 
-    未分級設備（`iso_class_source == 'unset'`）**不套用 Zone 判定**，
-    此時 `zone` 為 None、`applicable` 為 False。
+    未分類設備（`iso_class_source == 'unset'`、群組或基礎剛性缺失）與
+    ISO 20816-3 適用範圍外的設備（≤ 15 kW 或轉速超出 120–30000 rpm）
+    **一律不套用 Zone 判定**，此時 `zone` 為 None、`applicable` 為 False，
+    `note` 說明是哪一種原因。
     """
     applicable: bool
-    machine_class: str | None        # 'I' | 'II' | 'III' | 'IV'
+    machine_class: str | None        # '群組/基礎剛性'，例如 '2/rigid'；未分類為 None
     class_source: str                # 'unset' | 'frontend' | 'manual_override'
     zone: str | None                 # 'A' | 'B' | 'C' | 'D'
     vel_rms: float | None
     thresholds: dict[str, float] = field(default_factory=dict)   # ab/bc/cd
-    is_class_suspect: bool = False   # 基準期中位數已超過 B/C 界 → 等級可能填錯
+    is_class_suspect: bool = False   # 基準期中位數已超過 B/C 界 → 分類可能填錯
     suspect_reason: str = ''
     note: str = ''
 
@@ -146,10 +148,23 @@ class DeviceContext:
     system_name: str = ''
     machine_type: str = ''
     is_standby: bool = False
-    iso_machine_class: str | None = None
+    #: ISO 10816-3 機器群組 '1'~'4'。**與基礎剛性兩者齊備才能判定 Zone**
+    #: ——同一群組下剛性與柔性的 A/B 界可差近一倍，缺一不可（見 metrics/iso.py）。
+    iso_machine_group: str | None = None
+    #: 基礎剛性 'rigid' | 'flexible'
+    iso_foundation: str | None = None
+    #: 泵浦的驅動型式 'integrated' | 'external'，用於區分 Group 4 與 Group 3。
+    #: 僅供台帳記錄與稽核；Zone 判定直接讀 iso_machine_group，不從這裡推導
+    #: ——推導規則本身需要專家確認，不該埋在程式裡。
+    iso_driver_type: str | None = None
     iso_class_source: str = 'unset'
+    #: 額定功率（kW）與轉速（rpm），用於 ISO 20816-3 的適用範圍檢查
+    rated_power_kw: float | None = None
     rated_rpm: float | None = None
     fmf_hz: float | None = None
+    #: 最後一次保養／大修時點。基準期不得早於此——ISO 10816-3 §5.4.1 要求
+    #: 大修、換軸承、基礎變更後重建 baseline（見 metrics/baseline.py）。
+    last_maintenance_at: datetime | None = None
 
 
 @dataclass

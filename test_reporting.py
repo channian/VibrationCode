@@ -47,11 +47,12 @@ DEFAULT_TEST_DB = "vib_reporting_test"
 SEED_SQL = """
 SET search_path TO vib, public;
 
-INSERT INTO device (device_id, device_name, building, floor, system_name, status, is_standby) VALUES
-  ('AHU-601','外氣空調箱601','A棟','6F','空調','active',false),
-  ('AHU-602','外氣空調箱602','A棟','6F','空調','active',false),
-  ('CHP-101','冰水泵101','B棟','1F','冰水','active',false),
-  ('CHP-102','冰水泵102（備）','B棟','1F','冰水','active',true);
+INSERT INTO device (device_id, device_name, building, floor, system_name, status, is_standby,
+                    iso_machine_group, iso_foundation, iso_class_source, rated_power_kw, rated_rpm) VALUES
+  ('AHU-601','外氣空調箱601','A棟','6F','空調','active',false, '2','rigid','manual_override',75,1710),
+  ('AHU-602','外氣空調箱602','A棟','6F','空調','active',false, '2','rigid','manual_override',75,1710),
+  ('CHP-101','冰水泵101','B棟','1F','冰水','active',false, '3','rigid','manual_override',45,1750),
+  ('CHP-102','冰水泵102（備）','B棟','1F','冰水','active',true, NULL,NULL,'unset',45,1750);
 
 INSERT INTO measure_point (device_id, position, is_active) VALUES
   ('AHU-601','M1',true), ('AHU-602','M1',true),

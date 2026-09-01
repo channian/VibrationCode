@@ -33,8 +33,9 @@ import os
 import pandas as pd
 
 from vibcore.io.analytic_reader import _ENCODINGS
-from vibcore.metrics.iso import ISO_THRESHOLDS, classify_zone, iso_alert_threshold
-from validate.points import _ISO_CODE_MAP
+from vibcore.metrics.iso import (ISO_FOUNDATIONS, ISO_GROUPS, ISO_THRESHOLDS,
+                                 classify_zone, iso_alert_threshold)
+from validate.points import _ISO_CODE_TO_GROUP, parse_iso_assumption
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +93,14 @@ def _read_min(path: str) -> pd.DataFrame | None:
         return None
 
 
-def collect(data_dir: str, pattern: str = '*.csv') -> pd.DataFrame:
-    """掃描資料夾，彙整每台設備的機械等級與 velRMS 水準。"""
+def collect(data_dir: str, pattern: str = '*.csv',
+            assume: tuple[str, str] | None = None) -> pd.DataFrame:
+    """
+    掃描資料夾，彙整每台設備的 ISO 分類與 velRMS 水準。
+
+    `assume` 為 `(群組, 基礎剛性)`；不給則所有設備都算未分類，
+    這是預設也是唯一誠實的預設值——前端資料沒有基礎剛性欄位。
+    """
     paths = sorted(glob.glob(os.path.join(data_dir, pattern)))
     if not paths:
         logger.error(f"{data_dir} 找不到符合 {pattern} 的檔案")
@@ -124,12 +131,16 @@ def collect(data_dir: str, pattern: str = '*.csv') -> pd.DataFrame:
             if not codes.empty:
                 code = int(codes.mode().iloc[0])
 
-        machine_class = _ISO_CODE_MAP.get(code) if code else None
+        # 分類一律來自明確給定的假設，不從 ISO10816_code 猜——該欄位語意
+        # 未經確認，且就算確認了也還缺基礎剛性（見 points._ISO_CODE_TO_GROUP）。
+        # 有填 code 的設備才套用假設，好讓「台帳有填」與「空白」仍分得開。
+        iso_key = assume if (assume is not None and code in _ISO_CODE_TO_GROUP) else None
+        machine_class = '/'.join(iso_key) if iso_key else None
         # 以運轉中 velRMS 的中位數當基準的替代值。真正的基準期由
         # detect_baseline 掃描最穩定窗口而得，這裡只需要一個量級參考。
         baseline_proxy = float(vel_run.median()) if not vel_run.empty else None
-        threshold = (iso_alert_threshold(baseline_proxy, machine_class)
-                     if machine_class and baseline_proxy is not None else None)
+        threshold = (iso_alert_threshold(baseline_proxy, iso_key)
+                     if iso_key and baseline_proxy is not None else None)
         vel_p95 = float(vel_run.quantile(0.95)) if not vel_run.empty else None
 
         rows.append({
@@ -148,8 +159,8 @@ def collect(data_dir: str, pattern: str = '*.csv') -> pd.DataFrame:
             # p95 代表「偶爾會衝到哪一區」。ISO_ZONE 規則預設在 Zone C
             # 才告警，所以長期待在 Zone B 的設備不會有任何 Finding——
             # 那不是異常，但也不是 Zone A，值得在報告裡讓人看見。
-            'zone_median': classify_zone(baseline_proxy, machine_class),
-            'zone_p95': classify_zone(vel_p95, machine_class),
+            'zone_median': classify_zone(baseline_proxy, iso_key),
+            'zone_p95': classify_zone(vel_p95, iso_key),
         })
     return pd.DataFrame(rows)
 
@@ -167,16 +178,16 @@ def report(df: pd.DataFrame) -> None:
     print('  ISO 判定就緒度檢查')
     print('=' * 66)
     print(f'\n設備數：{n}')
-    print(f'  已填機械等級：{len(classified)} 台')
-    print(f'  未填（ISO10816_code 為 0 或空白）：{len(unset)} 台')
+    print(f'  套用到 ISO 分類：{len(classified)} 台')
+    print(f'  未分類（ISO10816_code 為 0/空白，或未給 --assume-iso）：{len(unset)} 台')
 
     if len(classified):
         dist = classified['machine_class'].value_counts().sort_index()
-        print('\n  等級分佈：' + '、'.join(
-            f"{ISO_THRESHOLDS[k]['label']} {v} 台" for k, v in dist.items()))
+        print('\n  分類分佈：' + '、'.join(
+            f"{ISO_THRESHOLDS[tuple(k.split('/'))]['label']} {v} 台" for k, v in dist.items()))
 
     if len(unset):
-        print(f'\n⚠ 未分級的 {len(unset)} 台設備：')
+        print(f'\n⚠ 未分類的 {len(unset)} 台設備：')
         print('    · ISO_ZONE 不做 Zone 判定（這正是它可能觸發 0 次的原因）')
         print('    · VEL_HIGH 的 ISO 模式退回相對基準（evidence 標記 sigma_fallback）')
         print('  ' + '、'.join(unset['device_id'].head(15).tolist())
@@ -189,7 +200,8 @@ def report(df: pd.DataFrame) -> None:
         # 有分級但沒運轉資料要查設備是否真的停機或感測器斷線。
         if classified.empty:
             print('\n沒有任何已分級的設備，因此無法計算 ISO 告警門檻。')
-            print('  處置：請工程師補填 ISO10816_code（1=Class I…4=Class IV）。')
+            print('  處置：ISO 10816-3 的 Zone 判定需要「機器群組」與「基礎剛性」兩項，')
+            print('        前端資料兩項都沒有。請補台帳，或用 --assume-iso 做敏感度分析。')
         else:
             print(f'\n已分級的 {len(classified)} 台都沒有運轉中的 velRMS 資料'
                   '（velRMS > 0.1 mm/s），無法計算門檻。')
@@ -202,9 +214,9 @@ def report(df: pd.DataFrame) -> None:
 
         print('\n  離門檻最近的前 10 台（headroom = p95 ÷ 門檻，≥1 代表已越線）：')
         top = ready.sort_values('headroom_ratio', ascending=False).head(10)
-        print(f'  {"設備":16s} {"等級":5s} {"中位":>7s} {"p95":>7s} {"門檻":>7s} {"headroom":>9s}')
+        print(f'  {"設備":16s} {"分類":12s} {"中位":>7s} {"p95":>7s} {"門檻":>7s} {"headroom":>9s}')
         for r in top.itertuples():
-            print(f'  {r.device_id:16s} {str(r.machine_class):5s} '
+            print(f'  {r.device_id:16s} {str(r.machine_class):12s} '
                   f'{r.vel_rms_median:7.3f} {r.vel_rms_p95:7.3f} '
                   f'{r.iso_alert_threshold:7.3f} {r.headroom_ratio:9.2f}')
 
@@ -219,7 +231,7 @@ def report(df: pd.DataFrame) -> None:
         if not in_b_plus.empty:
             print(f'\n  ⚠ {len(in_b_plus)} 台的**正常運轉水準**已不在 Zone A：')
             for r in in_b_plus.sort_values('vel_rms_median', ascending=False).head(10).itertuples():
-                print(f'    {r.device_id:16s} Class {r.machine_class}　中位 {r.vel_rms_median:.3f} mm/s'
+                print(f'    {r.device_id:16s} {r.machine_class:12s} 中位 {r.vel_rms_median:.3f} mm/s'
                       f'　Zone {r.zone_median}')
             print('    ISO 對 Zone B 的定義是「可長期不受限運轉」，因此 ISO_ZONE')
             print('    （預設 Zone C 才告警）不會為這些設備開單——這是設計如此。')
@@ -235,17 +247,97 @@ def report(df: pd.DataFrame) -> None:
     print('\n' + '=' * 66)
 
 
+def compare(data_dir: str, pattern: str, assumptions: list[tuple[str, str]]) -> pd.DataFrame:
+    """
+    在多個分類假設下各跑一次，輸出對照表。
+
+    **這是給專家會議用的。** 「這些泵到底算 Group 幾、基礎算剛性還柔性」
+    是一個抽象的分類學問題，專家不見得能立刻決定；但「你選這個，正常運轉
+    就已經不在 Zone A 的設備有 N 台、已越過告警門檻的有 M 台」是具體後果，
+    看著數字一句話就能決定。沒有這張表，同樣的討論可能繞很久還沒共識。
+    """
+    rows = []
+    for assume in assumptions:
+        df = collect(data_dir, pattern, assume=assume)
+        if df.empty:
+            continue
+        key = tuple(assume)
+        th = ISO_THRESHOLDS[key]
+        ready = df[df['iso_alert_threshold'].notna()]
+        over = ready[ready['vel_rms_p95'] >= ready['iso_alert_threshold']]
+        zone_med = ready['zone_median'].value_counts()
+        rows.append({
+            '假設': '/'.join(assume),
+            'A/B 界': th['ab'],
+            'B/C 界': th['bc'],
+            '告警門檻中位': (round(float(ready['iso_alert_threshold'].median()), 3)
+                             if not ready.empty else None),
+            '可評估台數': len(ready),
+            '平常在 Zone A': int(zone_med.get('A', 0)),
+            '平常在 Zone B': int(zone_med.get('B', 0)),
+            '平常在 Zone C+': int(zone_med.get('C', 0)) + int(zone_med.get('D', 0)),
+            'p95 已越門檻': len(over),
+        })
+    return pd.DataFrame(rows)
+
+
+def report_compare(df: pd.DataFrame) -> None:
+    if df.empty:
+        print('沒有可比較的結果。')
+        return
+    print('=' * 92)
+    print('  ISO 分類假設敏感度對照')
+    print('=' * 92)
+    print('\n同一批資料，在不同的「機器群組 / 基礎剛性」假設下的判定結果：\n')
+    cols = list(df.columns)
+    widths = {c: max(len(c), *(len(str(v)) for v in df[c])) + 2 for c in cols}
+    print('  ' + ''.join(f'{c:<{widths[c]}}' for c in cols))
+    print('  ' + ''.join('-' * widths[c] for c in cols))
+    for r in df.itertuples(index=False):
+        print('  ' + ''.join(f'{str(v):<{widths[c]}}' for c, v in zip(cols, r)))
+    print('\n判讀方式：')
+    print('  · 「平常在 Zone B」是關鍵欄位——ISO_ZONE 預設 Zone C 才告警，')
+    print('    所以這些設備長期不會產生任何 Finding。數字在不同假設下差很多，')
+    print('    代表「它們是否長期在 Zone B」這個結論完全取決於分類怎麼填。')
+    print('  · 「p95 已越門檻」約略對應 VEL_HIGH 的觸發量級（實際觸發還要看')
+    print('    基準期與持續性條件，這裡只用 p95 當快速代理）。')
+    print('  · 兩欄都大幅變動，就代表分類必須先確認，否則所有 ISO 相關結論都是浮的。')
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description='檢查 ISO 機械等級填寫狀況與告警門檻餘裕')
     p.add_argument('--data-dir', required=True, help='存放 Analytic CSV 的資料夾')
     p.add_argument('--pattern', default='*.csv', help='檔名比對樣式（預設 *.csv）')
     p.add_argument('--csv', default=None, help='另存一份明細 CSV')
+    p.add_argument('--assume-iso', default=None, metavar='GROUP/FOUNDATION',
+                   help='假設全部已填 ISO10816_code 的設備為此分類，例如 3/rigid。'
+                        '不給則所有設備視為未分類（前端沒有基礎剛性欄位）')
+    p.add_argument('--compare', action='store_true',
+                   help='在所有 8 種分類組合下各跑一次並輸出對照表，供專家會議決策')
     p.add_argument('--log-level', default='WARNING',
                    choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level, format='%(levelname)s: %(message)s')
 
-    df = collect(args.data_dir, args.pattern)
+    if args.compare:
+        assumptions = [(g, f) for g in ISO_GROUPS for f in ISO_FOUNDATIONS]
+        cmp_df = compare(args.data_dir, args.pattern, assumptions)
+        report_compare(cmp_df)
+        if args.csv and not cmp_df.empty:
+            os.makedirs(os.path.dirname(os.path.abspath(args.csv)) or '.', exist_ok=True)
+            cmp_df.to_csv(args.csv, index=False, encoding='utf-8-sig')
+            print(f'\n對照表已寫入：{args.csv}')
+        return 0
+
+    try:
+        assume = parse_iso_assumption(args.assume_iso)
+    except ValueError as e:
+        print(f'參數錯誤：{e}')
+        return 2
+
+    df = collect(args.data_dir, args.pattern, assume=assume)
+    if assume is not None:
+        print(f'（分類假設：{"/".join(assume)}——這是假設值，不是台帳實際資料）\n')
     report(df)
 
     if args.csv and not df.empty:

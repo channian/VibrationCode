@@ -218,6 +218,18 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
 
         # ── 基準期：已有就沿用，沒有才嘗試建立 ──
         baseline = repo.get_baseline(conn, point_id)
+
+        # 保養後既有基準失效（ISO 10816-3 §5.4.1）。若不做這件事，
+        # `not_before` 只在「第一次建立基準」時生效——設備大修後既有基準
+        # 會被無限沿用，而那份基準描述的是保養前的機器狀態。之後所有 σ
+        # 判定都對著一個已經不存在的狀態比較，且不會有任何錯誤訊息。
+        last_maint = getattr(device, 'last_maintenance_at', None)
+        if baseline is not None and last_maint is not None \
+                and baseline.start_date < last_maint.date():
+            logger.info(f"  {device_id}/{position}：基準期起點 {baseline.start_date} 早於"
+                        f"最後一次保養 {last_maint.date()}，捨棄並重建")
+            baseline = None
+
         if baseline is None:
             history = repo.get_agg(conn, point_id,
                                    datetime.combine(run_date, datetime.min.time(),
@@ -225,7 +237,12 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
                                    datetime.combine(run_date, datetime.min.time(),
                                                     tzinfo=timezone.utc) + timedelta(days=1))
             if not history.empty:
-                baseline = detect_baseline(history, point_id=point_id)
+                # 基準期不得早於最後一次保養（ISO 10816-3 §5.4.1，
+                # 理由見 detect_baseline 的 not_before 說明）
+                baseline = detect_baseline(
+                    history, point_id=point_id,
+                    not_before=getattr(device, 'last_maintenance_at', None),
+                )
                 if baseline is not None:
                     repo.save_baseline(conn, baseline)
                     logger.info(f"  {device_id}/{position}：建立基準期 "

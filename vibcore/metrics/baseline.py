@@ -23,6 +23,7 @@ baseline.py — 基準期偵測與統計
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 import pandas as pd
 
@@ -253,7 +254,8 @@ def _restrict_to_latest_cadence(agg: pd.DataFrame, point_id: int | str = '') -> 
 
 def detect_baseline(agg: pd.DataFrame,
                      cfg: BaselineConfig = DEFAULT_BASELINE_CFG,
-                     point_id: int | str = '') -> BaselineStats | None:
+                     point_id: int | str = '',
+                     not_before: datetime | None = None) -> BaselineStats | None:
     """
     自動掃描 `agg` 找出最穩定的期間作為基準。
 
@@ -271,11 +273,23 @@ def detect_baseline(agg: pd.DataFrame,
     找不到任何滿足門檻的窗口時（資料太短、太多缺口，或全設備幾乎沒運轉
     過），回傳 `None` 並記錄警告，**不會**硬選一個不可靠的窗口充數。
 
+    **`not_before`（保養後重建基準）**：ISO 10816-3 §5.4.1 要求設備大修、
+    軸承更換、基礎修改造成穩態水準改變時重新檢討 ALARM 的基準值。窗口起點
+    早於這個時點的候選一律排除。
+
+    為什麼一定要做這件事：基準期是演算法自動掃「最穩定的窗口」選出來的，
+    而**穩定不等於健康**。若機器在基準期之後大修、振動下降了，相對判定會
+    把「變好」算成偏離；若窗口剛好橫跨保養前後，那個基準本身就是兩個不同
+    機器狀態的混合，之後所有 σ 判定都建立在一個不存在的狀態上。兩種情況
+    都不會報錯，只會安靜地給出錯誤結論。
+
     Args:
         agg: 該量測點的每小時聚合結果。
         cfg: 滾動窗口掃描參數，見 `BaselineConfig`。
         point_id: 量測點識別碼，會寫入回傳的 `BaselineStats.point_id`
                   （型別契約缺口，見 `compute_baseline_stats` 的說明）。
+        not_before: 最後一次保養／大修時點；窗口起點不得早於此。
+                    為 None（無保養紀錄）時不限制，行為與加入此參數前相同。
 
     Returns:
         穩定度分數最低、且通過完整度與樣本數門檻的 `BaselineStats`
@@ -286,6 +300,28 @@ def detect_baseline(agg: pd.DataFrame,
         return None
 
     agg = _restrict_to_latest_cadence(agg, point_id)
+
+    # 保養後重建基準：先把保養時點之前的資料整段剔除，而不是只在候選窗口
+    # 評分時過濾——後者會讓「窗口起點在保養後、但窗口內仍含保養前資料」的
+    # 情況漏網（窗口長度 14 天，保養日前後的資料很容易同時落在同一窗口）。
+    if not_before is not None:
+        before = len(agg)
+        cutoff = pd.Timestamp(not_before)
+        ts = pd.to_datetime(agg['ts_hour'], errors='coerce')
+        if ts.dt.tz is not None and cutoff.tz is None:
+            cutoff = cutoff.tz_localize(ts.dt.tz)
+        elif ts.dt.tz is None and cutoff.tz is not None:
+            cutoff = cutoff.tz_localize(None)
+        agg = agg[ts >= cutoff]
+        if agg.empty:
+            logger.warning(
+                f"detect_baseline：point={point_id} 最後一次保養（{not_before}）之後"
+                "沒有任何聚合資料，無法建立基準期。保養後需累積足夠運轉時數才會有基準。"
+            )
+            return None
+        if len(agg) < before:
+            logger.info(f"detect_baseline：point={point_id} 已排除保養（{not_before}）"
+                        f"之前的 {before - len(agg)} 列，僅以保養後資料建立基準")
 
     metrics = list(AGG_SPEC.keys())
     # 評分指標必須以「資料中實際存在且有值」為準，不能只看設定檔有沒有列。

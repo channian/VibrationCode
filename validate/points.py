@@ -35,14 +35,27 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from vibcore.io.analytic_reader import load_analytic_dir
+from vibcore.metrics.iso import ISO_FOUNDATIONS, ISO_GROUPS
 from vibcore.types import DeviceContext
 
 logger = logging.getLogger(__name__)
 
-#: ISO10816_code → iso_machine_class 的推測對照。實測樣本此欄目前多數為 0
-#: （未設定，見計畫書 §十二），對照表尚未經工程台帳驗證，僅供回測時若
-#: 欄位剛好有值可以利用；若貴司代碼定義不同，用 `--device-meta` 覆寫即可。
-_ISO_CODE_MAP = {1: 'I', 2: 'II', 3: 'III', 4: 'IV'}
+#: `ISO10816_code` → ISO 10816-3 機器群組的對照。
+#:
+#: **這是一個未經驗證的假設，預設不啟用。** 兩個理由：
+#:
+#: 1. 這個欄位的語意沒人確認過。它可能是 ISO 2372 的 Class I~IV（舊分類），
+#:    也可能是 ISO 10816-3 的 Group 1~4，兩者的數值範圍剛好都是 1~4。
+#:    已知的矛盾線索：ZP 3-5 與 CP 10 都是泵、`ISO10816_code` 都填 2，
+#:    但 ISO 10816-3 的泵浦屬 Group 3/4，Group 2 是「中型機／馬達」。
+#:    要嘛工程師填的是舊的 Class II，要嘛是依驅動馬達而非依泵本身分類。
+#: 2. **就算群組確定了，Zone 判定還缺基礎剛性**（rigid/flexible）——
+#:    同一群組下兩者的 A/B 界可差近一倍，前端資料完全沒有這個欄位。
+#:
+#: 因此預設一律視為未分類，走相對基準與趨勢路徑。要做「若假設是 X 會
+#: 如何」的敏感度分析，用 `--assume-iso GROUP/FOUNDATION` 明確指定，
+#: 或用 `--device-meta` 逐台指定 `iso_machine_group` / `iso_foundation`。
+_ISO_CODE_TO_GROUP = {1: '1', 2: '2', 3: '3', 4: '4'}
 
 
 @dataclass
@@ -55,17 +68,45 @@ class PointSeries:
     source_files: list[str] = field(default_factory=list)
 
 
-def _build_device_context(device_id: str, meta: dict, overrides: dict | None) -> DeviceContext:
+def _build_device_context(device_id: str, meta: dict, overrides: dict | None,
+                          assume_iso: tuple[str, str] | None = None) -> DeviceContext:
+    """
+    組出單一設備的 `DeviceContext`。
+
+    ISO 分類的來源優先序（由高到低）：
+
+      1. `--device-meta` 逐台指定的 `iso_machine_group` / `iso_foundation`
+      2. `--assume-iso` 給的全域假設（供敏感度分析，見 `_ISO_CODE_TO_GROUP`）
+      3. 不分類——**不從 `ISO10816_code` 猜**，理由見 `_ISO_CODE_TO_GROUP`
+
+    `assume_iso` 的群組只在 `ISO10816_code` 有值時才套用，讓「台帳有填」
+    與「台帳空白」兩種設備在敏感度分析裡仍然分得開；基礎剛性則一律套用
+    （前端本來就沒有這個欄位，不套就沒有任何設備能算 Zone）。
+    """
     ov = overrides or {}
     iso_code = meta.get('ISO10816_code')
     try:
         iso_code_int = int(iso_code) if iso_code is not None and not pd.isna(iso_code) else 0
     except (TypeError, ValueError):
         iso_code_int = 0
-    guessed_class = _ISO_CODE_MAP.get(iso_code_int)
+
+    group = ov.get('iso_machine_group')
+    foundation = ov.get('iso_foundation')
+
+    # 假設一律成對套用。只給基礎剛性而沒有群組（或反之）算不出 Zone，
+    # 卻會讓台帳看起來「填了一半」——那種半套用狀態沒有任何用處，
+    # 只會在除錯時誤導人以為分類生效了。
+    from_assumption = False
+    if assume_iso is not None and group is None and foundation is None \
+            and iso_code_int in _ISO_CODE_TO_GROUP:
+        group, foundation = assume_iso
+        from_assumption = True
+
+    classified = group is not None and foundation is not None
 
     rpm = meta.get('RPM')
     fmf = meta.get('FMF')
+    power = meta.get('rated_power_kw', ov.get('rated_power_kw'))
 
     ctx = DeviceContext(
         device_id=device_id,
@@ -75,11 +116,18 @@ def _build_device_context(device_id: str, meta: dict, overrides: dict | None) ->
         system_name=str(ov.get('system_name', meta.get('System', '')) or ''),
         machine_type=str(ov.get('machine_type', '')),
         is_standby=bool(ov.get('is_standby', False)),
-        iso_machine_class=ov.get('iso_machine_class', guessed_class),
-        iso_class_source=ov.get('iso_class_source', 'unset' if guessed_class is None else 'frontend'),
+        iso_machine_group=group,
+        iso_foundation=foundation,
+        iso_driver_type=ov.get('iso_driver_type'),
+        iso_class_source=ov.get('iso_class_source',
+                                'manual_override' if classified else 'unset'),
+        rated_power_kw=float(power) if power is not None and not pd.isna(power) else None,
         rated_rpm=float(rpm) if rpm is not None and not pd.isna(rpm) else None,
         fmf_hz=float(fmf) if fmf is not None and not pd.isna(fmf) else None,
     )
+    # 供呼叫端統計「假設實際套到幾台」——與「總共幾台已分類」是不同的數字，
+    # 後者含 --device-meta 明確指定的設備，會蓋住假設完全沒生效的事實。
+    ctx._from_iso_assumption = from_assumption   # type: ignore[attr-defined]
     return ctx
 
 
@@ -179,13 +227,39 @@ def trim_points(points: list[PointSeries],
     return out
 
 
+def parse_iso_assumption(text: str | None) -> tuple[str, str] | None:
+    """
+    解析 `--assume-iso` 的 `GROUP/FOUNDATION` 字串，例如 `3/rigid`。
+
+    刻意要求同時給群組與基礎剛性——只給其中一個算不出 Zone，
+    讓使用者以為設定生效了卻毫無作用是最糟的失敗模式。
+    """
+    if not text:
+        return None
+    parts = str(text).strip().split('/')
+    if len(parts) != 2:
+        raise ValueError(f"--assume-iso 格式應為 GROUP/FOUNDATION（例如 3/rigid），收到：{text!r}")
+    group, foundation = parts[0].strip(), parts[1].strip().lower()
+    if group not in ISO_GROUPS:
+        raise ValueError(f"群組須為 {'/'.join(ISO_GROUPS)} 之一，收到：{group!r}")
+    if foundation not in ISO_FOUNDATIONS:
+        raise ValueError(f"基礎剛性須為 {'/'.join(ISO_FOUNDATIONS)} 之一，收到：{foundation!r}")
+    return group, foundation
+
+
 def load_points(folder: str, pattern: str = '*.csv',
-                 device_meta_path: str | None = None) -> list[PointSeries]:
+                 device_meta_path: str | None = None,
+                 assume_iso: tuple[str, str] | None = None) -> list[PointSeries]:
     """
     讀取資料夾內所有 Analytic CSV，切分為量測點清單。
 
     這是回測框架讀資料的唯一入口——`offline.py` 之後對每個 `PointSeries`
     各自跑「聚合 → 涵蓋率 → 基準期 → 規則」，彼此獨立、互不影響。
+
+    `assume_iso` 供 ISO 分類的敏感度分析：前端資料沒有基礎剛性欄位、
+    `ISO10816_code` 的語意也未經確認，所以預設所有設備都是未分類。
+    要回答「若這些設備其實是 Group 3 剛性基礎，告警量會變多少」這種問題，
+    就用這個參數跑多次再比較（見 `_build_device_context`）。
     """
     from vibcore.io.analytic_reader import load_analytic_file
     import glob
@@ -214,12 +288,19 @@ def load_points(folder: str, pattern: str = '*.csv',
 
     points: list[PointSeries] = []
     next_point_id = 1
+    n_classified = 0
+    n_from_assumption = 0
     for device_id, entries in sorted(per_device.items()):
         merged = pd.concat([e[0] for e in entries], ignore_index=True) \
             .sort_values('datetime').reset_index(drop=True)
         meta = entries[0][1]
         source_files = [e[2] for e in entries]
-        device_ctx = _build_device_context(device_id, meta, overrides.get(device_id))
+        device_ctx = _build_device_context(device_id, meta, overrides.get(device_id),
+                                            assume_iso=assume_iso)
+        if device_ctx.iso_machine_group and device_ctx.iso_foundation:
+            n_classified += 1
+        if getattr(device_ctx, '_from_iso_assumption', False):
+            n_from_assumption += 1
 
         merged = merged.assign(_position=_position_series(merged))
         for position, sub in merged.groupby('_position', sort=True):
@@ -232,5 +313,19 @@ def load_points(folder: str, pattern: str = '*.csv',
             ))
             next_point_id += 1
 
-    logger.info(f"共載入 {len(per_device)} 台設備、切出 {len(points)} 個量測點")
+    logger.info(f"共載入 {len(per_device)} 台設備、切出 {len(points)} 個量測點；"
+                f"其中 {n_classified} 台有完整的 ISO 分類（群組＋基礎剛性）"
+                + (f"，{n_from_assumption} 台來自 --assume-iso "
+                   f"{'/'.join(assume_iso)}" if assume_iso else ""))
+
+    # 給了假設卻一台都沒套上，代表這批資料的 ISO10816_code 全是 0 或空白。
+    # 不講清楚的話，敏感度分析會「跑完、沒報錯、結果完全沒變」——
+    # 使用者只會以為分類不影響結果，而真相是假設根本沒生效。
+    if assume_iso is not None and n_from_assumption == 0:
+        logger.warning(
+            f"--assume-iso {'/'.join(assume_iso)} 沒有套用到任何設備！"
+            "假設只會套用在 ISO10816_code 有值（1~4）的設備上，而這批資料"
+            "全部為 0 或空白。ISO_ZONE 不會觸發、VEL_HIGH 會走 sigma_fallback，"
+            "本次結果與不給假設完全相同。若要強制指定，請改用 --device-meta 逐台設定。"
+        )
     return points

@@ -39,7 +39,7 @@ import logging
 import pandas as pd
 
 from vibcore.config import DataStatus, FULL_SCALE_MS2, G_TO_MS2, SATURATION_PCT, SENSOR_RANGE_G
-from vibcore.metrics.iso import classify_zone, evaluate_iso
+from vibcore.metrics.iso import classify_zone, evaluate_iso, resolve_class
 from vibcore.rules.engine import register
 from vibcore.types import RuleContext, RuleOutcome
 
@@ -480,7 +480,7 @@ def orientation_change(ctx: RuleContext) -> RuleOutcome:
 # ──────────────────────────────────────────────────────────
 
 def _frontend_zone_cross_check(agg_asof: pd.DataFrame,
-                                machine_class: str,
+                                iso_key: tuple[str, str],
                                 consecutive: int) -> dict | None:
     """
     比對「本系統依 `evaluate_iso()` 同一套門檻算出的 Zone」與「前端已算好
@@ -505,7 +505,7 @@ def _frontend_zone_cross_check(agg_asof: pd.DataFrame,
 
     Args:
         agg_asof: 已用 `_asof()` 篩過「不偷看未來」的聚合資料。
-        machine_class: 本系統依台帳認定的機械等級（呼叫端已確認
+        iso_key: 本系統依台帳認定的 (群組, 基礎剛性)（呼叫端已確認
             `evaluate_iso(...).applicable` 為 True 才會傳進來）。
         consecutive: 連續筆數門檻（對應規則參數
             `frontend_consecutive_readings`）。
@@ -541,7 +541,7 @@ def _frontend_zone_cross_check(agg_asof: pd.DataFrame,
             continue
         if fz_int not in _FRONTEND_ZONE_MAP:
             continue
-        our_zone = classify_zone(float(vel_rms), machine_class)
+        our_zone = classify_zone(float(vel_rms), iso_key)
         if our_zone is None:
             continue
         comparable.append({
@@ -652,7 +652,7 @@ def iso_class_suspect(ctx: RuleContext) -> RuleOutcome:
     cross = None
     if iso.applicable:
         consecutive = max(1, int(ctx.params.get('frontend_consecutive_readings', 3)))
-        cross = _frontend_zone_cross_check(agg_asof, iso.machine_class, consecutive)
+        cross = _frontend_zone_cross_check(agg_asof, resolve_class(ctx.device), consecutive)
 
     if not iso.is_class_suspect and cross is None:
         return RuleOutcome.no_trigger(rule_code, issue_type, family)
