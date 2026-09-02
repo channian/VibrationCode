@@ -238,7 +238,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sweep_df = None
     if not args.no_sweep:
-        specs = list(_DEFAULT_SWEEPS) + [_parse_sweep_arg(s) for s in args.sweep]
+        # 使用者指定的掃描優先於預設：同一個 (規則, 參數) 只保留使用者那組，
+        # 否則 CSV 會出現同一條規則兩份掃描結果（值還可能不同），分析時
+        # groupby 會把兩者混在一起，看起來像資料出錯。
+        user_specs = [_parse_sweep_arg(s) for s in args.sweep]
+        overridden = {(rc, pn) for rc, pn, _ in user_specs}
+        specs = [sp for sp in _DEFAULT_SWEEPS if (sp[0], sp[1]) not in overridden] + user_specs
         frames = []
         for rule_code, param_name, values in specs:
             if rule_code not in rule_configs:

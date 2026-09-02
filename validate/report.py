@@ -10,7 +10,10 @@ report.py — 把回測結果轉成人看得懂的報表
   trigger_density.csv        每台設備每週觸發密度，依 RuleCategory × 是否進SLA
                               兩個正交維度分開算（判斷會不會誤報洪水、
                               以及會不會誤把觀察名單當工作量的關鍵表）
-  episodes_detail.csv        每一個觸發事件的明細（含 category、is_actionable 欄位）
+  episodes_detail.csv        每一個觸發事件的明細（含 category、is_actionable，
+                             以及觸發當下的 threshold_mode／machine_class 等
+                             證據欄位——判讀「這件是 ISO 判定還是退回相對基準」
+                             靠的就是它，完整 evidence 在 evidence_json）
   threshold_sensitivity.csv  門檻敏感度掃描（有跑掃描才會產生）
   summary.txt / summary.html 摘要
 
@@ -438,11 +441,21 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
 
     if sweep_df is not None and not sweep_df.empty:
         lines.append('-- 門檻敏感度掃描 --')
+        lines.append('  ⚠ 事件數不是門檻的單調函數：連續觸發的日子會被合併成一筆事件，')
+        lines.append('    門檻放寬時原本斷開的幾筆會連成一筆長事件，件數反而變少。')
+        lines.append('    校準門檻請看「總天數」——那才是真正的告警總量；')
+        lines.append('    「平均天數」隨門檻放寬而變長，就是合併現象正在發生的訊號。')
+        has_duration = 'total_duration_days' in sweep_df.columns
         for rule_code, g in sweep_df.groupby('rule_code'):
             lines.append(f"  {rule_code}：")
             for _, r in g.iterrows():
-                lines.append(f"    {r['param_name']}={r['param_value']}　"
-                             f"→ {int(r['n_episodes'])} 件（{r['episodes_per_device_per_week']:.3f} 件/設備/週）")
+                line = (f"    {r['param_name']}={r['param_value']}　"
+                        f"→ {int(r['n_episodes'])} 件"
+                        f"（{r['episodes_per_device_per_week']:.3f} 件/設備/週）")
+                if has_duration:
+                    line += (f"　總天數 {int(r['total_duration_days'])}"
+                             f"　平均 {r['avg_duration_days']:.1f} 天/件")
+                lines.append(line)
         lines.append('')
 
     lines.append('=' * 60)

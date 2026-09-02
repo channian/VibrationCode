@@ -290,8 +290,61 @@ def test_axis_direction() -> None:
           out2['axis_energy_by_direction'] is None and out2['axis_energy_sorted'] is not None)
 
 
+def test_backtest_instrumentation() -> None:
+    """回測輸出的可判讀性——這兩項不改變任何判定，只讓結果解讀得出來。"""
+    print("\n[6] 回測輸出：證據欄位與掃描的總持續天數")
+
+    from validate.backtest import (_EVIDENCE_FLAT_KEYS, _episode_evidence,
+                                   _make_episode_row)
+
+    # 沒有 outcome（理論上不會發生，但不該讓整份報告炸掉）
+    empty = _episode_evidence(None)
+    check("outcome 為 None 時所有證據欄位為 None，不拋錯",
+          all(empty[k] is None for k in _EVIDENCE_FLAT_KEYS)
+          and empty['evidence_json'] is None)
+
+    # VEL_HIGH：判讀「這件是 ISO 判定還是退回相對基準」靠的就是 threshold_mode
+    stats = {'vel_rms': (0.45, 0.45, 0.1, 300), 'vel_oa': (0.45, 0.45, 0.1, 300)}
+    rows = [{'vel_rms': v, 'vel_oa': v} for v in (2.0, 2.1, 2.0)]
+    out = vel_high(ctx(rows, stats))
+    ev = _episode_evidence(out)
+    check("VEL_HIGH 事件記錄 threshold_mode", ev['threshold_mode'] == 'iso', str(ev['threshold_mode']))
+    check("VEL_HIGH 事件記錄 machine_class（可驗證分類假設是否套用）",
+          ev['machine_class'] == '2/rigid', str(ev['machine_class']))
+    check("VEL_HIGH 事件記錄持續性緩衝筆數", ev['consecutive_readings'] == 3)
+
+    # 未分類設備應標記為 sigma_fallback——這正是上一輪判讀不出來的那件事
+    out2 = vel_high(ctx(rows, stats, dev=device(iso_machine_group=None, iso_foundation=None,
+                                                iso_class_source='unset')))
+    check("未分類設備的事件標記為 sigma_fallback",
+          _episode_evidence(out2)['threshold_mode'] == 'sigma_fallback',
+          str(_episode_evidence(out2)['threshold_mode']))
+
+    # IMPACT_RISE：判讀走的是 median 通道還是退回 max
+    imp = impact_rise(ctx([{'acc_kurt_median': 4.0}], {'acc_kurt_median': (2.4, 2.4, 0.2, 300)}))
+    ev3 = _episode_evidence(imp)
+    check("IMPACT_RISE 事件記錄實際採用的欄位（median 或退回 max）",
+          ev3['primary_metric'] == 'acc_kurt_median', str(ev3['primary_metric']))
+    check("完整 evidence 保留在 evidence_json",
+          ev3['evidence_json'] and 'channels' in ev3['evidence_json'])
+
+    # 事件列本身要帶上這些欄位
+    class _P:
+        class point:
+            class device:
+                device_id, device_name = 'T', 'T'
+            point_id, position = 1, 'M1'
+    class _R:
+        rule_code = rule_name = family = issue_type = 'X'
+        severity = 'warn'
+    row = _make_episode_row(_P, _R, pd.Timestamp('2026-08-01'), pd.Timestamp('2026-08-03'), out)
+    for k in ('threshold_mode', 'machine_class', 'evidence_json', 'duration_days'):
+        check(f"事件列含 {k} 欄位", k in row)
+    check("duration_days 含頭尾（8/01–8/03 為 3 天）", row['duration_days'] == 3)
+
+
 def test_guardrail() -> None:
-    print("\n[6] 診斷性用語護欄")
+    print("\n[7] 診斷性用語護欄")
 
     stats = {'vel_rms': (0.45, 0.45, 0.1, 300), 'vel_oa': (0.45, 0.45, 0.1, 300)}
     rows = lambda vs: [{'vel_rms': v, 'vel_oa': v} for v in vs]
@@ -326,7 +379,7 @@ def _psql_env() -> dict:
 
 
 def test_db(dbname: str) -> None:
-    print("\n[7] 資料庫：台帳欄位保留與 migration 冪等性")
+    print("\n[8] 資料庫：台帳欄位保留與 migration 冪等性")
     env = _psql_env()
     try:
         subprocess.run(["dropdb", "--if-exists", dbname], env=env, check=True, capture_output=True)
@@ -395,6 +448,7 @@ def main() -> int:
         test_persistence()
         test_baseline_maintenance()
         test_axis_direction()
+        test_backtest_instrumentation()
         test_guardrail()
         test_db(args.dbname)
     except AssertionError as e:

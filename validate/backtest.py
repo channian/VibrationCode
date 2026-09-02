@@ -26,6 +26,7 @@ backtest.py — 回測核心：把「量測點的完整歷史」跑成「規則�
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from dataclasses import dataclass, field
 
@@ -120,8 +121,55 @@ def build_point_context(point: PointSeries, agg_cfg: AggregateConfig = DEFAULT_A
                          axis_baseline=axis_baseline, eval_timestamps=eval_timestamps)
 
 
+#: 從 RuleOutcome.evidence 攤平成獨立欄位的鍵。這些是**判讀結果時最先要問
+#: 的問題**，不該埋在 JSON 裡讓人自己去解析：
+#:
+#:   threshold_mode   VEL_HIGH 走的是 ISO 錨定門檻還是 sigma_fallback
+#:                    ——沒有這欄就分不出「ISO 判定生效了」與「設備未分類、
+#:                    退回相對基準」，而兩者的意義完全不同
+#:   machine_class    ISO 分類（群組/基礎剛性），可驗證 --assume-iso 有沒有
+#:                    真的套用到這台
+#:   trigger_source   IMPACT_RISE 是合成通道、逐軸通道、還是兩者都超標
+#:   primary_metric   實際採用的欄位名（median 或退回 max，見 _impact_channel）
+#:   consecutive_readings  持續性緩衝實際要求幾筆
+#:
+#: 其餘 evidence 一律保留在 `evidence_json`，不逐一開欄——規則之間的
+#: evidence 結構差異很大，全開會變成一張到處是空白的寬表。
+_EVIDENCE_FLAT_KEYS = (
+    'threshold_mode', 'machine_class', 'trigger_source',
+    'primary_metric', 'consecutive_readings',
+)
+
+
+def _episode_evidence(outcome) -> dict:
+    """把觸發當下的 RuleOutcome 攤成事件列的欄位。"""
+    if outcome is None:
+        return {k: None for k in _EVIDENCE_FLAT_KEYS} | {
+            'current_value': None, 'baseline_value': None,
+            'value_unit': None, 'evidence_json': None,
+        }
+    evidence = getattr(outcome, 'evidence', None) or {}
+    out = {k: evidence.get(k) for k in _EVIDENCE_FLAT_KEYS}
+    out['current_value'] = getattr(outcome, 'current_value', None)
+    out['baseline_value'] = getattr(outcome, 'baseline_value', None)
+    out['value_unit'] = getattr(outcome, 'value_unit', None)
+    try:
+        out['evidence_json'] = json.dumps(evidence, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        out['evidence_json'] = None
+    return out
+
+
 def _make_episode_row(pc: PointContext, rule_row: RuleConfigRow,
-                       start: pd.Timestamp, end: pd.Timestamp) -> dict:
+                       start: pd.Timestamp, end: pd.Timestamp,
+                       first_outcome=None) -> dict:
+    """
+    組出一筆事件列。
+
+    `first_outcome` 是**事件第一天**的 RuleOutcome——記錄「當初是什麼條件
+    讓它觸發的」。刻意不用最後一天：門檻與模式在事件期間通常不變，但數值
+    會漂移，而校準門檻時要問的是「觸發的那一刻長什麼樣」。
+    """
     duration_days = (end.normalize() - start.normalize()).days + 1
     return {
         'device_id': pc.point.device.device_id,
@@ -140,6 +188,7 @@ def _make_episode_row(pc: PointContext, rule_row: RuleConfigRow,
         'episode_start': start,
         'episode_end': end,
         'duration_days': duration_days,
+        **_episode_evidence(first_outcome),
     }
 
 
@@ -154,6 +203,7 @@ def build_episodes(pc: PointContext, rule_row: RuleConfigRow, fn: RuleFunc) -> l
 
     episodes: list[dict] = []
     open_start: pd.Timestamp | None = None
+    open_outcome = None          # 觸發當下的 RuleOutcome，見 _make_episode_row
     prev_ts: pd.Timestamp = pc.eval_timestamps[0]
 
     for ts in pc.eval_timestamps:
@@ -172,13 +222,15 @@ def build_episodes(pc: PointContext, rule_row: RuleConfigRow, fn: RuleFunc) -> l
         triggered = bool(outcome and outcome.triggered)
         if triggered and open_start is None:
             open_start = ts
+            open_outcome = outcome
         elif not triggered and open_start is not None:
-            episodes.append(_make_episode_row(pc, rule_row, open_start, prev_ts))
+            episodes.append(_make_episode_row(pc, rule_row, open_start, prev_ts, open_outcome))
             open_start = None
+            open_outcome = None
         prev_ts = ts
 
     if open_start is not None:
-        episodes.append(_make_episode_row(pc, rule_row, open_start, prev_ts))
+        episodes.append(_make_episode_row(pc, rule_row, open_start, prev_ts, open_outcome))
 
     return episodes
 
@@ -259,8 +311,15 @@ def sweep_threshold(point_contexts: list[PointContext],
 
     這是回答「σ 該設多少」的直接依據——若某個門檻附近觸發量斷崖式下降，
     代表資料本身在那個水準附近有一群「剛好卡在邊緣」的樣本，通常是比較
-    安全的切點；若觸發量隨門檴平滑遞減，則要另外看「調到多少才落在可
+    安全的切點；若觸發量隨門檻平滑遞減，則要另外看「調到多少才落在可
     負荷的每週件數」。
+
+    **事件數不是門檻的單調函數，必須同時看總持續天數。** `build_episodes`
+    會把連續觸發的日子合併成一筆事件，所以門檻放寬時，原本斷開的幾筆會
+    連成一筆長事件——件數反而變少。實測 VEL_HIGH 就出現過 σ=2.0 → 84 件、
+    σ=3.0 → 85 件、σ=4.0 → 71 件這種非單調結果。只看件數會得出「調鬆反而
+    告警變少」的錯誤結論；`total_duration_days` 才反映真正的告警總量，
+    而 `avg_duration_days` 能讓合併現象直接現形（門檻越鬆、平均越長）。
     """
     fn = REGISTRY.get(rule_code)
     if fn is None:
@@ -291,11 +350,16 @@ def sweep_threshold(point_contexts: list[PointContext],
             episodes.extend(build_episodes(pc, row, fn))
         n_devices_affected = len({e['device_id'] for e in episodes})
         n_episodes = len(episodes)
+        total_duration = sum(int(e['duration_days']) for e in episodes)
         rows.append({
             'rule_code': rule_code,
             'param_name': param_name,
             'param_value': v,
             'n_episodes': n_episodes,
+            # 告警的「總量」。事件數會因合併而非單調，這個不會——判讀門檻
+            # 時應以此為準（見本函式 docstring）。
+            'total_duration_days': total_duration,
+            'avg_duration_days': round(total_duration / n_episodes, 2) if n_episodes else 0.0,
             'n_devices_affected': n_devices_affected,
             'episodes_per_device_per_week': round(n_episodes / total_device_weeks, 4)
             if total_device_weeks else 0.0,
