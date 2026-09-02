@@ -197,6 +197,76 @@ AT_MAX_REFERENCE = 'accTOP1FREQ_V'
 #: 三軸能量分佈的來源欄位（用於方向無關的軸能量佔比）
 AXIS_ENERGY_COLS = ('accRMS_x', 'accRMS_y', 'accRMS_z')
 
+# ──────────────────────────────────────────────────────────
+# 感測器軸向
+# ──────────────────────────────────────────────────────────
+
+#: `Channel_X/Y/Z` 的數值 → 該軸的物理方向（使用者 2026-09 提供）。
+#:
+#: **x/y/z 與方向的對應逐台不同，必須逐台讀 Channel 欄位，不可用位置推斷。**
+#: 實測三台：
+#:
+#:     設備        Channel_X       Channel_Y       Channel_Z
+#:     AHU-601     4 垂直徑向      6 水平徑向      5 軸向
+#:     ZP 3-5      4 垂直徑向      5 軸向          6 水平徑向
+#:     CP 10       4 垂直徑向      5 軸向          6 水平徑向
+#:
+#: AHU-601 的 Y/Z 與兩台泵相反。這也是既有的 `_axis_energy_sorted`
+#: （排序後只留主/次/弱、丟掉標籤）當初的成因——在不讀 Channel 的前提下，
+#: 那是唯一安全的做法。讀了 Channel 之後就不必再丟掉方向資訊。
+AXIS_DIRECTION_CODES: dict[int, str] = {
+    4: 'vertical_radial',      # 垂直徑向
+    5: 'axial',                # 馬達軸向
+    6: 'horizontal_radial',    # 水平徑向／切線
+}
+
+#: 方向代碼的中文顯示名稱
+AXIS_DIRECTION_LABELS: dict[str, str] = {
+    'vertical_radial':   '垂直徑向',
+    'axial':             '軸向',
+    'horizontal_radial': '水平徑向',
+}
+
+#: `Channel_X/Y/Z` 欄名 → 對應的軸後綴
+_CHANNEL_COLS: dict[str, str] = {'Channel_X': 'x', 'Channel_Y': 'y', 'Channel_Z': 'z'}
+
+
+def resolve_axis_directions(row_or_meta) -> dict[str, str] | None:
+    """
+    由 `Channel_X/Y/Z` 解析出 `{'x': 方向, 'y': 方向, 'z': 方向}`。
+
+    **三個通道必須恰好湊齊 4/5/6 才回傳結果**，否則回傳 None。理由是
+    這三個代碼代表三個互相垂直的方向，缺一或重複都代表台帳設定有問題
+    （例如兩軸都填 5），此時任何方向解讀都是錯的——寧可退回方向無關的
+    排序佔比，也不要用一組矛盾的設定算出看似合理的數字。
+
+    Args:
+        row_or_meta: 任何支援 `[欄名]` 取值的物件（pandas Series、
+            `extract_metadata()` 回傳的 dict、DataFrame 的一列皆可）。
+
+    Returns:
+        `{'x': 'vertical_radial', ...}`；無法解析時 None。
+    """
+    codes: dict[str, int] = {}
+    for col, axis in _CHANNEL_COLS.items():
+        try:
+            v = row_or_meta[col]
+        except (KeyError, IndexError, TypeError):
+            return None
+        if v is None:
+            return None
+        try:
+            code = int(float(v))
+        except (TypeError, ValueError):
+            return None
+        if code not in AXIS_DIRECTION_CODES:
+            return None
+        codes[axis] = code
+
+    if len(codes) != 3 or len(set(codes.values())) != 3:
+        return None
+    return {axis: AXIS_DIRECTION_CODES[code] for axis, code in codes.items()}
+
 
 # ──────────────────────────────────────────────────────────
 # 聚合與資料品質

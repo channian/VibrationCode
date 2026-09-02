@@ -154,3 +154,28 @@ WHERE d.status = 'active'
 GROUP BY d.device_id;
 
 COMMIT;
+
+-- =============================================================
+-- migration 004b：感測器軸向（2026-09 追加）
+--
+-- Channel_X/Y/Z 的 4/5/6 是方向代碼（垂直徑向／軸向／水平徑向），
+-- 資訊本來就在 Analytic CSV 裡，但管線沒讀 → 方向被丟掉、
+-- measure_point.channel_x/y/z 永遠是 NULL。
+--
+-- 既有資料不回填：依方向的佔比需要原始逐軸資料重算，重跑聚合即可。
+-- 新欄位在重跑前為 NULL，此時規則層照常只用方向無關的排序佔比。
+-- =============================================================
+
+BEGIN;
+
+ALTER TABLE measurement_agg
+    ADD COLUMN IF NOT EXISTS axis_energy_by_direction JSONB;
+ALTER TABLE measurement_agg
+    ADD COLUMN IF NOT EXISTS acc_crest_max_direction TEXT;
+ALTER TABLE measurement_agg
+    ADD COLUMN IF NOT EXISTS acc_kurt_max_direction  TEXT;
+
+COMMENT ON COLUMN measurement_agg.axis_energy_by_direction IS
+    '依物理方向的三軸能量佔比（需 Channel_X/Y/Z 正確設定為 4/5/6）；含 axial_ratio 與 hv_ratio';
+
+COMMIT;

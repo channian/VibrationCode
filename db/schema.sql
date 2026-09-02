@@ -184,8 +184,17 @@ CREATE TABLE measurement_agg (
     acc_top1_freq           NUMERIC(10,3),
     acc_top1_amp            NUMERIC(14,6),
     vel_weighted_mean_freq  NUMERIC(10,3),
-    -- 軸能量分佈（排序後佔比，方向無關）
+    -- 軸能量分佈（排序後佔比，方向無關）。任何設備都算得出來，
+    -- 回答「能量集中在單一方向嗎」。
     axis_energy_sorted  JSONB,
+    -- 軸能量分佈（依物理方向）。需要 Channel_X/Y/Z 正確設定為 4/5/6
+    -- （垂直徑向／軸向／水平徑向），未設定或設定矛盾時為 NULL。
+    -- 回答「集中在**哪個**方向」——另含 axial_ratio 與 hv_ratio 兩個
+    -- 跨設備可比的衍生比值。方向資訊本來就在 Analytic CSV 裡，
+    -- 過去被管線丟掉（見 vibcore/config.py 的 resolve_axis_directions）。
+    -- 刻意只加在小時層：日層要如何彙總「方向」需要另外定義規則，
+    -- 沒有想清楚之前不預設一種。
+    axis_energy_by_direction JSONB,
     -- 逐軸衝擊指標取「三軸最大」，再取該小時最大值。合成欄是對合成訊號
     -- 另算的，單一方向的衝擊會被其他兩軸稀釋（實測 ZP 3-5 三軸 crest
     -- 4.65/5.01/4.30，合成欄只有 4.08）。只存極值不存是哪一軸——感測器
@@ -202,6 +211,10 @@ CREATE TABLE measurement_agg (
     acc_kurt_median        NUMERIC(12,6),
     acc_crest_axis_median  NUMERIC(12,6),
     acc_kurt_axis_median   NUMERIC(12,6),
+    -- 衝擊最強的方向（只記標籤，數值沿用上面的逐軸欄位——依方向各存一份
+    -- 會變成 12 個欄位，而逐軸值真正要提供的資訊就是「集中在哪個方向」）
+    acc_crest_max_direction TEXT,
+    acc_kurt_max_direction  TEXT,
     -- 溫度（°C）。與振動獨立的唯一物理通道：「振動上升但溫度持平」與
     -- 「兩者一起上升」對現場的意義不同。可能是感測器內部溫度而非軸承座
     -- 溫度（見 docs/DATA_CONTRACT.md §3.1），故僅用於與自身基準比的相對

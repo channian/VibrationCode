@@ -60,7 +60,10 @@ Connection = psycopg2.extensions.connection
 #: AGG_SPEC 裡；漏掉的話會安靜地不寫入，欄位永遠是 NULL。
 _AGG_METRIC_COLS: tuple[str, ...] = (tuple(AGG_SPEC.keys())
                                     + tuple(AXIS_IMPACT_COLS.keys())
-                                    + tuple(AXIS_IMPACT_MEDIAN_COLS.keys()))
+                                    + tuple(AXIS_IMPACT_MEDIAN_COLS.keys())
+                                    # 方向標籤：同樣不是 AGG_SPEC 的單一來源欄位聚合，
+                                    # 漏掉就會安靜地永遠是 NULL
+                                    + ('acc_crest_max_direction', 'acc_kurt_max_direction'))
 
 #: 每日 rollup 的欄位。週報與長期趨勢讀的是日層，這裡漏掉的欄位在週報裡
 #: 等於不存在——小時層算得再細也沒用。
@@ -318,7 +321,7 @@ def bulk_insert_agg(conn: Connection, point_id: int, agg_df: pd.DataFrame) -> in
     cols = [
         "point_id", "ts_hour", "data_status", "completeness",
         "n_samples_total", "n_samples_running",
-        *_AGG_METRIC_COLS, "axis_energy_sorted",
+        *_AGG_METRIC_COLS, "axis_energy_sorted", "axis_energy_by_direction",
     ]
     rows = []
     for _, r in agg_df.iterrows():
@@ -332,6 +335,7 @@ def bulk_insert_agg(conn: Connection, point_id: int, agg_df: pd.DataFrame) -> in
         ]
         row.extend(_clean_value(r.get(c)) for c in _AGG_METRIC_COLS)
         row.append(_clean_value(r.get("axis_energy_sorted")))
+        row.append(_clean_value(r.get("axis_energy_by_direction")))
         rows.append(tuple(row))
 
     update_cols = [c for c in cols if c not in ("point_id", "ts_hour")]

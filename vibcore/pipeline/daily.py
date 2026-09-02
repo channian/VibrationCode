@@ -168,7 +168,21 @@ def _ensure_device_and_point(conn, meta: dict, position: str) -> tuple[DeviceCon
         fmf_hz=_num(meta.get('FMF')),
     )
     repo.upsert_device(conn, device)
-    point_id = repo.upsert_measure_point(conn, device.device_id, position)
+    # Channel_X/Y/Z 帶著軸向資訊（4=垂直徑向 5=軸向 6=水平徑向），一併寫進
+    # 台帳。這三欄 schema 早就有、upsert_measure_point 也早就接受，但過去
+    # 呼叫時沒傳，所以永遠是 NULL——方向資訊在 CSV 裡卻被管線丟掉了。
+    def _chan(key):
+        v = meta.get(key)
+        try:
+            return int(float(v)) if v is not None and str(v).strip() not in ('', 'nan') else None
+        except (TypeError, ValueError):
+            return None
+
+    point_id = repo.upsert_measure_point(
+        conn, device.device_id, position,
+        channel_x=_chan('Channel_X'), channel_y=_chan('Channel_Y'),
+        channel_z=_chan('Channel_Z'),
+    )
     # 台帳可能已由管理員設定 ISO 等級與備機旗標，讀回較完整的版本
     stored = repo.get_device(conn, device.device_id)
     return (stored or device), point_id

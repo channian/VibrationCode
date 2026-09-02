@@ -26,6 +26,7 @@ import pandas as pd
 from vibcore.config import (
     AGG_SPEC, AGG_MEAN, AGG_MAX, AGG_MIN, AGG_MEDIAN, AGG_AT_MAX, AT_MAX_REFERENCE,
     AXIS_ENERGY_COLS, AXIS_IMPACT_COLS, AXIS_IMPACT_MEDIAN_COLS, NOMINAL_INTERVALS_SEC,
+    resolve_axis_directions,
     AggregateConfig, DEFAULT_AGG, DataStatus,
 )
 
@@ -98,6 +99,93 @@ def _axis_energy_sorted(sub: pd.DataFrame) -> dict | None:
     }
 
 
+def _axis_energy_by_direction(sub: pd.DataFrame) -> dict | None:
+    """
+    依**物理方向**（軸向／垂直徑向／水平徑向）輸出三軸能量佔比。
+
+    與 `_axis_energy_sorted` 並存而非取代，兩者回答不同問題：
+
+      sorted     「能量集中在單一方向嗎」——方向無關，任何設備都算得出來
+      direction  「集中在**哪個**方向」——需要 Channel_X/Y/Z 正確設定
+
+    方向資訊本來就在資料裡（`Channel_X/Y/Z` 的 4/5/6），過去被丟掉是因為
+    管線沒去讀它。有了方向就能區分徑向與軸向，讓證據對專家系統更有指向性
+    ——但本系統仍不做成因判定，只陳述「軸向佔比由 15% 升到 40%」這類現象。
+
+    `Channel_X/Y/Z` 未湊齊 4/5/6 時回傳 None（見 `resolve_axis_directions`），
+    此時下游一律退回 sorted 版本，不會因為台帳沒填就整個聚合失敗。
+
+    另外回傳兩個衍生比值，兩者都是無單位、跨設備可比的量：
+      `axial_ratio`  軸向佔全部能量的比例
+      `hv_ratio`     水平徑向 ÷ 垂直徑向（垂直為 0 時省略）
+    """
+    if sub.empty:
+        return None
+    directions = resolve_axis_directions(sub.iloc[0])
+    if directions is None:
+        return None
+
+    cols = {axis: col for axis, col in
+            zip(('x', 'y', 'z'), AXIS_ENERGY_COLS) if col in sub.columns}
+    if len(cols) < 3:
+        return None
+    means = sub[[cols[a] for a in ('x', 'y', 'z')]].mean()
+    if means.isna().any():
+        return None
+
+    energy = np.square(means.values.astype(float))
+    total = energy.sum()
+    if total <= 0:
+        return None
+
+    out = {directions[a]: round(float(e / total), 4)
+           for a, e in zip(('x', 'y', 'z'), energy)}
+    out['axial_ratio'] = out.get('axial', 0.0)
+    vertical = out.get('vertical_radial')
+    horizontal = out.get('horizontal_radial')
+    if vertical:
+        out['hv_ratio'] = round(horizontal / vertical, 4)
+    # 一併帶出合成量值，理由同 _axis_energy_sorted：總能量太低時佔比
+    # 會被雜訊主導，下游需要這個數字才能判斷佔比值不值得採信。
+    out['energy'] = round(float(np.sqrt(total)), 6)
+    return out
+
+
+def _axis_impact_direction(sub_run: pd.DataFrame) -> dict:
+    """
+    衝擊型指標在**哪個方向**最強（只記方向標籤，不另存三份數值）。
+
+    逐軸的 crest/kurt 已經有 max 與 median 兩組欄位了，再依方向各存一份
+    會變成 12 個欄位。這裡只回答「最尖的是哪個方向」——那才是逐軸值真正
+    要提供的資訊（「衝擊集中在單一方向」對現場的意義與「整體變大」不同），
+    數值本身沿用既有欄位即可。
+
+    Channel 未正確設定時回傳 None 值，下游照常只用方向無關的資訊。
+    """
+    out: dict = {'acc_crest_max_direction': None, 'acc_kurt_max_direction': None}
+    if sub_run.empty:
+        return out
+    directions = resolve_axis_directions(sub_run.iloc[0])
+    if directions is None:
+        return out
+
+    for target, cols in AXIS_IMPACT_COLS.items():
+        key = 'acc_crest_max_direction' if 'crest' in target else 'acc_kurt_max_direction'
+        present = [c for c in cols if c in sub_run.columns]
+        if len(present) < 3:
+            continue
+        vals = sub_run[list(cols)].apply(pd.to_numeric, errors='coerce')
+        # 先對每一軸取該小時的最大值，再看哪一軸最大——與 _axis_impact_max
+        # 的「逐列取三軸最大再取小時最大」數值一致，只是多記下是哪一軸。
+        per_axis = vals.max()
+        if per_axis.isna().all():
+            continue
+        winner = per_axis.idxmax()
+        axis = winner[-1].lower()          # accKURT_x → 'x'
+        out[key] = directions.get(axis)
+    return out
+
+
 def _aggregate_running(sub_run: pd.DataFrame) -> dict:
     """對一小時內的運轉樣本，依欄位語意聚合。"""
     out: dict = {}
@@ -132,7 +220,9 @@ def _aggregate_running(sub_run: pd.DataFrame) -> dict:
             raise ValueError(f"未知的聚合方式：{how}")
 
     out['axis_energy_sorted'] = _axis_energy_sorted(sub_run)
+    out['axis_energy_by_direction'] = _axis_energy_by_direction(sub_run)
     out.update(_axis_impact_max(sub_run))
+    out.update(_axis_impact_direction(sub_run))
     return out
 
 
@@ -181,6 +271,9 @@ def _empty_metrics() -> dict:
     out.update({t: np.nan for t in AXIS_IMPACT_COLS})
     out.update({t: np.nan for t in AXIS_IMPACT_MEDIAN_COLS})
     out['axis_energy_sorted'] = None
+    out['axis_energy_by_direction'] = None
+    out['acc_crest_max_direction'] = None
+    out['acc_kurt_max_direction'] = None
     return out
 
 

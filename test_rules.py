@@ -35,6 +35,7 @@ import pandas as pd
 from vibcore.metrics.baseline import detect_baseline
 from vibcore.metrics.iso import (ISO_THRESHOLDS, evaluate_iso, iso_alert_threshold,
                                  iso_scope_reason, resolve_class)
+from vibcore.config import resolve_axis_directions
 from vibcore.pipeline.aggregate import _aggregate_running
 from vibcore.rules.guardrail import check_outcome, check_text
 from vibcore.rules.metric_rules import impact_rise, iso_zone, vel_high
@@ -244,8 +245,53 @@ def test_baseline_maintenance() -> None:
 # 五、護欄
 # ──────────────────────────────────────────────────────────
 
+def test_axis_direction() -> None:
+    print("\n[5] 感測器軸向（Channel_X/Y/Z 的 4/5/6）")
+
+    check("AHU-601 的 (4,6,5) 解析正確",
+          resolve_axis_directions({'Channel_X': 4, 'Channel_Y': 6, 'Channel_Z': 5})
+          == {'x': 'vertical_radial', 'y': 'horizontal_radial', 'z': 'axial'})
+    check("泵的 (4,5,6) 解析正確——與 AHU 的 Y/Z 相反，證明不可用位置推斷",
+          resolve_axis_directions({'Channel_X': 4, 'Channel_Y': 5, 'Channel_Z': 6})
+          == {'x': 'vertical_radial', 'y': 'axial', 'z': 'horizontal_radial'})
+    check("字串型別也能解析", resolve_axis_directions(
+          {'Channel_X': '4', 'Channel_Y': '5', 'Channel_Z': '6'}) is not None)
+    for bad, why in (({'Channel_X': 4, 'Channel_Y': 5, 'Channel_Z': 5}, '代碼重複'),
+                     ({'Channel_X': 4, 'Channel_Y': 5, 'Channel_Z': 9}, '未知代碼'),
+                     ({'Channel_X': 4, 'Channel_Y': 5}, '缺欄位'),
+                     ({'Channel_X': None, 'Channel_Y': 5, 'Channel_Z': 6}, '空值')):
+        check(f"{why}時回傳 None（不猜方向）", resolve_axis_directions(bad) is None)
+
+    src = 'data/Analytic.csv'
+    if os.path.exists(src):
+        d = pd.read_csv(src, sep='\t', encoding='utf-8-sig', low_memory=False)
+        out = _aggregate_running(d)
+        bd = out['axis_energy_by_direction']
+        check("聚合輸出依方向的佔比", bd is not None and 'axial' in bd, str(bd))
+        check("三個方向佔比加總為 1",
+              abs(sum(bd[k] for k in ('axial', 'vertical_radial', 'horizontal_radial')) - 1.0) < 1e-3)
+        check("axial_ratio 等於 axial 佔比", abs(bd['axial_ratio'] - bd['axial']) < 1e-9)
+        check("排序版仍並存（供 Channel 未設定的設備退回使用）",
+              out['axis_energy_sorted'] is not None)
+        check("排序版的 major 等於依方向的最大值",
+              abs(out['axis_energy_sorted']['major']
+                  - max(bd[k] for k in ('axial', 'vertical_radial', 'horizontal_radial'))) < 1e-3)
+        check("有記錄衝擊最強的方向",
+              out['acc_kurt_max_direction'] in
+              ('axial', 'vertical_radial', 'horizontal_radial'),
+              str(out['acc_kurt_max_direction']))
+    else:
+        skip("以真實資料驗證方向聚合", f"找不到 {src}")
+
+    # Channel 缺失時整組退回 None，但排序版仍要算得出來
+    d2 = pd.DataFrame({'accRMS_x': [1.0, 1.0], 'accRMS_y': [2.0, 2.0], 'accRMS_z': [3.0, 3.0]})
+    out2 = _aggregate_running(d2)
+    check("Channel 欄位不存在時方向為 None，排序版仍可用",
+          out2['axis_energy_by_direction'] is None and out2['axis_energy_sorted'] is not None)
+
+
 def test_guardrail() -> None:
-    print("\n[5] 診斷性用語護欄")
+    print("\n[6] 診斷性用語護欄")
 
     stats = {'vel_rms': (0.45, 0.45, 0.1, 300), 'vel_oa': (0.45, 0.45, 0.1, 300)}
     rows = lambda vs: [{'vel_rms': v, 'vel_oa': v} for v in vs]
@@ -280,7 +326,7 @@ def _psql_env() -> dict:
 
 
 def test_db(dbname: str) -> None:
-    print("\n[6] 資料庫：台帳欄位保留與 migration 冪等性")
+    print("\n[7] 資料庫：台帳欄位保留與 migration 冪等性")
     env = _psql_env()
     try:
         subprocess.run(["dropdb", "--if-exists", dbname], env=env, check=True, capture_output=True)
@@ -348,6 +394,7 @@ def main() -> int:
         test_iso()
         test_persistence()
         test_baseline_maintenance()
+        test_axis_direction()
         test_guardrail()
         test_db(args.dbname)
     except AssertionError as e:

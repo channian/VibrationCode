@@ -30,7 +30,7 @@ import logging
 
 import pandas as pd
 
-from vibcore.config import DEFAULT_TREND
+from vibcore.config import AXIS_DIRECTION_LABELS, DEFAULT_TREND
 from vibcore.metrics import deviation as deviation_mod
 from vibcore.metrics import iso as iso_mod
 from vibcore.metrics import trend as trend_mod
@@ -220,6 +220,37 @@ def _parse_axis_dict(value) -> dict[str, float] | None:
         return {k: float(value[k]) for k in _AXIS_KEYS if k in value and value[k] is not None}
     except (TypeError, ValueError):
         return None
+
+
+def _latest_direction_energy(ctx: RuleContext) -> dict | None:
+    """最新一筆 ok 資料的 `axis_energy_by_direction`；沒有就 None。"""
+    ok = ctx.analyzable()
+    if ok.empty or 'axis_energy_by_direction' not in ok.columns:
+        return None
+    if 'ts_hour' in ok.columns:
+        ok = ok.sort_values('ts_hour')
+    return _parse_axis_dict_raw(ok['axis_energy_by_direction'].iloc[-1])
+
+
+def _parse_axis_dict_raw(value) -> dict | None:
+    """把 JSONB 欄位轉成 dict；格式不對就回 None（不讓一筆髒資料炸掉規則）。"""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def _direction_phrase(direction: dict | None) -> str:
+    """把依方向的佔比敘述成一句話；沒有方向資訊就回空字串。"""
+    if not direction:
+        return ''
+    parts = [f'{label}{direction[key]:.0%}'
+             for key, label in AXIS_DIRECTION_LABELS.items() if key in direction]
+    if not parts:
+        return ''
+    return '目前各方向佔比：' + '、'.join(parts) + '。'
 
 
 def _axis_energy_recent_median(ctx: RuleContext) -> tuple[dict[str, float] | None, int]:
@@ -846,6 +877,7 @@ def axis_shift(ctx: RuleContext) -> RuleOutcome:
         return RuleOutcome.no_trigger('AXIS_SHIFT', 'axis_shift', 'monotonic')
 
     current_energy, n_rows = _axis_energy_recent_median(ctx)
+    direction = _latest_direction_energy(ctx)
     if current_energy is None:
         logger.debug(f"AXIS_SHIFT：point={ctx.point_id} 近 {_AXIS_SHIFT_WINDOW_DAYS:.0f} 天內"
                      f"可用的 axis_energy_sorted 樣本僅 {n_rows} 筆，不足以判定")
@@ -869,7 +901,8 @@ def axis_shift(ctx: RuleContext) -> RuleOutcome:
         title='三軸能量分佈相對基準偏移',
         detail=(f'排序後三軸能量佔比中「{max_key}」相對基準已偏移 {deltas[max_key]:+.1%}'
                 f'（門檻 ±{ratio_delta_th:.0%}），取近 {_AXIS_SHIFT_WINDOW_DAYS:.0f} 天'
-                f'（{n_rows} 筆有效樣本）中位數與基準期比較。'),
+                f'（{n_rows} 筆有效樣本）中位數與基準期比較。'
+                + _direction_phrase(direction)),
         interpretation_limit=(
             '本判定僅反映排序後三軸能量佔比的持續性變化，方向無關，可能源自負載型態改變、'
             '運轉工況變化或感測器安裝狀態改變等多種原因，本系統無法區分具體成因；'
@@ -886,6 +919,10 @@ def axis_shift(ctx: RuleContext) -> RuleOutcome:
             'ratio_delta_threshold': ratio_delta_th,
             'window_days': _AXIS_SHIFT_WINDOW_DAYS,
             'n_rows': n_rows,
+            # 依方向的佔比（Channel_X/Y/Z 有正確設定時才有值）。判定本身
+            # 仍用方向無關的排序佔比——那是這條規則的設計（見 docstring）；
+            # 方向只是讓證據更有指向性，供專家系統判斷該量什麼。
+            'by_direction': direction,
         },
     )
 
