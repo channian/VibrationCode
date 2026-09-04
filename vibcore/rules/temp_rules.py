@@ -28,7 +28,7 @@ temp_rules.py — 溫度型規則（Phase 1 規則集之八）
 ## 規則參數（`ctx.params`，由呼叫端 seed，此檔不內建 DB 預設值表）
 
 - `sigma`（建議預設 2.5）：`temp_avg` 相對基準標準差的觸發門檻。與
-  `IMPACT_RISE` 的 `crest_sigma`/`kurt_sigma` 同量級，而非比照 `VEL_HIGH`
+  `IMPACT_RISE` 的 `crest_sigma` 同量級，而非比照 `VEL_HIGH`
   的 3.0——因為本規則另外用「連續多筆」把關，兩道防線一起收斂假警報，
   單一 σ 門檻不需要拉到最高。
 - `consecutive_readings`（建議預設 3）：需連續幾筆 `ok` 資料都超標才觸發，

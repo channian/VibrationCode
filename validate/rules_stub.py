@@ -363,31 +363,29 @@ def rule_vel_high(ctx: RuleContext) -> RuleOutcome:
 
 
 def rule_impact_rise(ctx: RuleContext) -> RuleOutcome:
-    """accCREST / accKURT 相對基準顯著上升（不判定成因，常見於軸承/潤滑劣化）。"""
+    """accCREST 相對基準顯著上升（不判定成因，常見於軸承/潤滑劣化）。
+
+    kurtosis 通道已於 2026-09 專家會議定案移除，理由見
+    `vibcore.rules.metric_rules.impact_rise`；此處同步拿掉，免得退回 stub
+    時與真實實作給出不同結果。
+    """
     crest_th = float(ctx.params.get('crest_sigma', 2.5))
-    kurt_th = float(ctx.params.get('kurt_sigma', 2.5))
-    require_both = bool(ctx.params.get('require_both', False))
 
     row = _latest_ok_row(ctx.agg[ctx.agg['ts_hour'] <= ctx.now])
     if row is None or ctx.baseline is None:
         return RuleOutcome.no_trigger('IMPACT_RISE', 'impact_rise', 'monotonic')
 
-    crest_stat, kurt_stat = ctx.baseline.stats.get('acc_crest'), ctx.baseline.stats.get('acc_kurt')
+    crest_stat = ctx.baseline.stats.get('acc_crest')
     crest_sigma = crest_stat.sigma_of(float(row['acc_crest'])) \
         if crest_stat and not pd.isna(row.get('acc_crest')) else None
-    kurt_sigma = kurt_stat.sigma_of(float(row['acc_kurt'])) \
-        if kurt_stat and not pd.isna(row.get('acc_kurt')) else None
-
-    crest_up = crest_sigma is not None and crest_sigma >= crest_th
-    kurt_up = kurt_sigma is not None and kurt_sigma >= kurt_th
-    triggered = (crest_up and kurt_up) if require_both else (crest_up or kurt_up)
+    triggered = crest_sigma is not None and crest_sigma >= crest_th
 
     return RuleOutcome(triggered=triggered, rule_code='IMPACT_RISE', issue_type='impact_rise',
                         family='monotonic', severity='warn',
                         title='衝擊性指標上升' if triggered else '',
                         current_value=float(row.get('acc_crest')) if not pd.isna(row.get('acc_crest')) else None,
                         value_unit='', interpretation_limit=_TRIAGE_LIMIT,
-                        evidence={'crest_sigma': crest_sigma, 'kurt_sigma': kurt_sigma})
+                        evidence={'crest_sigma': crest_sigma})
 
 
 def _trend_asof(ctx: RuleContext, metric: str, cfg: TrendConfig) -> TrendResult:

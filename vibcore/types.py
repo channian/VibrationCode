@@ -147,7 +147,12 @@ class DeviceContext:
     floor: str = ''
     system_name: str = ''
     machine_type: str = ''
-    is_standby: bool = False
+    #: 是否為備機。**三態**：True/False 是台帳明確填寫的值，`None` 代表
+    #: 「這個來源不知道」。每日排程用 Analytic CSV 組 DeviceContext 時無從
+    #: 得知備機與否，必須給 None——給 False 會在 upsert 時把管理員設好的
+    #: True 覆寫掉，而且全程沒有錯誤訊息（見 db/repository.upsert_device）。
+    #: 判定端一律以 falsy 視為非備機，所以 None 與 False 的行為相同。
+    is_standby: bool | None = None
     #: ISO 10816-3 機器群組 '1'~'4'。**與基礎剛性兩者齊備才能判定 Zone**
     #: ——同一群組下剛性與柔性的 A/B 界可差近一倍，缺一不可（見 metrics/iso.py）。
     iso_machine_group: str | None = None

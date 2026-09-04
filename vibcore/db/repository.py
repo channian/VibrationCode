@@ -137,7 +137,10 @@ def upsert_device(conn: Connection, device: DeviceContext) -> str:
                              iso_machine_group, iso_foundation, iso_driver_type,
                              iso_class_source, last_maintenance_at, updated_at)
         VALUES (%(device_id)s, %(device_name)s, %(building)s, %(floor)s, %(system_name)s,
-                %(machine_type)s, %(rated_power_kw)s, %(rated_rpm)s, %(fmf_hz)s, %(is_standby)s,
+                %(machine_type)s, %(rated_power_kw)s, %(rated_rpm)s, %(fmf_hz)s,
+                -- 新設備且來源不知道備機與否時落到欄位預設值；DB 端是
+                -- NOT NULL，不能直接寫 NULL 進去
+                COALESCE(%(is_standby)s, FALSE),
                 %(iso_machine_group)s, %(iso_foundation)s, %(iso_driver_type)s,
                 %(iso_class_source)s, %(last_maintenance_at)s, now())
         ON CONFLICT (device_id) DO UPDATE SET
@@ -148,13 +151,20 @@ def upsert_device(conn: Connection, device: DeviceContext) -> str:
             machine_type      = COALESCE(EXCLUDED.machine_type, device.machine_type),
             rated_rpm         = EXCLUDED.rated_rpm,
             fmf_hz            = EXCLUDED.fmf_hz,
-            is_standby        = EXCLUDED.is_standby,
             -- 以下為**台帳管理欄位**：來源是管理介面或工程師，不是 Analytic
             -- CSV。每日排程用 CSV 組出來的 DeviceContext 這些欄位一律是
             -- NULL，若直接寫 EXCLUDED 就會每天把管理員設好的值清成 NULL
             -- ——而且不會報錯，只會讓 ISO 判定某天起安靜地全部退回未分類。
             -- 用 COALESCE：有給值才更新，沒給就保留台帳原值。
             rated_power_kw    = COALESCE(EXCLUDED.rated_power_kw, device.rated_power_kw),
+            -- is_standby 的 DB 欄位是 NOT NULL DEFAULT false，但 DeviceContext
+            -- 側是三態（None = 這個來源不知道）。每日排程從 CSV 組出來的值
+            -- 永遠是 None，直接寫 EXCLUDED 會把管理員設的備機旗標重設為
+            -- false——這正是 2026-09 前的行為，且沒有任何錯誤訊息。
+            -- 這裡讀原始參數而不是 EXCLUDED：EXCLUDED 取的是 VALUES 算完
+            -- 之後的值，那個 COALESCE 已經把 NULL 變成 FALSE，用它就分不出
+            -- 「確認不是備機」與「不知道」了。
+            is_standby        = COALESCE(%(is_standby)s, device.is_standby),
             iso_machine_group = COALESCE(EXCLUDED.iso_machine_group, device.iso_machine_group),
             iso_foundation    = COALESCE(EXCLUDED.iso_foundation, device.iso_foundation),
             iso_driver_type   = COALESCE(EXCLUDED.iso_driver_type, device.iso_driver_type),

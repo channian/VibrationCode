@@ -172,15 +172,13 @@ def _sigma_channel(
 
 
 #: 衝擊型指標的判定通道：(判定用欄位, 舊基準退回欄位)。
-#: 一律優先用 median——kurtosis 的業界判準講的是一段訊號的峰度，不是小時內
-#: 3600 個滾動窗峰度的最大值（實測與完整理由見 config.py 的 acc_kurt_median）。
+#: 一律優先用 median——小時內取最大值會系統性偏高（3600 個滾動窗取最大，
+#: 實測與完整理由見 config.py 的 acc_crest_median）。
 #: 退回 max 是為了既有資料庫：median 欄位是後加的，舊基準沒有對應統計量，
 #: 此時仍用 max 判定並在 evidence 標記，而不是安靜地讓整條規則失效。
 _IMPACT_CHANNELS: dict[str, tuple[str, str]] = {
     'crest':      ('acc_crest_median',           'acc_crest'),
-    'kurt':       ('acc_kurt_median',            'acc_kurt'),
     'crest_axis': ('acc_crest_axis_median',      'acc_crest_axis_max'),
-    'kurt_axis':  ('acc_kurt_axis_median',       'acc_kurt_axis_max'),
 }
 
 
@@ -541,101 +539,88 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
 
 
 # ──────────────────────────────────────────────────────────
-# IMPACT_RISE — accCREST / accKURT 相對基準顯著上升（monotonic）
+# IMPACT_RISE — accCREST 相對基準顯著上升（monotonic）
 # ──────────────────────────────────────────────────────────
 
 @register('IMPACT_RISE')
 def impact_rise(ctx: RuleContext) -> RuleOutcome:
     """
-    accCREST / accKURT 相對基準顯著上升；同時比對**合成通道**
-    （`acc_crest` / `acc_kurt`，對合成訊號算的）與**逐軸通道**
-    （`acc_crest_axis_max` / `acc_kurt_axis_max`，三軸取最大值，見
+    accCREST 相對基準顯著上升；同時比對**合成通道**（`acc_crest`，對合成
+    訊號算的）與**逐軸通道**（`acc_crest_axis_max`，三軸取最大值，見
     `pipeline/aggregate.py` 的 `_axis_impact_max`）。
 
     **為什麼兩種通道都要看，而不是直接用逐軸值取代合成值**：兩者衡量的
-    是不同的東西，敏感度方向也不一致，不能假設其中一種必然比較敏感。
-    實測 ZP 3-5 同一筆資料：三軸 crest 為 4.65/5.01/4.30，合成欄卻只有
-    4.08（低於任一軸——單一方向的衝擊被其他兩軸稀釋掉了）；但同一筆的
-    kurt 恰好相反，三軸為 3.15/3.37/2.87，合成欄卻是 4.53（高於任一軸）。
+    是不同的東西。實測 ZP 3-5 同一筆資料：三軸 crest 為 4.65/5.01/4.30，
+    合成欄卻只有 4.08（低於任一軸——單一方向的衝擊被其他兩軸稀釋掉了）。
     所以本規則對兩種通道分別判定門檻、任一通道超標即觸發（OR），並在
     evidence／detail 裡標明是哪個通道——「衝擊集中在單一方向」只是對
     資料型態的客觀描述，不是成因推論，兩者觸發的意義不同：
     只有逐軸通道超標，代表衝擊可能集中在單一方向；合成與逐軸都超標，
     代表整體性的變化。
 
-    判定邏輯：合成通道與逐軸通道各自沿用原本的「`require_both=False`
-    時任一指標（crest 或 kurt）達門檻即算該通道觸發，`require_both=True`
-    時需兩者同步上升」規則，兩個通道的判定結果再取 OR 作為最終是否觸發。
-    這樣當基準期沒有逐軸統計量時（見下），逐軸通道恆為不觸發，整條規則
-    會自然退化成加入逐軸通道之前的原始行為，不需要另外分支。
+    基準期沒有逐軸統計量時，逐軸通道恆為不觸發，整條規則會自然退化成
+    只看合成值，不需要另外分支。
 
     **判定一律用 median 通道，不用 max**（2026-09 變更）：
 
-    每小時聚合對 accCREST/accKURT 同時存 max 與 median 兩個值，判定用
-    median。因為 max 會系統性偏高——實測 AHU-601 逐筆 accKURT 中位數
-    2.37、僅 2.6% 超過 4，但每 30/60/114 筆取最大值後平均已達
-    7.17/13.49/19.00（超過 4 的比例 14%/33%/50%）；median 則不論區塊多大
-    都穩定在 2.37。正式聚合是每小時 3600 筆，偏高的幅度只會更大。
-
-    基準與現值取自同一通道，所以 σ 判定本身不受此影響；改用 median 是為了
-    讓數值能跟外部判準對照，也讓不同取樣密度的設備之間可比。
+    每小時聚合對 accCREST 同時存 max 與 median 兩個值，判定用 median。
+    因為 max 會系統性偏高——小時內 3600 個滾動窗取最大值，本質上是取
+    極值統計量，隨樣本數單調上升。基準與現值取自同一通道，所以 σ 判定
+    本身不受此影響；改用 median 是為了讓數值能跟外部判準對照，也讓不同
+    取樣密度的設備之間可比。
 
     舊基準沒有 median 統計量時，`_impact_channel` 自動退回對應的 max 欄位
     並在 evidence 的 `channels` 標明實際用了哪個欄位，不會安靜失效。
 
-    **已移除 `kurt_absolute` 與 `threshold_mode`**（2026-09 變更）：
+    **已移除 kurtosis 通道**（2026-09 專家會議定案）：
 
-    原本 kurtosis 要「相對基準上升」與「絕對值 > 4」同時成立才算上升，用意
-    是防止本來就安靜的機器微幅波動就湊到 3σ。但那道絕對門檻是套在每小時取
-    最大值的 accKURT 上（見上），實測任何設備幾乎必然超過 4，等於恆為真
-    ——AND 條件完全沒有把關，`convention` 模式實質上早已退化成 `sigma`
-    模式。留著一道不生效的門檻只會讓後人誤以為有防線，故移除。
+    本規則原本同時判定 accCREST 與 accKURT（任一超標即觸發）。移除
+    accKURT 的依據是兩項實測：
 
-    絕對值判準本身是否可用，要等 median 通道累積資料後重新評估。另有實測
-    顯示本廠 kurtosis 與振動量值反向（三台 accOA 1137.6/504.8/129.7 對應
-    accKURT 中位數 2.37/3.60/4.53），單一絕對門檻能否跨設備適用仍有疑問，
-    列為專家會議待確認事項。
+    1. **跨設備反向**——三台設備 accOA 1137.6/504.8/129.7 對應 accKURT
+       中位數 2.37/3.60/4.53，排序完全顛倒。成因是 kurtosis 為比值型
+       指標（Pearson 定義 m4/m2²），分母含背景振動量：機器越吵，σ 越大，
+       偶發衝擊越被稀釋。所以它反映的是「哪台比較安靜」，不是「哪台比較
+       有問題」。受控驗證可重現此型態：固定衝擊列、只調背景雜訊，
+       accOA 上升 8 倍時 accKURT 由 22.8 降至 3.0。
+    2. **改成純相對基準後仍無鑑別力**——移除失效的絕對門檻、聚合改用
+       中位數之後，觸發結果完全沒變（33 週 511 次 / 60 台，佔機隊 88%），
+       且門檻掃描曲線平滑無斷崖（1.5→4.0 件數 −46%、告警總天數僅 −22%）。
+       問題不在門檻訂多少，在指標本身。
 
+    accCREST 保留：它是 peak/RMS，同樣是比值型指標，但沒有對應的實測
+    證據顯示它在本廠失效，且它是諧波不可用之後僅存的衝擊性通道。
+    下一次回測會另外量「只用 crest」的觸發率，再決定是否一併移除。
 
+    accKURT 仍保留在 `STEP_CHANGE` 的多變量特徵中——在那裡它的角色是
+    「這台機器的運轉點是否偏離自己的常態」的其中一個維度，不是衝擊判準，
+    且移除會改變 Mahalanobis 的維度與門檻語意（k 維距離平方服從卡方分布，
+    自由度變了同一個門檻數字的稀有程度就不同）。那不在本次定案範圍內。
     """
     if ctx.baseline is None:
         logger.debug(f"IMPACT_RISE：point={ctx.point_id} 尚無基準期，無法判定")
         return RuleOutcome.no_trigger('IMPACT_RISE', 'impact_rise', 'monotonic')
 
     crest_th = float(ctx.params.get('crest_sigma', 2.5))
-    kurt_th = float(ctx.params.get('kurt_sigma', 2.5))
     crest_axis_th = float(ctx.params.get('crest_axis_sigma', 2.5))
-    kurt_axis_th = float(ctx.params.get('kurt_axis_sigma', 2.5))
-    require_both = bool(ctx.params.get('require_both', False))
 
     crest_metric, crest_val, crest_stat, crest_sigma, crest_up = \
         _impact_channel(ctx, 'crest', crest_th)
-    kurt_metric, kurt_val, kurt_stat, kurt_sigma, kurt_up = \
-        _impact_channel(ctx, 'kurt', kurt_th)
     crest_axis_metric, crest_axis_val, crest_axis_stat, crest_axis_sigma, crest_axis_up = \
         _impact_channel(ctx, 'crest_axis', crest_axis_th)
-    kurt_axis_metric, kurt_axis_val, kurt_axis_stat, kurt_axis_sigma, kurt_axis_up = \
-        _impact_channel(ctx, 'kurt_axis', kurt_axis_th)
 
-    if all(s is None for s in (crest_sigma, kurt_sigma, crest_axis_sigma, kurt_axis_sigma)):
+    if crest_sigma is None and crest_axis_sigma is None:
         logger.debug(f"IMPACT_RISE：point={ctx.point_id} 無可用的衝擊性指標資料或基準統計量")
         return RuleOutcome.no_trigger('IMPACT_RISE', 'impact_rise', 'monotonic')
 
-    composite_triggered = (crest_up and kurt_up) if require_both else (crest_up or kurt_up)
-    axis_triggered = (crest_axis_up and kurt_axis_up) if require_both else (crest_axis_up or kurt_axis_up)
-    triggered = composite_triggered or axis_triggered
-
-    if not triggered:
+    if not (crest_up or crest_axis_up):
         return RuleOutcome.no_trigger('IMPACT_RISE', 'impact_rise', 'monotonic')
 
-    # 挑 σ 最大者作為呈現用的主要數值（不代表「哪個更重要」，只是取較顯著者）。
-    # 四個候選中缺資料/缺基準統計量的通道 sigma 為 None 已被濾掉；只剩合成
-    # 兩通道時，這一步與加入逐軸通道之前完全等價。
+    # 挑 σ 較大者作為呈現用的主要數值（不代表「哪個更重要」，只是取較顯著者）。
+    # 缺資料／缺基準統計量的通道 sigma 為 None，已被濾掉。
     candidates = [
         (crest_metric, crest_val, crest_stat, crest_sigma),
-        (kurt_metric, kurt_val, kurt_stat, kurt_sigma),
         (crest_axis_metric, crest_axis_val, crest_axis_stat, crest_axis_sigma),
-        (kurt_axis_metric, kurt_axis_val, kurt_axis_stat, kurt_axis_sigma),
     ]
     primary_metric, primary_val, primary_stat, primary_sigma = max(
         (c for c in candidates if c[3] is not None), key=lambda c: c[3],
@@ -643,17 +628,15 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
 
     # 標明觸發來源，讓 evidence／detail 能區分「合成」「逐軸」「兩者都有」
     # ——這個區分只描述資料型態，不推論成因（見函式 docstring）。
-    if composite_triggered and axis_triggered:
+    if crest_up and crest_axis_up:
         trigger_source = 'both'
-    elif axis_triggered:
+    elif crest_axis_up:
         trigger_source = 'axis_max'
     else:
         trigger_source = 'composite'
 
     detail = (f'{_label(primary_metric)} 相對基準期中位數 {primary_stat.median:.2f} '
               f'上升至 {primary_val:.2f}（{primary_sigma:+.1f}σ）。')
-    if crest_up and kurt_up:
-        detail += '合成訊號的波峰因子與峰度同步上升。'
     if trigger_source == 'axis_max':
         detail += '僅逐軸最大值（三軸取大）超標、合成訊號未達門檻，衝擊可能集中在單一方向。'
     elif trigger_source == 'both':
@@ -668,11 +651,10 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
         title='衝擊性指標相對基準顯著上升',
         detail=detail,
         interpretation_limit=(
-            '波峰因子（Crest）與峰度（Kurtosis）反映振動訊號中衝擊成分的強弱，兩者上升通常代表'
+            '波峰因子（Crest）反映振動訊號中衝擊成分的強弱，上升通常代表'
             '週期性衝擊事件增加，常見於軸承劣化、潤滑不足或機件鬆動等情況，'
             '本系統無法區分具體成因；本判定僅反映相對該量測點自身基準的統計偏離，'
-            '不使用任何絕對值門檻——本廠實測顯示峰度與振動量值反向，'
-            '跨設備共用單一絕對門檻並不成立；逐軸值可用於察覺衝擊是否集中在單一方向，'
+            '不使用任何絕對值門檻；逐軸值可用於察覺衝擊是否集中在單一方向，'
             '但感測器可能貼錯方向，本系統刻意不保留是哪一軸，因此無法指出實際方向，'
             '仍建議安排專家量測系統複測以確認。'
         ),
@@ -689,17 +671,10 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
                 'crest':      {'metric': crest_metric, 'current': crest_val,
                                'sigma': round(crest_sigma, 2) if crest_sigma is not None else None,
                                'threshold_sigma': crest_th, 'exceeded': crest_up},
-                'kurt':       {'metric': kurt_metric, 'current': kurt_val,
-                               'sigma': round(kurt_sigma, 2) if kurt_sigma is not None else None,
-                               'threshold_sigma': kurt_th, 'exceeded': kurt_up},
                 'crest_axis': {'metric': crest_axis_metric, 'current': crest_axis_val,
                                'sigma': round(crest_axis_sigma, 2) if crest_axis_sigma is not None else None,
                                'threshold_sigma': crest_axis_th, 'exceeded': crest_axis_up},
-                'kurt_axis':  {'metric': kurt_axis_metric, 'current': kurt_axis_val,
-                               'sigma': round(kurt_axis_sigma, 2) if kurt_axis_sigma is not None else None,
-                               'threshold_sigma': kurt_axis_th, 'exceeded': kurt_axis_up},
             },
-            'require_both': require_both,
         },
     )
 
@@ -712,7 +687,10 @@ def impact_rise(ctx: RuleContext) -> RuleOutcome:
 #: 不含 vel_oa/acc_oa（定義未驗證，見 config.py）與頻譜指標
 #: （由 SPECTRAL_SHIFT 另外處理，避免同一份訊號被兩條規則各自判定成
 #: 「劣化」與「頻譜上移」重複告警）。
-_DEGRADE_TREND_METRICS = ('vel_rms', 'acc_rms', 'acc_crest', 'acc_kurt', 'disp_p2p')
+#: **不含 acc_kurt**（2026-09 專家會議定案）：本廠實測 kurtosis 與振動
+#: 量值反向，「數值上升＝惡化」這個前提在本廠不成立，理由見 IMPACT_RISE
+#: 的 docstring。留著會讓「持續劣化」的判定包含一個方向性存疑的指標。
+_DEGRADE_TREND_METRICS = ('vel_rms', 'acc_rms', 'acc_crest', 'disp_p2p')
 
 
 @register('DEGRADE_TREND')

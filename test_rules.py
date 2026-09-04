@@ -21,6 +21,7 @@ DB 連線沿用 VIB_DB_HOST / VIB_DB_PORT / VIB_DB_USER / VIB_DB_PASSWORD；
 """
 
 import argparse
+import dataclasses
 import datetime as dt
 import logging
 import os
@@ -38,7 +39,8 @@ from vibcore.metrics.iso import (ISO_THRESHOLDS, evaluate_iso, iso_alert_thresho
 from vibcore.config import resolve_axis_directions
 from vibcore.pipeline.aggregate import _aggregate_running
 from vibcore.rules.guardrail import check_outcome, check_text
-from vibcore.rules.metric_rules import impact_rise, iso_zone, vel_high
+from vibcore.rules.metric_rules import (_DEGRADE_TREND_METRICS, _STEP_CHANGE_FEATURES,
+                                        impact_rise, iso_zone, vel_high)
 from vibcore.types import BaselineStats, DeviceContext, MetricStats, RuleContext
 
 logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(name)s: %(message)s")
@@ -94,7 +96,7 @@ def ctx(rows: list[dict], stats: dict, params: dict | None = None,
 # ──────────────────────────────────────────────────────────
 
 def test_impact() -> None:
-    print("\n[1] 衝擊型指標：聚合 max/median 並存，判定用 median")
+    print("\n[1] 衝擊型指標：聚合 max/median 並存，判定用 median 的 crest")
 
     # 用真實資料驗證聚合，沒有就退回合成資料（結論相同，只是說服力較低）
     src = 'data/Analytic.csv'
@@ -104,39 +106,67 @@ def test_impact() -> None:
         check("聚合同時輸出 max 與 median 兩個通道",
               all(out.get(k) is not None for k in
                   ('acc_kurt', 'acc_kurt_median', 'acc_crest', 'acc_crest_median',
-                   'acc_kurt_axis_max', 'acc_kurt_axis_median')))
+                   'acc_crest_axis_max', 'acc_crest_axis_median')))
         check("median 欄位等於逐筆中位數",
-              abs(out['acc_kurt_median'] - d['accKURT'].median()) < 1e-9,
-              f"{out['acc_kurt_median']} vs {d['accKURT'].median()}")
+              abs(out['acc_crest_median'] - d['accCREST'].median()) < 1e-9,
+              f"{out['acc_crest_median']} vs {d['accCREST'].median()}")
         check("max 欄位等於逐筆最大值",
-              abs(out['acc_kurt'] - d['accKURT'].max()) < 1e-9)
+              abs(out['acc_crest'] - d['accCREST'].max()) < 1e-9)
         check(f"實測 max({out['acc_kurt']:.2f}) 遠高於 median({out['acc_kurt_median']:.2f})"
               "——這是移除絕對門檻的依據",
               out['acc_kurt'] > 4 > out['acc_kurt_median'])
+        # kurtosis 欄位仍然聚合入庫（STEP_CHANGE 還在用，且日後可能翻案），
+        # 只是不再進 IMPACT_RISE 的判定
+        check("accKURT 仍照常聚合入庫（供 STEP_CHANGE 與日後重新評估）",
+              out.get('acc_kurt_median') is not None)
     else:
         skip("以真實資料驗證聚合", f"找不到 {src}")
 
     r = impact_rise(ctx(
-        [{'acc_kurt_median': 4.0, 'acc_kurt': 40.0, 'acc_crest_median': 2.6}],
-        {'acc_kurt_median': (2.4, 2.4, 0.2, 300), 'acc_crest_median': (2.6, 2.6, 0.3, 300)}))
+        [{'acc_crest_median': 3.4, 'acc_crest': 9.0}],
+        {'acc_crest_median': (2.6, 2.6, 0.3, 300)}))
     check("有 median 基準時優先用 median 通道",
-          r.triggered and r.evidence['channels']['kurt']['metric'] == 'acc_kurt_median',
-          str(r.evidence['channels']['kurt']))
+          r.triggered and r.evidence['channels']['crest']['metric'] == 'acc_crest_median',
+          str(r.evidence['channels']['crest']))
 
-    r = impact_rise(ctx([{'acc_kurt_median': 4.0, 'acc_kurt': 40.0}],
-                        {'acc_kurt': (20.0, 20.0, 2.0, 300)}))
+    r = impact_rise(ctx([{'acc_crest_median': 3.4, 'acc_crest': 9.0}],
+                        {'acc_crest': (5.0, 5.0, 0.5, 300)}))
     check("舊基準沒有 median 統計量時退回 max 並標明",
-          r.triggered and r.evidence['channels']['kurt']['metric'] == 'acc_kurt',
-          str(r.evidence['channels']['kurt']))
+          r.triggered and r.evidence['channels']['crest']['metric'] == 'acc_crest',
+          str(r.evidence['channels']['crest']))
 
-    r = impact_rise(ctx([{'acc_kurt_median': 4.6}],
-                        {'acc_kurt_median': (4.53, 4.53, 0.5, 300)}))
-    check("基線本來就高的機器不因絕對值觸發（ZP 3-5 情境，中位數 4.53）",
+    # ── 2026-09 專家會議定案：移除 kurtosis 通道 ──────────────
+    r = impact_rise(ctx([{'acc_kurt_median': 40.0, 'acc_crest_median': 2.6}],
+                        {'acc_kurt_median': (2.4, 2.4, 0.2, 300),
+                         'acc_crest_median': (2.6, 2.6, 0.3, 300)}))
+    check("kurtosis 暴增但 crest 不動時不再觸發（kurt 通道已移除）",
           not r.triggered)
 
-    r = impact_rise(ctx([{'acc_kurt_median': 4.0}], {'acc_kurt_median': (2.4, 2.4, 0.2, 300)}))
-    for gone in ('kurt_absolute_threshold', 'kurt_absolute_exceeded', 'threshold_mode'):
+    r = impact_rise(ctx([{'acc_crest_median': 3.4, 'acc_kurt_median': 40.0}],
+                        {'acc_crest_median': (2.6, 2.6, 0.3, 300),
+                         'acc_kurt_median': (2.4, 2.4, 0.2, 300)}))
+    check("evidence 的 channels 只剩 crest 與 crest_axis",
+          r.triggered and set(r.evidence['channels']) == {'crest', 'crest_axis'},
+          str(sorted(r.evidence['channels'])))
+    for gone in ('kurt_absolute_threshold', 'kurt_absolute_exceeded',
+                 'threshold_mode', 'require_both'):
         check(f"evidence 不再含已移除的 {gone}", gone not in r.evidence)
+    check("interpretation_limit 不再提 Kurtosis",
+          'Kurtosis' not in r.interpretation_limit and '峰度' not in r.interpretation_limit,
+          r.interpretation_limit)
+
+    # 逐軸通道仍在：衝擊集中在單一方向時，合成值可能被稀釋
+    r = impact_rise(ctx([{'acc_crest_median': 2.6, 'acc_crest_axis_median': 5.0}],
+                        {'acc_crest_median': (2.6, 2.6, 0.3, 300),
+                         'acc_crest_axis_median': (3.0, 3.0, 0.4, 300)}))
+    check("僅逐軸超標時仍觸發並標記 trigger_source=axis_max",
+          r.triggered and r.evidence['trigger_source'] == 'axis_max',
+          str(r.evidence.get('trigger_source')))
+
+    check("DEGRADE_TREND 的候選指標已移除 acc_kurt",
+          'acc_kurt' not in _DEGRADE_TREND_METRICS, str(_DEGRADE_TREND_METRICS))
+    check("STEP_CHANGE 仍保留 acc_kurt（多變量特徵，不是衝擊判準）",
+          'acc_kurt' in _STEP_CHANGE_FEATURES, str(_STEP_CHANGE_FEATURES))
 
 
 # ──────────────────────────────────────────────────────────
@@ -321,10 +351,10 @@ def test_backtest_instrumentation() -> None:
           str(_episode_evidence(out2)['threshold_mode']))
 
     # IMPACT_RISE：判讀走的是 median 通道還是退回 max
-    imp = impact_rise(ctx([{'acc_kurt_median': 4.0}], {'acc_kurt_median': (2.4, 2.4, 0.2, 300)}))
+    imp = impact_rise(ctx([{'acc_crest_median': 3.4}], {'acc_crest_median': (2.6, 2.6, 0.3, 300)}))
     ev3 = _episode_evidence(imp)
     check("IMPACT_RISE 事件記錄實際採用的欄位（median 或退回 max）",
-          ev3['primary_metric'] == 'acc_kurt_median', str(ev3['primary_metric']))
+          ev3['primary_metric'] == 'acc_crest_median', str(ev3['primary_metric']))
     check("完整 evidence 保留在 evidence_json",
           ev3['evidence_json'] and 'channels' in ev3['evidence_json'])
 
@@ -351,7 +381,7 @@ def test_guardrail() -> None:
     outcomes = [
         iso_zone(ctx(rows([3.5, 3.6, 3.5]), stats)),
         vel_high(ctx(rows([2.0, 2.1, 2.0]), stats)),
-        impact_rise(ctx([{'acc_kurt_median': 4.0}], {'acc_kurt_median': (2.4, 2.4, 0.2, 300)})),
+        impact_rise(ctx([{'acc_crest_median': 3.4}], {'acc_crest_median': (2.6, 2.6, 0.3, 300)})),
     ]
     for o in outcomes:
         problems = check_outcome(o)
@@ -362,6 +392,71 @@ def test_guardrail() -> None:
     check("真正的故障斷言仍被擋下", bool(check_text('疑似基礎鬆動')))
     check("帶免責語的可能性列舉仍放行",
           not check_text('可能源自基礎鬆動或負載變化等多種原因，本系統無法區分'))
+
+
+# ──────────────────────────────────────────────────────────
+# 台帳補填：CSV 範本與匯入（D1）
+# ──────────────────────────────────────────────────────────
+
+def test_ledger() -> None:
+    print("\n[8] 台帳補填：CSV 範本產出與匯入")
+
+    import tempfile
+
+    from validate.iso_readiness import (_LEDGER_FILL_COLS, _LEDGER_REFERENCE_COLS,
+                                        emit_ledger_template)
+    from validate.points import load_device_meta_overrides
+
+    src = pd.DataFrame([
+        {'device_id': 'ZP 3-5', 'rated_rpm': 1750.0, 'n_running': 4210,
+         'vel_rms_median': 0.412, 'vel_rms_p95': 0.981},
+        {'device_id': 'AHU-601', 'rated_rpm': 1710.0, 'n_running': 3012,
+         'vel_rms_median': 1.204, 'vel_rms_p95': 2.310},
+    ])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'ledger.csv')
+        n = emit_ledger_template(src, path)
+        check("範本列數等於設備數", n == 2, str(n))
+
+        written = pd.read_csv(path, encoding='utf-8-sig', dtype=str)
+        check("範本含全部參考欄",
+              all(c in written.columns for c in _LEDGER_REFERENCE_COLS),
+              str(list(written.columns)))
+        check("範本含全部待填欄（且為空）",
+              all(c in written.columns and written[c].isna().all()
+                  for c in _LEDGER_FILL_COLS),
+              str(list(written.columns)))
+        check("範本依 device_id 排序，方便在試算表裡整批填同型號",
+              list(written['device_id']) == ['AHU-601', 'ZP 3-5'],
+              str(list(written['device_id'])))
+
+        # 模擬工程師填完：只填其中一台，另一台整列留空
+        written.loc[written['device_id'] == 'ZP 3-5',
+                    ['rated_power_kw', 'iso_machine_group', 'iso_foundation',
+                     'is_standby', 'last_maintenance_at']] = \
+            ['45', '3', 'rigid', 'TRUE', '2026-03-14']
+        written.to_csv(path, index=False, encoding='utf-8-sig')
+
+        ov = load_device_meta_overrides(path)
+        check("填好的設備讀得回來", 'ZP 3-5' in ov, str(sorted(ov)))
+        got = ov.get('ZP 3-5', {})
+        check("群組與基礎剛性讀成字串（與 ISO_THRESHOLDS 的鍵型別一致）",
+              got.get('iso_machine_group') == '3' and got.get('iso_foundation') == 'rigid',
+              str(got))
+        check("rated_power_kw 轉成數字", got.get('rated_power_kw') == 45.0, str(got))
+        check("is_standby 的 TRUE 轉成布林", got.get('is_standby') is True, str(got))
+        check("整列留空的設備不產生 override（留空 ≠ 填了空值）",
+              'AHU-601' not in ov, str(sorted(ov)))
+        check("參考欄不會被當成台帳欄位讀進來",
+              'vel_rms_median' not in got and 'n_running' not in got, str(sorted(got)))
+
+    # 布林欄的各種寫法
+    from validate.points import _ledger_bool
+    for raw, want in (('TRUE', True), ('true', True), ('Y', True), ('是', True), ('1', True),
+                      ('FALSE', False), ('no', False), ('否', False), ('0', False),
+                      ('', None), ('  ', None), ('不確定', None), (None, None)):
+        check(f"is_standby「{raw}」→ {want}", _ledger_bool(raw) is want, str(_ledger_bool(raw)))
 
 
 # ──────────────────────────────────────────────────────────
@@ -379,7 +474,7 @@ def _psql_env() -> dict:
 
 
 def test_db(dbname: str) -> None:
-    print("\n[8] 資料庫：台帳欄位保留與 migration 冪等性")
+    print("\n[9] 資料庫：台帳欄位保留與 migration 冪等性")
     env = _psql_env()
     try:
         subprocess.run(["dropdb", "--if-exists", dbname], env=env, check=True, capture_output=True)
@@ -406,6 +501,7 @@ def test_db(dbname: str) -> None:
         device_id='P1', device_name='泵1', building='A棟', floor='1F', system_name='冰水',
         iso_machine_group='3', iso_foundation='rigid', iso_driver_type='external',
         iso_class_source='manual_override', rated_power_kw=75.0, rated_rpm=1750.0,
+        is_standby=True,
         last_maintenance_at=dt.datetime(2026, 4, 2, tzinfo=dt.timezone.utc))
     repo.upsert_device(conn, admin)
     # 模擬每日排程：用 CSV 組出的 context 再 upsert 一次（台帳欄位皆 None）
@@ -421,17 +517,38 @@ def test_db(dbname: str) -> None:
               getattr(got, field) is not None, f"{field} 被清成 NULL")
     check("iso_class_source 不被 'unset' 覆蓋",
           got.iso_class_source == 'manual_override', got.iso_class_source)
+    # is_standby 是 NOT NULL DEFAULT false，2026-09 前每日排程會安靜地
+    # 把管理員設的 true 重設成 false（DeviceContext 側預設就是 False）
+    check("每日排程 upsert 不會把備機旗標重設為 false",
+          got.is_standby is True, f"is_standby = {got.is_standby}")
+    # 明確填 false 仍要能改掉——COALESCE 只擋 None，不該連「確認不是備機」
+    # 也一起擋掉，否則備機一旦設成 true 就永遠改不回來
+    repo.upsert_device(conn, dataclasses.replace(admin, is_standby=False))
+    conn.commit()
+    check("台帳明確填 false 時仍可把備機旗標改回來",
+          repo.get_device(conn, 'P1').is_standby is False)
     conn.close()
 
-    mig = "db/migration_004_iso10816_3_and_median.sql"
-    if not os.path.exists(mig):
-        skip("migration_004 冪等", f"找不到 {mig}")
-        return
-    outs = [subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-d", dbname, "-f", mig],
-                           env=env, capture_output=True, text=True) for _ in range(2)]
-    check("migration_004 可重複套用於新建庫（冪等）",
-          all(o.returncode == 0 for o in outs),
-          '；'.join(o.stderr[:200] for o in outs if o.returncode != 0))
+    for mig, label in (("db/migration_004_iso10816_3_and_median.sql", "migration_004"),
+                       ("db/migration_005_drop_kurtosis_channel.sql", "migration_005")):
+        if not os.path.exists(mig):
+            skip(f"{label} 冪等", f"找不到 {mig}")
+            continue
+        outs = [subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-d", dbname, "-f", mig],
+                               env=env, capture_output=True, text=True) for _ in range(2)]
+        check(f"{label} 可重複套用於新建庫（冪等）",
+              all(o.returncode == 0 for o in outs),
+              '；'.join(o.stderr[:200] for o in outs if o.returncode != 0))
+
+    # migration_005 之後，IMPACT_RISE 不該再帶任何 kurt 參數——留著會讓
+    # 現場以為門檻還在生效（規則層只是安靜地忽略它們）
+    r = subprocess.run(["psql", "-tAq", "-d", dbname, "-c",
+                        "set search_path to vib,public; "
+                        "select params::text from rule_config where rule_code='IMPACT_RISE';"],
+                       env=env, capture_output=True, text=True)
+    check("migration_005 後 IMPACT_RISE 的參數不含 kurt / require_both",
+          r.returncode == 0 and 'kurt' not in r.stdout and 'require_both' not in r.stdout,
+          r.stdout.strip() or r.stderr[:200])
 
     subprocess.run(["dropdb", "--if-exists", dbname], env=env, capture_output=True)
 
@@ -450,6 +567,7 @@ def main() -> int:
         test_axis_direction()
         test_backtest_instrumentation()
         test_guardrail()
+        test_ledger()
         test_db(args.dbname)
     except AssertionError as e:
         print(f"\n❌ 驗收失敗：{e}")

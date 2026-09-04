@@ -1,9 +1,26 @@
 {
-  "_說明": "Analytic CSV 不含「是否備機」「ISO 等級是否已由工程師確認」這類台帳資訊，見 validate/README.md 的「需要準備什麼資料」一節。把下面的範例改成貴司實際設備代碼與台帳資訊即可；device_id 需與 Analytic CSV 的 Name 欄一致。",
-  "AHU-601": { "is_standby": false },
+  "_說明": "Analytic CSV 不含「機器群組」「基礎剛性」「是否備機」這類台帳資訊，見 validate/README.md 的「需要準備什麼資料」一節。要一次填全廠設備建議改用 CSV 版：python -m validate.iso_readiness --data-dir data/ --emit-ledger out/ledger.csv，填完直接餵給 --device-meta（.csv 與 .json 兩種格式都收）。device_id 需與 Analytic CSV 的 Name 欄一致。",
+  "_欄位": {
+    "iso_machine_group": "'1'~'4'，ISO 10816-3 的機器群組",
+    "iso_foundation": "'rigid' 或 'flexible'。與群組**必須成對填**，只填一邊算不出 Zone，會整台視為未分類",
+    "iso_driver_type": "'integrated' 或 'external'（選填），僅供台帳稽核，Zone 判定不從這裡推導",
+    "rated_power_kw": "額定功率。ISO 20816-3 適用下限為 > 15 kW，缺這欄擋不掉範圍外設備",
+    "is_standby": "true / false。留空代表「不知道」，不會覆蓋台帳既有值",
+    "last_maintenance_at": "YYYY-MM-DD（選填）。基準期不會早於這一天（ISO 10816-3 §5.4.1）"
+  },
+  "AHU-601": {
+    "iso_machine_group": "2",
+    "iso_foundation": "rigid",
+    "rated_power_kw": 22.0,
+    "is_standby": false
+  },
   "CHW-PUMP-3": {
+    "iso_machine_group": "3",
+    "iso_foundation": "rigid",
+    "iso_driver_type": "external",
+    "rated_power_kw": 45.0,
     "is_standby": true,
-    "iso_machine_class": "II",
-    "iso_class_source": "frontend"
+    "last_maintenance_at": "2026-03-14",
+    "iso_class_source": "manual_override"
   }
 }

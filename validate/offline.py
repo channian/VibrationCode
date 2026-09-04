@@ -72,7 +72,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument('--data-dir', required=True, help='存放 Analytic CSV 的資料夾')
     p.add_argument('--pattern', default='*.csv', help='檔名比對樣式（預設 *.csv）')
     p.add_argument('--device-meta', default=None,
-                   help='JSON 檔，補充 is_standby / iso_machine_class 等台帳資訊'
+                   help='台帳檔（.csv 或 .json），補充機器群組／基礎剛性／'
+                        'is_standby 等 Analytic CSV 沒有的資訊。範本產生方式：'
+                        'python -m validate.iso_readiness --emit-ledger out/ledger.csv'
                         '（Analytic CSV 本身不含這些欄位）')
     p.add_argument('--assume-iso', default=None, metavar='GROUP/FOUNDATION',
                    help='ISO 分類假設，例如 3/rigid。Analytic CSV 沒有「基礎剛性」欄位，'

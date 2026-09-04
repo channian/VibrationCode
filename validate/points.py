@@ -127,7 +127,10 @@ def _build_device_context(device_id: str, meta: dict, overrides: dict | None,
         floor=str(ov.get('floor', meta.get('Floor', '')) or ''),
         system_name=str(ov.get('system_name', meta.get('System', '')) or ''),
         machine_type=str(ov.get('machine_type', '')),
-        is_standby=bool(ov.get('is_standby', False)),
+        # 三態：台帳沒填就給 None（「不知道」），不要一律代 False——
+        # False 是「已確認不是備機」，兩者在寫回台帳時的意義不同。
+        is_standby=(None if ov.get('is_standby') is None
+                    else bool(ov.get('is_standby'))),
         iso_machine_group=group,
         iso_foundation=foundation,
         iso_driver_type=ov.get('iso_driver_type'),
@@ -153,23 +156,114 @@ def _position_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series('M1', index=df.index)
 
 
+#: 台帳 CSV 的布林欄位可能出現的寫法。試算表填出來的值形形色色，
+#: 全部轉小寫後比對；不在表內的值一律視為「沒填」而非 False——
+#: 「沒填」與「確認不是備機」在寫回台帳時的意義不同（見 DeviceContext）。
+_TRUE_WORDS = {'true', 't', 'yes', 'y', '1', 'v', '是', '備機'}
+_FALSE_WORDS = {'false', 'f', 'no', 'n', '0', 'x', '否', '主機'}
+
+#: 台帳 CSV 中會被讀進來的欄位；其餘欄位（範本裡的參考欄與分隔欄）忽略。
+_LEDGER_FIELDS = ('device_name', 'machine_type', 'rated_power_kw',
+                  'iso_machine_group', 'iso_foundation', 'iso_driver_type',
+                  'iso_class_source', 'is_standby', 'last_maintenance_at',
+                  'building', 'floor', 'system_name')
+
+
+def _ledger_bool(value) -> bool | None:
+    """把台帳 CSV 的布林欄轉成三態；認不得的字串記警告並視為沒填。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip().lower()
+    if text == '' or text == 'nan':
+        return None
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+    logger.warning(f"台帳的 is_standby 欄位讀到無法判讀的值「{value}」，視為未填")
+    return None
+
+
+def _load_device_meta_csv(path: str) -> dict[str, dict]:
+    """
+    讀取 CSV 版台帳（`validate.iso_readiness --emit-ledger` 產出的格式）。
+
+    **為什麼要收 CSV 而不只是 JSON**：這份資料要由工程師填 68 台，逐台
+    手寫 JSON 物件既慢又容易漏逗號，而且錯一個字整份就讀不進去。CSV 可以
+    在試算表裡填、排序、整批複製同型號的值。JSON 仍然支援，兩種格式讀出
+    來的結構完全相同。
+
+    空字串一律視為「沒填」而不是「填了空值」——留空的欄位不該覆蓋台帳裡
+    既有的值。
+    """
+    for enc in ('utf-8-sig', 'utf-8', 'cp950'):
+        try:
+            df = pd.read_csv(path, encoding=enc, dtype=str)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        logger.error(f"台帳 {path} 無法以 utf-8/cp950 讀取，略過")
+        return {}
+
+    if 'device_id' not in df.columns:
+        logger.error(f"台帳 {path} 缺少 device_id 欄位（實際欄位：{list(df.columns)}），略過")
+        return {}
+
+    out: dict[str, dict] = {}
+    for row in df.to_dict('records'):
+        device_id = str(row.get('device_id') or '').strip()
+        if not device_id:
+            continue
+        ov: dict = {}
+        for field in _LEDGER_FIELDS:
+            if field not in row:
+                continue
+            raw = row[field]
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                continue
+            text = str(raw).strip()
+            if text == '' or text.lower() == 'nan':
+                continue
+            if field == 'is_standby':
+                parsed = _ledger_bool(text)
+                if parsed is not None:
+                    ov[field] = parsed
+            elif field == 'rated_power_kw':
+                try:
+                    ov[field] = float(text)
+                except ValueError:
+                    logger.warning(f"{device_id} 的 rated_power_kw「{text}」不是數字，略過該欄")
+            else:
+                ov[field] = text
+        if ov:
+            out[device_id] = ov
+    return out
+
+
 def load_device_meta_overrides(path: str | None) -> dict[str, dict]:
     """
-    讀取 `--device-meta` JSON：`{device_id: {is_standby, iso_machine_class,
-    iso_class_source, machine_type, device_name, ...}}`。
+    讀取 `--device-meta`：`{device_id: {is_standby, iso_machine_group,
+    iso_foundation, rated_power_kw, ...}}`。副檔名為 `.csv` 時走 CSV 解析，
+    其餘一律當 JSON。
 
-    Analytic CSV 沒有攜帶「是否備機」「機械等級是否已由工程師確認」這類
-    台帳資訊（`is_standby` 全部只能猜 False，ISO 分級多數為 0=未設定），
-    要回測 `STANDBY_NO_RUNTIME` / `ISO_ZONE` 就需要這份補充資訊。檔案不存在
-    時回傳空字典並只記警告，不中斷回測（等於全部設備視為非備機、未分級）。
+    Analytic CSV 沒有攜帶「是否備機」「機器群組」「基礎剛性」這類台帳
+    資訊（ISO 分級多數為 0=未設定），要回測 `STANDBY_NO_RUNTIME` /
+    `ISO_ZONE` 就需要這份補充資訊。檔案不存在時回傳空字典並只記警告，
+    不中斷回測（等於全部設備未分級、備機狀態未知）。
+
+    產生範本：`python -m validate.iso_readiness --data-dir data/
+    --emit-ledger out/ledger.csv`。
     """
     if not path:
         return {}
     try:
+        if path.lower().endswith('.csv'):
+            return _load_device_meta_csv(path)
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
-        logger.warning(f"設備補充資訊 {path} 不存在，全部設備視為非備機、未分級")
+        logger.warning(f"設備補充資訊 {path} 不存在，全部設備視為未分級、備機狀態未知")
         return {}
     except (json.JSONDecodeError, OSError) as e:
         logger.error(f"設備補充資訊 {path} 讀取失敗（{e}），略過")

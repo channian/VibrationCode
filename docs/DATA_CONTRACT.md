@@ -138,6 +138,12 @@ crest 為 4.65/5.01/4.30，合成欄只有 4.08——低於任何一軸。
 卻是 4.53，高於任一軸。所以逐軸值不必然比合成值敏感，兩者是不同的量，
 規則應同時利用而非取代。
 
+**accKURT 已於 2026-09 退出 IMPACT_RISE 與 DEGRADE_TREND**（專家會議定案，
+見 `docs/DECISIONS_2026-09_expert_review.md`）。欄位仍照常聚合入庫——
+`STEP_CHANGE` 的多變量特徵還在用，且日後若換感測器或前端改算法需要重新
+評估。以下小節關於 max/median 的說明因此只對 accCREST 有操作意義，
+kurtosis 的部分保留作為當初判斷的紀錄。
+
 **方向資訊其實在資料裡（2026-09 修正）**：`Channel_X/Y/Z` 的數值就是方向
 代碼——**4 = 垂直徑向、5 = 馬達軸向、6 = 水平徑向／切線**（使用者確認）。
 
@@ -259,7 +265,8 @@ CP 10 為 0。分數本身難以判讀，且模型已無人維護。
 | `velRMS` | ISO 判定、運轉判定 | ISO 規則與運轉判定失效 |
 | `velRMS_x/y/z` | 三軸分析 | 軸能量規則失效 |
 | `accRMS`、`accRMS_x/y/z` | 多變量偏離的核心特徵 | STEP_CHANGE 失效 |
-| `accCREST`、`accKURT` | 衝擊型指標 | IMPACT_RISE 失效 |
+| `accCREST` | 衝擊型指標 | IMPACT_RISE 失效 |
+| `accKURT` | STEP_CHANGE 的多變量特徵之一 | STEP_CHANGE 少一個維度（2026-09 起不再用於 IMPACT_RISE） |
 | `RPM` / `FMF` | 轉速參照 | 頻率相關判定失去基準 |
 | `ISO10816_code` | 機械等級 | ISO Zone 判定退回「未分級」 |
 | `Channel_X/Y/Z` | **軸向判定**（4=垂直徑向 5=軸向 6=水平徑向） | 失去徑向／軸向區分，退回方向無關的排序佔比 |

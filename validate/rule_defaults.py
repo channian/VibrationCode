@@ -58,17 +58,13 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             description='velOA 相對基準超過 N 個標準差'),
         RuleConfigRow(
             'IMPACT_RISE', '衝擊性指標上升', 'monotonic', 'impact_rise', 'observe',
-            # 逐軸門檻與合成值同量級：沒有證據支持逐軸 kurt 比合成值更敏感
-            # 或更不敏感（實測 crest 是逐軸較大、kurt 反而是合成較大），
-            # 故不預設偏鬆或偏緊。
-            # kurt_absolute=4.0 是業界通則（Pearson kurtosis 常態為 3），
-            # 與 σ 取 AND：kurtosis 3.2 在物理上不算有衝擊，不該只因為
-            # 相對基準上升就告警。crest 沒有對應的公認經驗值故不設絕對門檻。
-            {'threshold_mode': 'convention', 'kurt_absolute': 4.0,
-             'crest_sigma': 2.5, 'kurt_sigma': 2.5,
-             'crest_axis_sigma': 2.5, 'kurt_axis_sigma': 2.5,
-             'require_both': False},
-            description='accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
+            # 逐軸門檻與合成值同量級：實測 crest 是逐軸較大（ZP 3-5 三軸
+            # 4.65/5.01/4.30 vs 合成 4.08），但只有三台樣本，不足以支持
+            # 預設偏鬆或偏緊，故兩者同值。
+            # 已無 kurt_* 與 kurt_absolute／threshold_mode——kurtosis 通道
+            # 已於 2026-09 專家會議定案移除，理由見 metric_rules.impact_rise。
+            {'crest_sigma': 2.5, 'crest_axis_sigma': 2.5},
+            description='accCREST 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
         RuleConfigRow(
             'DEGRADE_TREND', '指標持續劣化', 'monotonic', 'degradation_trend', 'observe',
             {'min_days': 14, 'min_r2': 0.3, 'slope_pct_per_month': 10},

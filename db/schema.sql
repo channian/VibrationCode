@@ -471,22 +471,23 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      '{"threshold_mode":"iso","sigma":3.0,"consecutive_readings":3}',
      'velRMS 相對 ISO 錨定門檻偏高（未分類時退回相對基準 σ 判定）'),
     ('IMPACT_RISE',        '衝擊性指標上升',   'monotonic',   'impact_rise',      'observe',
-     -- 判定用 median 通道（acc_*_median），不用 max。kurtosis 的業界判準
-     --   講的是一段訊號的峰度，不是每小時 3600 個滾動窗峰度的最大值；
-     --   實測 AHU-601 逐筆中位數 2.37、僅 2.6% 超過 4，但取區塊最大值後
-     --   30/60/114 筆各為 7.17/13.49/19.00，median 則恆為 2.37。
-     -- 原本的 kurt_absolute=4.0 與 threshold_mode 已移除：那道絕對門檻套在
-     --   取最大值的 accKURT 上實測恆為真，AND 條件完全沒有把關，
-     --   convention 模式早已退化成 sigma 模式。留著只會讓人誤以為有防線。
-     -- 逐軸門檻與合成值同量級：實測 crest 是逐軸較大、kurt 反而是合成
-     --   較大（見 docs/DATA_CONTRACT.md §3.3），沒有證據支持哪一邊該偏鬆。
-     -- 嚴重度維持 observe：本廠實測 kurtosis 與振動量值反向（三台 accOA
-     --   1137.6/504.8/129.7 對應 accKURT 中位數 2.37/3.60/4.53），
-     --   跨設備的絕對判準不成立，改用純相對判定後仍需累積誤報回饋才知道
-     --   精確率，暫不進 SLA（見 vibcore/types.py 的 SEVERITY_OBSERVE）。
-     '{"crest_sigma":2.5,"kurt_sigma":2.5,'
-     '"crest_axis_sigma":2.5,"kurt_axis_sigma":2.5,"require_both":false}',
-     'accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
+     -- 判定用 median 通道（acc_*_median），不用 max：小時內 3600 個滾動窗
+     --   取最大值本質上是極值統計量，隨樣本數單調上升，跨設備不可比。
+     -- kurtosis 通道已於 2026-09 專家會議移除（原本的 kurt_sigma /
+     --   kurt_axis_sigma / kurt_absolute / threshold_mode / require_both
+     --   全數不再使用）。依據：本廠實測 kurtosis 與振動量值反向（三台
+     --   accOA 1137.6/504.8/129.7 對應 accKURT 中位數 2.37/3.60/4.53），
+     --   改成純相對判定後觸發結果完全沒變（511 次 / 60 台，佔機隊 88%），
+     --   且門檻掃描曲線平滑無斷崖——問題不在門檻訂多少，在指標本身。
+     --   完整紀錄見 docs/DECISIONS_2026-09_expert_review.md 的 Q2。
+     --   accKURT 欄位仍照常聚合入庫，STEP_CHANGE 的多變量特徵還在用。
+     -- 逐軸門檻與合成值同量級：實測 crest 是逐軸較大（ZP 3-5 三軸
+     --   4.65/5.01/4.30 vs 合成 4.08），但只有三台樣本，不足以支持
+     --   預設偏鬆或偏緊。
+     -- 嚴重度維持 observe：移除 kurtosis 後的觸發量尚待回測，仍需累積
+     --   誤報回饋才知道精確率（見 vibcore/types.py 的 SEVERITY_OBSERVE）。
+     '{"crest_sigma":2.5,"crest_axis_sigma":2.5}',
+     'accCREST 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）'),
     ('DEGRADE_TREND',      '指標持續劣化',     'monotonic',   'degradation_trend','observe',
      '{"min_days":14,"min_r2":0.3,"slope_pct_per_month":10}',
      '回歸斜率持續惡化；須在聚合後的獨立樣本上計算'),

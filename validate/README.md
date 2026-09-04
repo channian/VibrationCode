@@ -33,19 +33,38 @@
 - **回測涵蓋的時間愈長愈有意義**——只有幾分鐘資料只能驗證程式跑不跑得動，
   看不出真實觸發量級。至少要能涵蓋基準期（14 天）加上一段觀察期（建議
   ≥ 1 個月）才有參考價值。
-- （選用）`--device-meta` 一個 JSON 檔，補充 Analytic CSV 沒有的台帳資訊：
+- **`--device-meta` 台帳檔**（強烈建議補，不是可有可無的選項）。Analytic
+  CSV 不帶「機器群組」「基礎剛性」「是否備機」這些資訊
+  （`ISO10816_code` 目前多數設備仍是 0 = 未設定，見計畫書 §十二）。
+  沒有它，`ISO_ZONE` 與 `ISO_CLASS_SUSPECT` 完全不判定、`VEL_HIGH` 退回
+  相對基準 3σ、`STANDBY_NO_RUNTIME` 全部不適用。
 
-  ```json
-  {
-    "AHU-601": { "is_standby": false },
-    "CHW-PUMP-3": { "is_standby": true, "iso_machine_class": "II", "iso_class_source": "frontend" }
-  }
+  **退回 σ 的門檻遠比 ISO 錨定門檻敏感**：68 台 33 週的實測，台帳空白時
+  工程師每週要處理 13 件，填了之後是 3 件（VEL_HIGH 366 次 / 58 台 vs
+  85 次 / 16 台）。也就是說不填台帳省下的是填兩個欄位的功夫，換來的是
+  4.3 倍的工作量。
+
+  產生範本（預填設備代碼、轉速與 velRMS 水準，空出待填欄位）：
+
+  ```bash
+  python -m validate.iso_readiness --data-dir data/ --emit-ledger out/ledger.csv
   ```
 
-  Analytic CSV 不帶「是否備機」「ISO 等級是否已由工程師確認」這類資訊
-  （`ISO10816_code` 目前多數設備仍是 0 = 未設定，見計畫書 §十二），沒有
-  這份補充資訊時，`STANDBY_NO_RUNTIME` 會全部判定不適用、`ISO_ZONE` 大多
-  會走「未分級」路徑。
+  在試算表裡填完六個欄位後直接餵回去即可。`--device-meta` 同時接受 `.csv`
+  與 `.json`（格式與欄位說明見 `validate/device_meta.example.json`）：
+
+  | 欄位 | 值 | 說明 |
+  |---|---|---|
+  | `iso_machine_group` | `1`~`4` | ISO 10816-3 機器群組 |
+  | `iso_foundation` | `rigid` / `flexible` | 基礎剛性。**與群組必須成對填**，只填一邊算不出 Zone，會整台視為未分類 |
+  | `rated_power_kw` | 數字 | ISO 20816-3 適用下限 > 15 kW，缺這欄擋不掉範圍外設備 |
+  | `iso_driver_type` | `integrated` / `external` | 選填，僅供台帳稽核 |
+  | `is_standby` | `TRUE` / `FALSE` | 留空 = 「不知道」，不會覆蓋台帳既有值 |
+  | `last_maintenance_at` | `YYYY-MM-DD` | 選填。基準期不會早於這一天（ISO 10816-3 §5.4.1） |
+
+  填法：同型號、同安裝方式的設備可整批填同一組值，不必逐台勘查；也不必
+  一次填到完美——`ISO_CLASS_SUSPECT` 會回頭比對，基準水準與所填分類矛盾
+  時會告警。
 
 ## 怎麼跑
 
@@ -54,7 +73,7 @@
 python -m validate.offline --data-dir data/
 
 # 補上設備台帳資訊
-python -m validate.offline --data-dir data/ --device-meta my_device_meta.json
+python -m validate.offline --data-dir data/ --device-meta out/ledger.csv
 
 # 整批覆寫規則參數（例如想看看把某條門檻調鬆後的效果）
 python -m validate.offline --data-dir data/ --rule-config my_rule_overrides.json

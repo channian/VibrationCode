@@ -143,10 +143,18 @@ def collect(data_dir: str, pattern: str = '*.csv',
                      if iso_key and baseline_proxy is not None else None)
         vel_p95 = float(vel_run.quantile(0.95)) if not vel_run.empty else None
 
+        rpm = None
+        if 'RPM' in sub.columns:
+            rpms = pd.to_numeric(sub['RPM'], errors='coerce').dropna()
+            rpms = rpms[rpms > 0]
+            if not rpms.empty:
+                rpm = float(rpms.mode().iloc[0])
+
         rows.append({
             'device_id': name,
             'iso_code': code,
             'machine_class': machine_class,
+            'rated_rpm': rpm,
             'n_rows': len(sub),
             'n_running': len(vel_run),
             'vel_rms_median': round(baseline_proxy, 3) if baseline_proxy is not None else None,
@@ -247,6 +255,78 @@ def report(df: pd.DataFrame) -> None:
     print('\n' + '=' * 66)
 
 
+#: 台帳範本的欄位順序。前段是本工具能從 Analytic CSV 推出來的既有資訊
+#: （只是給填表的人參考，匯入時會被 CSV 的實際值覆蓋），後段是必須由
+#: 工程師填的空欄。刻意把「參考」與「待填」分成兩段並在中間插一欄分隔，
+#: 免得填表的人分不清哪些該動。
+_LEDGER_REFERENCE_COLS = ('device_id', 'rated_rpm', 'n_running',
+                          'vel_rms_median', 'vel_rms_p95')
+_LEDGER_FILL_COLS = ('rated_power_kw', 'iso_machine_group', 'iso_foundation',
+                     'iso_driver_type', 'is_standby', 'last_maintenance_at')
+
+
+def emit_ledger_template(df: pd.DataFrame, path: str) -> int:
+    """
+    產出「待補台帳」的 CSV 範本，供工程師用試算表一次填完 68 台。
+
+    **為什麼需要這個**：ISO 10816-3 的 Zone 判定要「機器群組」與「基礎
+    剛性」兩欄，Analytic CSV 兩欄都沒有，而回測顯示補不補的差距是每週
+    13 件對 3 件。逐台寫 JSON 是可行但難用的路徑——68 台要手打 68 個
+    物件，而且錯一個逗號整份就讀不進去。CSV 可以在試算表裡填、可以排序、
+    可以整批複製同型號的值，填完直接餵給 `--device-meta`。
+
+    預填的參考欄（轉速、運轉樣本數、velRMS 水準）不是裝飾：判斷群組時
+    要看轉速與功率，判斷「這台到底有沒有在跑」要看運轉樣本數，而
+    velRMS 水準可以讓填表的人一眼看出哪幾台值得先確認。
+
+    Returns:
+        寫出的資料列數。
+    """
+    out = pd.DataFrame({c: df[c] if c in df.columns else None
+                        for c in _LEDGER_REFERENCE_COLS})
+    out = out.sort_values('device_id').reset_index(drop=True)
+    # 分隔欄：只是視覺提示，匯入端會忽略未知欄位
+    out['↓以下請填↓'] = ''
+    for c in _LEDGER_FILL_COLS:
+        out[c] = ''
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    # utf-8-sig：現場用 Excel 開，沒有 BOM 中文會變亂碼
+    out.to_csv(path, index=False, encoding='utf-8-sig')
+    return len(out)
+
+
+def report_ledger_template(path: str, n: int) -> None:
+    print('=' * 66)
+    print('  台帳補填範本')
+    print('=' * 66)
+    print(f'\n已寫出 {n} 台設備：{path}')
+    print('\n請填的六欄：')
+    print('  rated_power_kw      額定功率 kW。ISO 20816-3 的適用下限是 > 15 kW，')
+    print('                      沒有這欄就擋不掉範圍外的設備。')
+    print('  iso_machine_group   1 / 2 / 3 / 4。ISO 10816-3 的機器群組。')
+    print('  iso_foundation      rigid / flexible。基礎剛性——同一群組下')
+    print('                      這兩者的 A/B 界可以差近一倍，不可留空。')
+    print('  iso_driver_type     integrated / external（選填）。僅供台帳稽核，')
+    print('                      Zone 判定不從這裡推導。')
+    print('  is_standby          TRUE / FALSE。備機旗標；留空代表「不知道」，')
+    print('                      不會覆蓋既有台帳值。')
+    print('  last_maintenance_at YYYY-MM-DD（選填）。填了之後基準期不會早於')
+    print('                      這一天——大修後振動下降，舊基準會把「變好」')
+    print('                      算成偏離（ISO 10816-3 §5.4.1）。')
+    print('\n填法建議：')
+    print('  · 同型號、同安裝方式的設備可以整批填同一組值，不必逐台勘查。')
+    print('  · 不必一次填到完美——ISO_CLASS_SUSPECT 會回頭比對，基準水準')
+    print('    與所填分類矛盾時會告警。')
+    print('  · 群組與基礎剛性**必須成對填**。只填一邊算不出 Zone，程式會')
+    print('    整台視為未分類（半套用狀態只會在除錯時誤導人）。')
+    print('\n填完之後：')
+    print('  python -m validate.offline --data-dir data/ \\')
+    print(f'         --device-meta {path}')
+    print('  （回測與正式管線都吃同一份檔；.csv 與 .json 兩種格式都收）')
+    print('\n' + '=' * 66)
+
+
 def compare(data_dir: str, pattern: str, assumptions: list[tuple[str, str]]) -> pd.DataFrame:
     """
     在多個分類假設下各跑一次，輸出對照表。
@@ -314,10 +394,23 @@ def main(argv: list[str] | None = None) -> int:
                         '不給則所有設備視為未分類（前端沒有基礎剛性欄位）')
     p.add_argument('--compare', action='store_true',
                    help='在所有 8 種分類組合下各跑一次並輸出對照表，供專家會議決策')
+    p.add_argument('--emit-ledger', default=None, metavar='PATH',
+                   help='產出待補台帳的 CSV 範本（預填設備代碼與轉速，'
+                        '空出群組／基礎剛性等欄位供工程師填），填完可直接'
+                        '餵給 --device-meta')
     p.add_argument('--log-level', default='WARNING',
                    choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level, format='%(levelname)s: %(message)s')
+
+    if args.emit_ledger:
+        df = collect(args.data_dir, args.pattern, assume=None)
+        if df.empty:
+            print('沒有讀到任何設備資料，無法產生範本。')
+            return 1
+        n = emit_ledger_template(df, args.emit_ledger)
+        report_ledger_template(args.emit_ledger, n)
+        return 0
 
     if args.compare:
         assumptions = [(g, f) for g in ISO_GROUPS for f in ISO_FOUNDATIONS]
