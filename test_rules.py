@@ -463,6 +463,21 @@ def test_ledger() -> None:
 # 六、資料庫層（需要 PostgreSQL）
 # ──────────────────────────────────────────────────────────
 
+def _db_hint(e: Exception) -> str:
+    """把「跑不起來」翻成「該怎麼辦」。
+
+    這一節需要 PostgreSQL 用戶端（psql / createdb / dropdb）。找不到執行檔
+    與連不上伺服器是兩種完全不同的處置，訊息要分得開——否則使用者會以為
+    自己的資料庫壞了，而其實只是沒裝 client。
+    """
+    if isinstance(e, FileNotFoundError):
+        return ("找不到 psql / createdb。安裝用戶端即可，不需要在本機跑資料庫："
+                "Ubuntu/Debian `sudo apt install postgresql-client`、"
+                "macOS `brew install libpq && brew link --force libpq`；"
+                "連遠端資料庫請設 VIB_DB_HOST / VIB_DB_PORT / VIB_DB_USER / VIB_DB_PASSWORD")
+    return f"無法建立測試資料庫（{type(e).__name__}：{str(e)[:120]}）"
+
+
 def _psql_env() -> dict:
     env = dict(os.environ)
     env.setdefault("PGHOST", os.environ.get("VIB_DB_HOST", "localhost"))
@@ -484,8 +499,16 @@ def test_db(dbname: str) -> None:
         if r.returncode != 0:
             raise RuntimeError(r.stderr[:500])
     except (FileNotFoundError, subprocess.CalledProcessError, RuntimeError) as e:
-        skip("台帳欄位保留", f"無法建立測試資料庫（{type(e).__name__}）")
-        skip("migration_004 冪等", "同上")
+        why = _db_hint(e)
+        # 逐項列出「這次沒驗到什麼」。只印一句「略過」會讓人以為無關緊要，
+        # 但這一節驗的是台帳欄位保留與備機旗標——那正是每日排程最容易安靜
+        # 弄壞的東西，沒驗到就該講清楚是哪幾項沒驗到。
+        for label in ("台帳欄位保留（含備機旗標不被覆寫）",
+                      "migration_004 冪等",
+                      "migration_005 冪等",
+                      "migration_005 後 IMPACT_RISE 參數不含 kurt"):
+            skip(label, why)
+            why = "同上"
         return
 
     import psycopg2

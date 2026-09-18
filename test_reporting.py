@@ -357,7 +357,20 @@ def main() -> int:
     try:
         build_test_db(args.dbname)
     except FileNotFoundError:
-        print("找不到 psql / createdb，請確認 PostgreSQL 客戶端已安裝並在 PATH 上。")
+        # 本檔 46 項驗收全部要走資料庫（週報是從 SQL 組出來的），沒有可以
+        # 退而求其次只跑一部分的路徑。所以這裡不是「略過」，是真的跑不了
+        # ——但要講清楚這是環境缺件，不是程式有問題。
+        print("找不到 psql / createdb：這是環境缺件，不是驗收失敗。\n"
+              "  本檔的 46 項驗收全部需要資料庫（週報內容是從 SQL 組出來的），\n"
+              "  沒有用戶端就一項都跑不了。\n"
+              "\n"
+              "  安裝用戶端即可，不需要在本機跑資料庫伺服器：\n"
+              "    Ubuntu/Debian：sudo apt install postgresql-client\n"
+              "    macOS：brew install libpq && brew link --force libpq\n"
+              "\n"
+              "  要接既有的資料庫伺服器，設這幾個環境變數：\n"
+              "    VIB_DB_HOST / VIB_DB_PORT / VIB_DB_USER / VIB_DB_PASSWORD\n"
+              "  （本檔會建立一個獨立的測試資料庫再刪掉，不會動到既有資料）")
         return 2
     except Exception as e:
         print(f"測試資料庫建置失敗：{e}")
