@@ -139,6 +139,37 @@ def _psql_env() -> dict:
     return env
 
 
+def ensure_disposable_dbname(dbname: str) -> str | None:
+    """
+    擋掉「把測試指向正式資料庫」這個會毀資料的操作。
+
+    這兩支驗收腳本的第一個動作是 `dropdb --if-exists <dbname>` 再
+    `createdb`。把 `--dbname` 填成正式庫的名字，正式資料會**當場被刪掉且
+    無法復原**——而這個誤用很自然：使用者想「用實際的資料庫測試」，
+    指的其實是「連到實際那台伺服器」，不是「拿正式庫當測試對象」。
+    連伺服器是安全的（腳本會在該台上另建一個獨立的測試庫再刪掉），
+    拿正式庫當對象則不是。
+
+    規則：名稱必須以 `_test` 結尾。這不留例外開關——沒有任何正當理由要
+    在非 `_test` 的資料庫上跑這些腳本，真的想換名字，取成 `xxx_test` 即可。
+
+    Returns:
+        None 表示通過；否則回傳要印給使用者的錯誤訊息。
+    """
+    if dbname.endswith("_test"):
+        return None
+    return (f"拒絕在資料庫「{dbname}」上執行：名稱必須以 _test 結尾。\n"
+            f"\n"
+            f"  這支腳本開頭會 DROP 掉指定的資料庫再重建。若這是正式庫，\n"
+            f"  資料會當場消失且無法復原，所以這裡直接擋下來。\n"
+            f"\n"
+            f"  要連到正式那台伺服器測試是安全的做法——設環境變數指向它，\n"
+            f"  不要動 --dbname：\n"
+            f"    VIB_DB_HOST / VIB_DB_PORT / VIB_DB_USER / VIB_DB_PASSWORD\n"
+            f"  腳本會在該台伺服器上另建一個獨立的測試資料庫，跑完自動刪除，\n"
+            f"  完全不碰既有資料（需要該帳號有 CREATE DATABASE 權限）。")
+
+
 def build_test_db(dbname: str) -> None:
     env = _psql_env()
     print(f"建立測試資料庫 {dbname} …")
@@ -353,6 +384,11 @@ def main() -> int:
                     help=f"測試資料庫名稱（預設 {DEFAULT_TEST_DB}）；執行時會先 DROP 再重建")
     ap.add_argument("--keep", action="store_true", help="跑完保留資料庫供人工查看")
     args = ap.parse_args()
+
+    refusal = ensure_disposable_dbname(args.dbname)
+    if refusal:
+        print(refusal)
+        return 2
 
     try:
         build_test_db(args.dbname)
