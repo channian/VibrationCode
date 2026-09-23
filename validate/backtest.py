@@ -137,7 +137,7 @@ def build_point_context(point: PointSeries, agg_cfg: AggregateConfig = DEFAULT_A
 #: evidence 結構差異很大，全開會變成一張到處是空白的寬表。
 _EVIDENCE_FLAT_KEYS = (
     'threshold_mode', 'machine_class', 'trigger_source',
-    'primary_metric', 'consecutive_readings',
+    'primary_metric', 'consecutive_readings', 'n_features',
 )
 
 

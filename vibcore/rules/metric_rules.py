@@ -927,7 +927,13 @@ def step_change(ctx: RuleContext) -> RuleOutcome:
         logger.debug(f"STEP_CHANGE：point={ctx.point_id} 尚無基準期，無法判定")
         return RuleOutcome.no_trigger('STEP_CHANGE', 'step_change', 'monotonic')
 
-    features = [f for f in _STEP_CHANGE_FEATURES
+    # 特徵集可由 params 覆寫，供「拿掉某個特徵會怎樣」的對照回測使用。
+    # **改特徵數就必須重訂門檻**：Mahalanobis 距離平方服從自由度 = 特徵數
+    # 的卡方分布，k 變了同一個門檻數字對應的尾機率就不同（k=4 的 3.0 對應
+    # 尾機率 0.061，k=3 要 2.71 才是同一個機率）。直接沿用舊門檻比較，
+    # 量到的會是「門檻變嚴了」而不是「少了這個特徵的效果」。
+    candidates = ctx.params.get('features') or _STEP_CHANGE_FEATURES
+    features = [f for f in candidates
                 if f in ctx.agg.columns and f in ctx.baseline.stats]
     if len(features) < 2:
         logger.debug(f"STEP_CHANGE：point={ctx.point_id} 可用特徵不足 2 個"
@@ -970,6 +976,8 @@ def step_change(ctx: RuleContext) -> RuleOutcome:
         value_unit='',
         evidence={
             'features': features,
+            # 攤平到事件列，讓對照回測能直接依特徵數分組比較
+            'n_features': len(features),
             'distance': result.distance,
             'threshold': result.threshold,
             'per_feature_sigma': result.per_feature_sigma,

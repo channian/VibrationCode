@@ -5,6 +5,8 @@ report.py — 把回測結果轉成人看得懂的報表
 
   coverage.csv               每台設備/量測點的資料涵蓋率
   gaps.csv                   斷線／資料不全區段清單，依時長排序
+  systemic_gaps.csv          疑似系統層級的中斷（多點共用同一個斷線邊界），
+                             有偵測到才會產生
   finding_stats_by_rule.csv  依規則的觸發統計（含 category、severity、is_actionable 欄位）
   finding_stats_by_device.csv 依設備的觸發統計（err/warn/observe 分開計數）
   trigger_density.csv        每台設備每週觸發密度，依 RuleCategory × 是否進SLA
@@ -71,11 +73,90 @@ _COVERAGE_COLS = {
     'not_running_hours': '未運轉時數', 'analyzable_ratio': '可分析比例',
     'period_start': '期間起', 'period_end': '期間迄',
 }
+_SYSTEMIC_COLS = {
+    'boundary': '邊界時刻', 'kind': '種類(start=同時開始/end=同時結束)',
+    'n_points': '量測點數', 'points': '量測點清單', 'median_hours': '時長中位數(小時)',
+}
+
 _GAPS_COLS = {
     'device_id': '設備代碼', 'point_id': '量測點ID', 'position': '安裝位置',
     'gap_start': '起始時間', 'gap_end': '結束時間', 'hours': '時長(小時)',
     'status': '狀態',
 }
+
+
+
+#: 幾個量測點共用同一個斷線邊界才算「疑似系統層級」。2 個可能是巧合，
+#: 3 個以上同時開始或同時結束就不像各自故障了。
+_SYSTEMIC_MIN_POINTS = 3
+
+#: 邊界對齊的容忍窗（小時）。實測同一次換版造成的中斷，各點的起始時間
+#: 散在數小時內（設備是逐台被切換的），但結束時間往往完全一致。
+_SYSTEMIC_TOLERANCE_H = 6
+
+
+def detect_systemic_gaps(gaps_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    找出「多個量測點共用同一個斷線邊界」的區段——系統層級事件的特徵。
+
+    **為什麼要自動找**：同一個結論我們已經靠人眼在 gaps.csv 裡發現兩次
+    （2026-01-09 的收集程式換版、2026-08-03 的中斷），而兩次都是先得出
+    錯誤結論才回頭修正的——把它讀成「這些感測器壞了」會讓涵蓋率低估
+    設備健康度、讓 IT／儀電收到一堆不該開的單，更麻煩的是基準期會挑到
+    中斷前那一段再拿去跟中斷後比。人眼看得到是因為剛好去翻了 gaps.csv，
+    下一個人不會。
+
+    判準只用一件客觀事實：**幾個不同的量測點在同一時刻（±容忍窗）開始或
+    結束斷線**。這不推論成因——可能是收集程式換版、網路、機房電力，
+    報表只說「這不像各點各自故障」，該查什麼由 IT 判斷。
+
+    Returns:
+        每列一個疑似系統事件，欄位 `boundary`（邊界時刻）、`kind`
+        （`start` 或 `end`）、`n_points`、`points`（量測點清單）、
+        `median_hours`（這些區段的時長中位數）。空表代表沒有發現。
+    """
+    if gaps_df.empty or not {'gap_start', 'gap_end', 'device_id'} <= set(gaps_df.columns):
+        return pd.DataFrame()
+
+    rows = []
+    for kind, col in (('start', 'gap_start'), ('end', 'gap_end')):
+        d = gaps_df.dropna(subset=[col]).copy()
+        if d.empty:
+            continue
+        ts = pd.to_datetime(d[col], errors='coerce')
+        d = d.assign(_ts=ts).dropna(subset=['_ts']).sort_values('_ts')
+        if d.empty:
+            continue
+        # 以容忍窗把相近的邊界併成同一叢：時間排序後，與叢首相差超過容忍
+        # 窗就另起一叢。這裡不用分群演算法——一維、有序、規則單純，
+        # 用它只會多一組沒有物理依據的參數要解釋。
+        cluster_id, head = [], None
+        cid = -1
+        for t in d['_ts']:
+            if head is None or (t - head) > pd.Timedelta(hours=_SYSTEMIC_TOLERANCE_H):
+                cid += 1
+                head = t
+            cluster_id.append(cid)
+        d = d.assign(_cluster=cluster_id)
+
+        for _, sub in d.groupby('_cluster'):
+            pts = sorted({f"{r.device_id}/{getattr(r, 'position', '')}".rstrip('/')
+                          for r in sub.itertuples()})
+            if len(pts) < _SYSTEMIC_MIN_POINTS:
+                continue
+            rows.append({
+                'boundary': sub['_ts'].min(),
+                'kind': kind,
+                'n_points': len(pts),
+                'points': '、'.join(pts),
+                'median_hours': float(sub['hours'].median()) if 'hours' in sub else float('nan'),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows)
+            .sort_values(['n_points', 'boundary'], ascending=[False, True])
+            .reset_index(drop=True))
 
 
 def _safe_write_csv(df: pd.DataFrame, path: str) -> str:
@@ -352,6 +433,27 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
                          f"{g['gap_start']} ～ {g['gap_end']}（{g['hours']:.0f} 小時）")
         lines.append('')
 
+        systemic = detect_systemic_gaps(result.gaps_df)
+        if not systemic.empty:
+            lines.append('-- ⚠ 疑似系統層級的中斷（多點共用同一個斷線邊界）--')
+            lines.append(f'  判準：{_SYSTEMIC_MIN_POINTS} 個以上量測點在同一時刻'
+                         f'（±{_SYSTEMIC_TOLERANCE_H} 小時）同時開始或同時結束斷線。')
+            lines.append('  多顆感測器各自故障不會挑同一刻，所以這比較像收集程式換版、')
+            lines.append('  網路或機房層級的事件——本報表只陳述這個型態，不推論成因。')
+            for _, r in systemic.head(5).iterrows():
+                kind = '同時開始' if r['kind'] == 'start' else '同時結束'
+                lines.append(f"  {r['boundary']}　{kind}　{r['n_points']} 個量測點"
+                             f"（時長中位數 {r['median_hours']:.0f} 小時）")
+            if len(systemic) > 5:
+                lines.append(f'  …另有 {len(systemic) - 5} 組，見 systemic_gaps.csv')
+            lines.append('')
+            lines.append('  處置建議：')
+            lines.append('    · 這些區間的低涵蓋率**不代表感測器健康度差**，不該據此換感測器。')
+            lines.append('    · 基準期會受影響——演算法挑「最穩定窗口」時可能挑到中斷前那一段，')
+            lines.append('      再拿去跟中斷後的資料比，整段看起來都在偏離。建議用 --since')
+            lines.append('      把最後一次系統層級中斷之前的資料整段排除，重跑一次對照。')
+            lines.append('')
+
     lines.append('-- 嚴重度分級說明 --')
     lines.append('  observe 級是給「有偵測價值但沒有可引用的外部標準」的規則用的')
     lines.append('  （本次為 STEP_CHANGE／AXIS_SHIFT／SPECTRAL_SHIFT／TEMP_RISE／DEGRADE_TREND）：')
@@ -522,6 +624,10 @@ def write_reports(result: BacktestResult, rule_configs: dict[str, RuleConfigRow]
         result.coverage_df.rename(columns=_COVERAGE_COLS), os.path.join(out_dir, 'coverage.csv'))
     written['gaps'] = _safe_write_csv(
         result.gaps_df.rename(columns=_GAPS_COLS), os.path.join(out_dir, 'gaps.csv'))
+    systemic = detect_systemic_gaps(result.gaps_df)
+    if not systemic.empty:
+        written['systemic_gaps'] = _safe_write_csv(
+            systemic.rename(columns=_SYSTEMIC_COLS), os.path.join(out_dir, 'systemic_gaps.csv'))
     written['finding_stats_by_rule'] = _safe_write_csv(
         stats_by_rule, os.path.join(out_dir, 'finding_stats_by_rule.csv'))
     written['finding_stats_by_device'] = _safe_write_csv(

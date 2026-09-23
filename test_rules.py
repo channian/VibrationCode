@@ -395,11 +395,142 @@ def test_guardrail() -> None:
 
 
 # ──────────────────────────────────────────────────────────
+# 疑似系統層級中斷的偵測
+# ──────────────────────────────────────────────────────────
+
+def test_systemic_gaps() -> None:
+    print("\n[8] 疑似系統層級中斷（多點共用同一斷線邊界）")
+
+    from validate.report import (_SYSTEMIC_MIN_POINTS, _SYSTEMIC_TOLERANCE_H,
+                                 detect_systemic_gaps)
+
+    # 重現 2026-08-03 那次：14 個點結束於同一刻，起始散在數小時內
+    rows = [{'device_id': f'DEV{i:02d}', 'position': 'M1',
+             'gap_start': pd.Timestamp('2026-07-07 12:00') + dt.timedelta(hours=i % 4),
+             'gap_end': pd.Timestamp('2026-08-03 08:00'),
+             'hours': 643.0, 'status': 'no_data'} for i in range(14)]
+    # 單點長時間故障——不該被歸為系統事件
+    rows.append({'device_id': 'LONE', 'position': 'M1',
+                 'gap_start': pd.Timestamp('2026-06-18 19:00'),
+                 'gap_end': pd.Timestamp('2026-08-07 20:00'),
+                 'hours': 1201.0, 'status': 'no_data'})
+    out = detect_systemic_gaps(pd.DataFrame(rows))
+
+    check("抓到同時結束的那一組", (out['kind'] == 'end').any(), str(out['kind'].tolist()))
+    check("同時結束組的點數正確（14 點）",
+          int(out[out['kind'] == 'end']['n_points'].iloc[0]) == 14)
+    check("起始散在容忍窗內仍併成同一組",
+          int(out[out['kind'] == 'start']['n_points'].iloc[0]) == 14)
+    check("單點長時間故障不被誤判為系統事件",
+          'LONE' not in out['points'].str.cat(sep='|'))
+
+    # 低於門檻的不報——2 個點同時斷線可能只是巧合
+    few = pd.DataFrame([
+        {'device_id': f'D{i}', 'position': 'M1',
+         'gap_start': pd.Timestamp('2026-05-01 00:00'),
+         'gap_end': pd.Timestamp('2026-05-02 00:00'),
+         'hours': 24.0, 'status': 'no_data'}
+        for i in range(_SYSTEMIC_MIN_POINTS - 1)])
+    check(f"少於 {_SYSTEMIC_MIN_POINTS} 個點不報（避免把巧合講成系統事件）",
+          detect_systemic_gaps(few).empty)
+
+    # 邊界差距超過容忍窗就該分成兩組
+    spread = pd.DataFrame([
+        {'device_id': f'S{i}', 'position': 'M1',
+         'gap_start': pd.Timestamp('2026-05-01 00:00'),
+         'gap_end': pd.Timestamp('2026-05-02 00:00') + dt.timedelta(
+             hours=0 if i < 3 else _SYSTEMIC_TOLERANCE_H * 4),
+         'hours': 24.0, 'status': 'no_data'} for i in range(6)])
+    ends = detect_systemic_gaps(spread)
+    ends = ends[ends['kind'] == 'end']
+    check("相隔超過容忍窗的邊界不會被併成同一組",
+          len(ends) == 2 and set(ends['n_points']) == {3},
+          str(ends[['boundary', 'n_points']].to_dict('records')))
+
+    check("空表不拋錯", detect_systemic_gaps(pd.DataFrame()).empty)
+
+
+# ──────────────────────────────────────────────────────────
+# STEP_CHANGE 的特徵集可覆寫（對照回測用）
+# ──────────────────────────────────────────────────────────
+
+def test_step_change_features() -> None:
+    print("\n[9] STEP_CHANGE：特徵集可由 params 覆寫")
+
+    from vibcore.rules.metric_rules import step_change
+
+    # STEP_CHANGE 會用基準期內的資料現場擬合協方差，所以資料列必須真的
+    # 落在基準期區間裡——共用的 ctx() 把資料放在 NOW 附近、基準期卻在
+    # 8/1~8/15，兩者不重疊會讓模型擬合失敗而靜默不觸發。這裡自己組。
+    base_day = dt.datetime(2026, 8, 25, tzinfo=dt.timezone.utc)
+    rng = np.random.default_rng(3)
+    agg_rows = []
+    for i in range(24):      # 基準期：24 小時的正常資料，帶一點雜訊才估得出協方差
+        n = rng.normal(0, 0.02, 4)
+        agg_rows.append({'ts_hour': base_day + dt.timedelta(hours=i), 'data_status': 'ok',
+                         'vel_rms': 1.0 + n[0], 'acc_rms': 0.5 + n[1],
+                         'acc_crest': 3.0 + n[2], 'acc_kurt': 2.5 + n[3]})
+    # 基準期之後的一筆明顯偏離
+    agg_rows.append({'ts_hour': base_day + dt.timedelta(days=1, hours=12), 'data_status': 'ok',
+                     'vel_rms': 3.0, 'acc_rms': 2.0, 'acc_crest': 6.0, 'acc_kurt': 9.0})
+    agg = pd.DataFrame(agg_rows)
+    stats = {'vel_rms': (1.0, 1.0, 0.02, 300), 'acc_rms': (0.5, 0.5, 0.02, 300),
+             'acc_crest': (3.0, 3.0, 0.02, 300), 'acc_kurt': (2.5, 2.5, 0.02, 300)}
+    baseline = BaselineStats(
+        point_id=1, start_date=dt.date(2026, 8, 25), end_date=dt.date(2026, 8, 25),
+        source='auto', stats={k: MetricStats(*v) for k, v in stats.items()}, n_hours=24)
+
+    def sc_ctx(params: dict | None = None) -> RuleContext:
+        return RuleContext(
+            device=device(iso_machine_group='2', iso_foundation='rigid'),
+            point_id=1, position='M1', agg=agg, baseline=baseline,
+            params=params or {}, now=base_day + dt.timedelta(days=1, hours=13))
+
+    r4 = step_change(sc_ctx())
+    check("預設用四個特徵",
+          r4.triggered and r4.evidence['n_features'] == 4, str(r4.evidence.get('features')))
+
+    r3 = step_change(sc_ctx({'features': ['vel_rms', 'acc_rms', 'acc_crest'],
+                             'mahalanobis_sigma': 2.71}))
+    check("params 指定時只用指定的特徵",
+          r3.triggered and r3.evidence['n_features'] == 3
+          and 'acc_kurt' not in r3.evidence['features'],
+          str(r3.evidence.get('features')))
+
+    # 卡方等效門檻：k=4 的 3.0（尾機率 0.0611）對應 k=3 的 2.71。
+    # 設定檔裡那張對照表若被改壞，這裡會抓到。
+    import json
+    with open('validate/rule_configs/step_change_without_kurt.json', encoding='utf-8') as f:
+        cfg = json.load(f)
+    check("對照設定檔的特徵集確實少了 acc_kurt",
+          cfg['STEP_CHANGE']['features'] == ['vel_rms', 'acc_rms', 'acc_crest'])
+    check("對照設定檔的預設門檻用的是卡方等效值 2.71",
+          abs(cfg['STEP_CHANGE']['mahalanobis_sigma'] - 2.71) < 1e-9)
+    try:
+        from scipy import stats as sp_stats
+        ok = True
+        for d4_str, d3 in cfg['_等效門檻對照']['k=4 → k=3'].items():
+            p_tail = sp_stats.chi2.sf(float(d4_str) ** 2, df=4)
+            want = float(np.sqrt(sp_stats.chi2.isf(p_tail, df=3)))
+            ok = ok and abs(want - d3) < 0.01
+        check("等效門檻對照表與卡方分布算出來的一致", ok)
+    except ImportError:
+        skip("等效門檻對照表驗算", "沒有 scipy")
+
+    # 底線開頭是註解鍵，不該被當成規則代碼
+    from validate.rule_defaults import load_rule_configs
+    cfgs = load_rule_configs('validate/rule_configs/step_change_without_kurt.json')
+    check("設定檔的註解鍵不會被當成未知規則",
+          cfgs['STEP_CHANGE'].params.get('features') == ['vel_rms', 'acc_rms', 'acc_crest'],
+          str(cfgs['STEP_CHANGE'].params))
+
+
+# ──────────────────────────────────────────────────────────
 # 台帳補填：CSV 範本與匯入（D1）
 # ──────────────────────────────────────────────────────────
 
 def test_ledger() -> None:
-    print("\n[8] 台帳補填：CSV 範本產出與匯入")
+    print("\n[10] 台帳補填：CSV 範本產出與匯入")
 
     import tempfile
 
@@ -520,7 +651,7 @@ def _psql_env() -> dict:
 
 
 def test_db(dbname: str) -> None:
-    print("\n[9] 資料庫：台帳欄位保留與 migration 冪等性")
+    print("\n[11] 資料庫：台帳欄位保留與 migration 冪等性")
     env = _psql_env()
     try:
         subprocess.run(["dropdb", "--if-exists", dbname], env=env, check=True, capture_output=True)
@@ -626,6 +757,8 @@ def main() -> int:
         test_axis_direction()
         test_backtest_instrumentation()
         test_guardrail()
+        test_systemic_gaps()
+        test_step_change_features()
         test_ledger()
         test_db(args.dbname)
     except AssertionError as e:

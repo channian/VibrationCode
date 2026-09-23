@@ -161,6 +161,11 @@ def load_rule_configs(config_path: str | None = None,
 
 def _apply_overrides(configs: dict[str, RuleConfigRow], overrides: dict[str, dict[str, Any]]) -> None:
     for rule_code, patch in overrides.items():
+        # 底線開頭是註解鍵的慣例（設定檔裡寫給人看的說明，JSON 沒有註解
+        # 語法），安靜略過——否則每個有寫說明的設定檔都會噴一串假警告，
+        # 真正的拼錯規則代碼反而被淹沒。
+        if rule_code.startswith('_'):
+            continue
         if rule_code not in configs:
             logger.warning(f"覆寫設定提到未知規則代碼 {rule_code!r}，略過")
             continue
