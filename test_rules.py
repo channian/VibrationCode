@@ -717,6 +717,35 @@ def test_ledger() -> None:
         check("參考欄不會被當成台帳欄位讀進來",
               'vel_rms_median' not in got and 'n_running' not in got, str(sorted(got)))
 
+    # iso_readiness 要讀得回填好的台帳——台帳補完之後，「有幾台真的
+    # 分類成功」是 D1 驗收的前提；若 ISO_ZONE 回傳 0 次，得先分得出是
+    # 「全部健康」還是「台帳根本沒生效」。
+    from validate.iso_readiness import collect as iso_collect
+    if os.path.isdir('data'):
+        led = {
+            'AHU-601':   {'iso_machine_group': '2', 'iso_foundation': 'rigid',
+                          'rated_power_kw': 22.0},
+            'ZP 3-5_M1': {'iso_machine_group': '3', 'iso_foundation': 'rigid',
+                          'rated_power_kw': 45.0},
+            'CP 10_M1':  {'iso_machine_group': '3', 'rated_power_kw': 11.0},
+        }
+        got = iso_collect('data', overrides=led).set_index('device_id')
+        check("台帳齊全的設備分類成功",
+              got.loc['AHU-601', 'machine_class'] == '2/rigid'
+              and got.loc['AHU-601', 'class_source'] == 'ledger',
+              str(got.loc['AHU-601', ['machine_class', 'class_source']].to_dict()))
+        check("只填一半的設備標成 ledger_partial 且算不出 Zone",
+              got.loc['CP 10_M1', 'class_source'] == 'ledger_partial'
+              and pd.isna(got.loc['CP 10_M1', 'machine_class']),
+              str(got.loc['CP 10_M1', ['machine_class', 'class_source']].to_dict()))
+        check("≤ 15 kW 標成適用範圍外（不是漏判）",
+              bool(got.loc['CP 10_M1', 'out_of_scope'])
+              and not bool(got.loc['AHU-601', 'out_of_scope']))
+        check("沒有台帳時所有設備維持未分類（誠實的預設）",
+              (iso_collect('data')['class_source'] == 'unset').all())
+    else:
+        skip("iso_readiness 讀回台帳", "找不到 data/ 樣本資料")
+
     # 布林欄的各種寫法
     from validate.points import _ledger_bool
     for raw, want in (('TRUE', True), ('true', True), ('Y', True), ('是', True), ('1', True),

@@ -33,9 +33,11 @@ import os
 import pandas as pd
 
 from vibcore.io.analytic_reader import _ENCODINGS
-from vibcore.metrics.iso import (ISO_FOUNDATIONS, ISO_GROUPS, ISO_THRESHOLDS,
+from vibcore.metrics.iso import (ISO_FOUNDATIONS, ISO_GROUPS,
+                                 ISO_MIN_RATED_POWER_KW, ISO_THRESHOLDS,
                                  classify_zone, iso_alert_threshold)
-from validate.points import _ISO_CODE_TO_GROUP, parse_iso_assumption
+from validate.points import (_ISO_CODE_TO_GROUP, load_device_meta_overrides,
+                             parse_iso_assumption)
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +96,16 @@ def _read_min(path: str) -> pd.DataFrame | None:
 
 
 def collect(data_dir: str, pattern: str = '*.csv',
-            assume: tuple[str, str] | None = None) -> pd.DataFrame:
+            assume: tuple[str, str] | None = None,
+            overrides: dict[str, dict] | None = None) -> pd.DataFrame:
     """
     掃描資料夾，彙整每台設備的 ISO 分類與 velRMS 水準。
 
-    `assume` 為 `(群組, 基礎剛性)`；不給則所有設備都算未分類，
+    `overrides` 是**真的台帳**（`--device-meta` 讀進來的），逐台帶自己的
+    群組／基礎剛性／額定功率，優先於 `assume`。台帳補完之後，這才是要看的
+    東西——`assume` 只是台帳還沒有時做敏感度分析用的全廠一致假設。
+
+    `assume` 為 `(群組, 基礎剛性)`；兩者都不給則所有設備都算未分類，
     這是預設也是唯一誠實的預設值——前端資料沒有基礎剛性欄位。
     """
     paths = sorted(glob.glob(os.path.join(data_dir, pattern)))
@@ -134,7 +141,32 @@ def collect(data_dir: str, pattern: str = '*.csv',
         # 分類一律來自明確給定的假設，不從 ISO10816_code 猜——該欄位語意
         # 未經確認，且就算確認了也還缺基礎剛性（見 points._ISO_CODE_TO_GROUP）。
         # 有填 code 的設備才套用假設，好讓「台帳有填」與「空白」仍分得開。
-        iso_key = assume if (assume is not None and code in _ISO_CODE_TO_GROUP) else None
+        # 台帳優先：有填就用填的，沒有才退回假設。
+        ov = (overrides or {}).get(name, {})
+        group, foundation = ov.get('iso_machine_group'), ov.get('iso_foundation')
+        if group is not None and foundation is not None:
+            iso_key = (str(group), str(foundation))
+            if iso_key not in ISO_THRESHOLDS:
+                logger.warning(f"{name} 的台帳分類 {iso_key} 不是合法組合，視為未分類")
+                iso_key = None
+            source = 'ledger'
+        elif group is not None or foundation is not None:
+            # 只填一邊算不出 Zone。這種「看起來填了一半」最容易誤導人，
+            # 所以獨立標一個來源，讓報表點得出是哪幾台。
+            iso_key, source = None, 'ledger_partial'
+        elif assume is not None and code in _ISO_CODE_TO_GROUP:
+            iso_key, source = assume, 'assumption'
+        else:
+            iso_key, source = None, 'unset'
+
+        # 適用範圍：ISO 20816-3 只涵蓋 > 15 kW。缺功率不擋（缺資料 ≠ 超出
+        # 範圍），與 vibcore.metrics.iso.iso_scope_reason 的判準保持一致。
+        power = ov.get('rated_power_kw')
+        out_of_scope = (power is not None
+                        and float(power) <= ISO_MIN_RATED_POWER_KW)
+        if out_of_scope:
+            iso_key = None
+
         machine_class = '/'.join(iso_key) if iso_key else None
         # 以運轉中 velRMS 的中位數當基準的替代值。真正的基準期由
         # detect_baseline 掃描最穩定窗口而得，這裡只需要一個量級參考。
@@ -154,6 +186,9 @@ def collect(data_dir: str, pattern: str = '*.csv',
             'device_id': name,
             'iso_code': code,
             'machine_class': machine_class,
+            'class_source': source,
+            'rated_power_kw': power,
+            'out_of_scope': out_of_scope,
             'rated_rpm': rpm,
             'n_rows': len(sub),
             'n_running': len(vel_run),
@@ -193,6 +228,29 @@ def report(df: pd.DataFrame) -> None:
         dist = classified['machine_class'].value_counts().sort_index()
         print('\n  分類分佈：' + '、'.join(
             f"{ISO_THRESHOLDS[tuple(k.split('/'))]['label']} {v} 台" for k, v in dist.items()))
+
+    if 'class_source' in df.columns:
+        src = df['class_source'].value_counts()
+        labels = {'ledger': '台帳已填（群組＋基礎剛性齊全）',
+                  'ledger_partial': '台帳只填了一半（算不出 Zone）',
+                  'assumption': '套用 --assume-iso 的假設值',
+                  'unset': '完全沒有分類資訊'}
+        print('\n  分類來源：')
+        for k, label in labels.items():
+            n_k = int(src.get(k, 0))
+            if n_k:
+                print(f'    {label}：{n_k} 台')
+        partial = df[df['class_source'] == 'ledger_partial']
+        if not partial.empty:
+            print(f'    ⚠ 只填一半的這 {len(partial)} 台等於白填，Zone 判定不會生效：')
+            print('      ' + '、'.join(partial['device_id'].head(10).tolist()))
+
+    if 'out_of_scope' in df.columns and df['out_of_scope'].any():
+        oos = df[df['out_of_scope']]
+        print(f'\n  ISO 適用範圍外（額定功率 ≤ {ISO_MIN_RATED_POWER_KW:.0f} kW）：{len(oos)} 台')
+        print('    這些設備不做 Zone 判定是正確的，不是漏判：')
+        for r in oos.head(10).itertuples():
+            print(f'      {r.device_id}（{r.rated_power_kw} kW）')
 
     if len(unset):
         print(f'\n⚠ 未分類的 {len(unset)} 台設備：')
@@ -494,6 +552,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument('--data-dir', required=True, help='存放 Analytic CSV 的資料夾')
     p.add_argument('--pattern', default='*.csv', help='檔名比對樣式（預設 *.csv）')
     p.add_argument('--csv', default=None, help='另存一份明細 CSV')
+    p.add_argument('--device-meta', default=None, metavar='PATH',
+                   help='真的台帳（.csv 或 .json），逐台帶群組／基礎剛性／額定功率。'
+                        '台帳補完之後要看的是這個，--assume-iso 只在台帳還沒有時用')
     p.add_argument('--assume-iso', default=None, metavar='GROUP/FOUNDATION',
                    help='假設全部已填 ISO10816_code 的設備為此分類，例如 3/rigid。'
                         '不給則所有設備視為未分類（前端沒有基礎剛性欄位）')
@@ -535,7 +596,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f'參數錯誤：{e}')
         return 2
 
-    df = collect(args.data_dir, args.pattern, assume=assume)
+    overrides = load_device_meta_overrides(args.device_meta)
+    if args.device_meta and not overrides:
+        print(f'⚠ 台帳 {args.device_meta} 沒有讀到任何設備，請檢查檔案與 device_id 欄位\n')
+    df = collect(args.data_dir, args.pattern, assume=assume, overrides=overrides)
+    if overrides:
+        print(f'（台帳：{args.device_meta}，讀到 {len(overrides)} 台的補充資訊）\n')
     if assume is not None:
         print(f'（分類假設：{"/".join(assume)}——這是假設值，不是台帳實際資料）\n')
     report(df)
