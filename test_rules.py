@@ -600,6 +600,36 @@ def test_step_change_features() -> None:
     # 底線開頭是註解鍵，不該被當成規則代碼
     from validate.rule_defaults import load_rule_configs
     cfgs = load_rule_configs('validate/rule_configs/step_change_without_kurt.json')
+    # 掉特徵必須看得出來：門檻的稀有程度隨特徵數而變，某點少一個特徵時
+    # 同一個門檻對它比較鬆，跨點就不可比——而且從 n_features 一個數字
+    # 分不出「設定檔指定三特徵」與「第四個安靜掉了」。
+    r4m = step_change(sc_ctx())
+    check("四特徵齊全時 features_missing 為空", r4m.evidence['features_missing'] == {})
+    check("四特徵齊全時 features_requested 記錄四個",
+          len(r4m.evidence['features_requested']) == 4)
+
+    agg_drop = agg.drop(columns=['acc_kurt'])
+    bl_drop = BaselineStats(
+        point_id=1, start_date=dt.date(2026, 8, 25), end_date=dt.date(2026, 8, 25),
+        source='auto',
+        stats={k: v for k, v in baseline.stats.items() if k != 'acc_kurt'}, n_hours=24)
+    r_drop = step_change(RuleContext(
+        device=device(iso_machine_group='2', iso_foundation='rigid'),
+        point_id=1, position='M1', agg=agg_drop, baseline=bl_drop,
+        params={}, now=base_day + dt.timedelta(days=1, hours=13)))
+    check("特徵安靜掉了會被記錄下來（不是只剩一個數字）",
+          r_drop.evidence['n_features'] == 3
+          and 'acc_kurt' in r_drop.evidence['features_missing'],
+          str(r_drop.evidence.get('features_missing')))
+    check("缺特徵的原因有寫清楚",
+          '欄位' in r_drop.evidence['features_missing']['acc_kurt'],
+          str(r_drop.evidence['features_missing']['acc_kurt']))
+    check("分得出「設定檔指定三特徵」與「第四個掉了」",
+          len(r3.evidence['features_requested']) == 3
+          and r3.evidence['features_missing'] == {}
+          and len(r_drop.evidence['features_requested']) == 4,
+          f"B={r3.evidence['features_requested']} drop={r_drop.evidence['features_requested']}")
+
     check("設定檔的註解鍵不會被當成未知規則",
           cfgs['STEP_CHANGE'].params.get('features') == ['vel_rms', 'acc_rms', 'acc_crest'],
           str(cfgs['STEP_CHANGE'].params))

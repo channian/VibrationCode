@@ -932,9 +932,29 @@ def step_change(ctx: RuleContext) -> RuleOutcome:
     # 的卡方分布，k 變了同一個門檻數字對應的尾機率就不同（k=4 的 3.0 對應
     # 尾機率 0.061，k=3 要 2.71 才是同一個機率）。直接沿用舊門檻比較，
     # 量到的會是「門檻變嚴了」而不是「少了這個特徵的效果」。
-    candidates = ctx.params.get('features') or _STEP_CHANGE_FEATURES
+    candidates = list(ctx.params.get('features') or _STEP_CHANGE_FEATURES)
     features = [f for f in candidates
                 if f in ctx.agg.columns and f in ctx.baseline.stats]
+    # **掉特徵不可以安靜發生。** 門檻的意義隨特徵數而變（k 維距離平方服從
+    # 自由度 k 的卡方分布），所以某個量測點少了一個特徵時，同一個門檻數字
+    # 對它而言比別人鬆——跨量測點就不可比了，而且從結果完全看不出來。
+    # 這裡把「要求了什麼、實際用了什麼、少了什麼、為什麼少」全部記進
+    # evidence，並記一筆警告。
+    missing = {}
+    for f in candidates:
+        if f in features:
+            continue
+        why = []
+        if f not in ctx.agg.columns:
+            why.append('agg 無此欄位')
+        if ctx.baseline is not None and f not in ctx.baseline.stats:
+            why.append('基準期無此統計量')
+        missing[f] = '、'.join(why) or '未知'
+    if missing:
+        logger.warning(
+            f"STEP_CHANGE：point={ctx.point_id} 要求 {len(candidates)} 個特徵，"
+            f"實際只有 {len(features)} 個可用（{missing}）。門檻 "
+            f"mahalanobis_sigma 的稀有程度隨特徵數而變，此點與其他點不可直接比較。")
     if len(features) < 2:
         logger.debug(f"STEP_CHANGE：point={ctx.point_id} 可用特徵不足 2 個"
                      f"（agg 欄位與基準統計量交集：{features}），無法做多變量判定")
@@ -978,6 +998,10 @@ def step_change(ctx: RuleContext) -> RuleOutcome:
             'features': features,
             # 攤平到事件列，讓對照回測能直接依特徵數分組比較
             'n_features': len(features),
+            # 要求了幾個、少了哪些——n_features 比預期小時，答案在這裡。
+            # 沒有這兩欄就分不出「設定檔指定三特徵」與「第四個安靜掉了」。
+            'features_requested': candidates,
+            'features_missing': missing,
             'distance': result.distance,
             'threshold': result.threshold,
             'per_feature_sigma': result.per_feature_sigma,
