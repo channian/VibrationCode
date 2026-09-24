@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 
 import pandas as pd
@@ -177,26 +178,54 @@ def detect_systemic_gaps(gaps_df: pd.DataFrame) -> pd.DataFrame:
             .reset_index(drop=True))
 
 
+#: 短暫停頓要報到什麼門檻，由「純屬巧合的期望次數」決定，不寫死。
+#: 期望次數低於實際觀測的這個比例，才算這個門檻下的事件值得一看。
+_CHANCE_MAX_SHARE = 0.10
+
+
+def _poisson_sf(k: int, lam: float) -> float:
+    """P(X >= k)，X ~ Poisson(lam)。自己算是為了不因為一個尾機率就把
+    scipy 變成專案依賴（目前整個 vibcore/validate 都沒用到它）。"""
+    if lam <= 0:
+        return 0.0 if k > 0 else 1.0
+    # 逐項累加 P(X = i)，i < k；lam 在這裡是個位數，不會有數值問題
+    term = math.exp(-lam)
+    cdf = term
+    for i in range(1, k):
+        term *= lam / i
+        cdf += term
+    return max(0.0, 1.0 - cdf)
+
+
 def summarize_brief_outages(gaps_df: pd.DataFrame,
                             period_days: float | None = None) -> dict | None:
     """
-    把「短暫但全廠同時」的停頓壓成幾個數字。
+    把「短暫但多點同時」的停頓壓成幾個數字，並扣掉純屬巧合的部分。
 
-    逐組列出沒有意義（實測 66 點 2.6 週就有上百組），但**這個型態本身是
-    重要的發現**：它代表缺口不是散落在各台設備的感測器問題，而是收集
-    系統每天規律地停幾次。處置對象因此是 IT／收集程式，不是 66 顆感測器。
+    逐組列出沒有意義（實測 66 點 2.6 週就有上百次），但**這個型態本身可能
+    是重要的發現**：若缺口不是散落在各台設備，而是收集系統規律地停頓，
+    處置對象就是 IT／收集程式，不是 66 顆感測器。
+
+    **必須扣掉巧合，否則這個結論站不住**。每個量測點本來就會零星斷線，
+    當全廠平均每小時有 λ 次斷線開始時，光靠機率就會出現不少「3 個點剛好
+    同一小時斷線」。實測 66 點、2.6 週，λ ≈ 1.3，門檻取 3 點時光是巧合
+    就有約 66 次——而總共只偵測到 146 次，將近一半是假的。把這些算進
+    「收集系統的問題」會高估它、也會讓 IT 查不到東西。
+
+    所以報告門檻不寫死：以 Poisson 估出各門檻下的巧合期望次數，取**第一個
+    讓巧合佔比低於 `_CHANCE_MAX_SHARE` 的門檻**來統計。門檻、期望次數與
+    超出量都一起回傳，讓讀報表的人看得到這個修正是怎麼來的。
 
     **這裡不沿用 `detect_systemic_gaps` 的分叢結果**，而是直接從 gaps_df
-    以「整點對齊」重數一次。原因是那邊的 ±6 小時容忍窗是為持續性中斷設
-    計的（各點被逐台切換，起始時間散在數小時內），套到一天發生好幾次的
-    短暫停頓上會把相鄰幾次併成一次，頻率因此被低估。短暫停頓是同一刻
-    整齊地開始，用整點對齊數才準，也不需要任何容忍參數。
+    以整點對齊重數：那邊的 ±6 小時容忍窗是為持續性中斷設計的（各點逐台
+    切換，起始時間散在數小時內），套到一天好幾次的短暫停頓上會把相鄰
+    幾次併成一次，頻率因此被低估。
 
     Returns:
-        `{'n_events', 'per_day', 'median_points', 'median_hours',
-        'missing_hours', 'missing_share'}`；沒有短暫停頓時回傳 None。
-        `missing_share` 是這些停頓佔「全部缺口小時數」的比例——回答
-        「把收集系統修好，涵蓋率能救回多少」。
+        `{'threshold_points', 'n_events', 'n_expected_by_chance', 'n_excess',
+        'per_day', 'median_points', 'median_hours', 'missing_hours',
+        'missing_share'}`；沒有超出巧合的短暫停頓時回傳 None。
+        件數與時數一律只算達到 `threshold_points` 的事件。
     """
     if gaps_df.empty or 'hours' not in gaps_df or 'gap_start' not in gaps_df:
         return None
@@ -212,7 +241,21 @@ def summarize_brief_outages(gaps_df: pd.DataFrame,
     grouped = brief.groupby('_ts').agg(n_points=('device_id', 'nunique'),
                                        median_hours=('_h', 'median'),
                                        total_hours=('_h', 'sum'))
-    events = grouped[grouped['n_points'] >= _SYSTEMIC_MIN_POINTS]
+
+    # 巧合基準：把 brief 的斷線起始視為在觀測時數上均勻散布的獨立事件
+    period_hours = (period_days * 24.0) if period_days else float(len(grouped))
+    lam = (len(brief) / period_hours) if period_hours > 0 else 0.0
+
+    threshold = _SYSTEMIC_MIN_POINTS
+    expected = float('inf')
+    for k in range(_SYSTEMIC_MIN_POINTS, int(grouped['n_points'].max()) + 2):
+        observed_k = int((grouped['n_points'] >= k).sum())
+        expected_k = _poisson_sf(k, lam) * period_hours
+        threshold, expected = k, expected_k
+        if observed_k == 0 or expected_k <= _CHANCE_MAX_SHARE * observed_k:
+            break
+
+    events = grouped[grouped['n_points'] >= threshold]
     if events.empty:
         return None
 
@@ -220,7 +263,10 @@ def summarize_brief_outages(gaps_df: pd.DataFrame,
     brief_hours = float(events['total_hours'].sum())
 
     return {
+        'threshold_points': int(threshold),
         'n_events': int(len(events)),
+        'n_expected_by_chance': round(expected, 1),
+        'n_excess': round(len(events) - expected, 1),
         'per_day': (len(events) / period_days) if period_days else None,
         'median_points': float(events['n_points'].median()),
         'median_hours': float(events['median_hours'].median()),
@@ -534,9 +580,13 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
             brief = summarize_brief_outages(result.gaps_df, period_days)
             if brief:
                 lines.append('')
-                lines.append(f'  【短暫全廠停頓】時長 < {_SUSTAINED_MIN_HOURS:.0f} 小時，'
-                             f'共 {brief["n_events"]} 次——數量太多，逐筆列出沒有意義，')
-                lines.append('    改看頻率：')
+                lines.append(f'  【短暫多點停頓】時長 < {_SUSTAINED_MIN_HOURS:.0f} 小時。'
+                             f'數量太多，逐筆列出沒有意義，改看頻率：')
+                lines.append(f'    統計門檻：同一小時內 ≥ {brief["threshold_points"]} 個量測點'
+                             f'同時開始斷線')
+                lines.append(f'    符合的事件 {brief["n_events"]} 次'
+                             f'（其中約 {brief["n_expected_by_chance"]:.0f} 次是巧合，'
+                             f'超出巧合的部分約 {brief["n_excess"]:.0f} 次）')
                 per_day = (f'每天約 {brief["per_day"]:.1f} 次　'
                            if brief['per_day'] else '')
                 lines.append(f'    {per_day}每次影響 {brief["median_points"]:.0f} 個量測點'
@@ -544,10 +594,19 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
                 if brief['missing_share'] is not None:
                     lines.append(f'    合計約佔全部資料缺口的 '
                                  f'{brief["missing_share"] * 100:.0f}%')
-                lines.append('    處置：這個型態代表缺口不是散落在各台設備的感測器問題，而是')
-                lines.append('          收集系統規律地停頓。**對象是 IT／收集程式，不是感測器。**')
-                if brief['missing_share'] is not None and brief['missing_share'] > 0.5:
-                    lines.append('          它佔了缺口的大半，修好它比逐台查感測器有效得多。')
+                lines.append('')
+                lines.append('    門檻怎麼來的：每個量測點本來就會零星斷線，光靠機率就會出現')
+                lines.append('    「幾個點剛好同一小時斷線」。上面的門檻是自動選的——取第一個')
+                lines.append('    讓「純屬巧合的期望次數」低於實際觀測一成的點數，避免把巧合')
+                lines.append('    當成系統問題報給 IT（他們會查不到東西）。')
+                if brief['n_excess'] > 0 and brief['missing_share'] is not None:
+                    lines.append('    處置：超出巧合的部分代表收集系統有規律地停頓，對象是')
+                    lines.append('          IT／收集程式，不是感測器。')
+                    if brief['missing_share'] > 0.4:
+                        lines.append('          它佔了缺口的一大塊，先修它比逐台查感測器有效。')
+                else:
+                    lines.append('    處置：超出巧合的部分不明顯，這些停頓比較像各點各自的零星')
+                    lines.append('          斷線累積而成，沒有單一的系統性原因可查。')
             lines.append('')
 
     lines.append('-- 嚴重度分級說明 --')

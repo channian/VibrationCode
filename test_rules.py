@@ -402,8 +402,8 @@ def test_systemic_gaps() -> None:
     print("\n[8] 疑似系統層級中斷（多點共用同一斷線邊界）")
 
     from validate.report import (_SUSTAINED_MIN_HOURS, _SYSTEMIC_MIN_POINTS,
-                                 _SYSTEMIC_TOLERANCE_H, detect_systemic_gaps,
-                                 summarize_brief_outages)
+                                 _SYSTEMIC_TOLERANCE_H, _poisson_sf,
+                                 detect_systemic_gaps, summarize_brief_outages)
 
     # 重現 2026-08-03 那次：14 個點結束於同一刻，起始散在數小時內
     rows = [{'device_id': f'DEV{i:02d}', 'position': 'M1',
@@ -484,6 +484,40 @@ def test_systemic_gaps() -> None:
           str(brief['missing_share']))
     check("沒有短暫停頓時回傳 None",
           summarize_brief_outages(pd.DataFrame(rows), period_days=18.0) is None)
+
+    # ── 巧合基準：每個點本來就會零星斷線，光靠機率就會出現「幾個點剛好
+    # 同一小時斷線」。實測 66 點 2.6 週、門檻取 3 點時，光是巧合就有約
+    # 66 次，而總共只偵測到 146 次——將近一半是假的。把巧合報給 IT
+    # 當成系統問題，他們會查不到東西。
+    days_r, n_pts_r = 18.2, 66
+    rng_r = np.random.default_rng(1)
+    noise = []
+    for h in range(int(days_r * 24)):
+        t = pd.Timestamp('2026-08-03') + dt.timedelta(hours=h)
+        for i in rng_r.choice(n_pts_r, size=rng_r.poisson(1.34), replace=False):
+            noise.append({'device_id': f'P{i:02d}', 'position': 'M1', 'gap_start': t,
+                          'gap_end': t + dt.timedelta(hours=1), 'hours': 1.0})
+    check("純隨機的零星斷線不會被報成系統性問題",
+          summarize_brief_outages(pd.DataFrame(noise), period_days=days_r) is None)
+
+    # 同一份雜訊 + 每天 2 次真正的 25 點同時停頓 → 要抓得出來且數字要準
+    planted = list(noise)
+    for day in range(18):
+        for hh in (3, 15):
+            t = pd.Timestamp('2026-08-03') + dt.timedelta(days=day, hours=hh)
+            for i in range(25):
+                planted.append({'device_id': f'P{i:02d}', 'position': 'M1', 'gap_start': t,
+                                'gap_end': t + dt.timedelta(hours=1), 'hours': 1.0})
+    got = summarize_brief_outages(pd.DataFrame(planted), period_days=days_r)
+    check("真正的系統性停頓仍抓得出來（真值 2.0/天）",
+          got is not None and abs(got['per_day'] - 2.0) < 0.2,
+          None if got is None else f"{got['per_day']:.2f}")
+    check("影響點數還原正確（真值 25 點）", got['median_points'] == 25.0)
+    check("門檻自動升高到巧合可忽略的位置",
+          got['threshold_points'] > _SYSTEMIC_MIN_POINTS, str(got['threshold_points']))
+    check("超出巧合的次數遠大於巧合本身",
+          got['n_excess'] > got['n_expected_by_chance'] * 5,
+          f"excess={got['n_excess']} chance={got['n_expected_by_chance']}")
 
 
 # ──────────────────────────────────────────────────────────
