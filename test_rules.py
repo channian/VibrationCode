@@ -519,6 +519,16 @@ def test_systemic_gaps() -> None:
           got['n_excess'] > got['n_expected_by_chance'] * 5,
           f"excess={got['n_excess']} chance={got['n_expected_by_chance']}")
 
+    # 逐筆時間戳：只給「每天幾次」IT 無從查起，要能拿去對 log
+    ev = got['events']
+    check("有回傳逐筆事件供 IT 對 log", len(ev) == got['n_events'], str(len(ev)))
+    check("事件時間戳還原出植入的規律（每天 03:00 與 15:00）",
+          set(pd.to_datetime(ev['boundary']).dt.hour.unique()) == {3, 15},
+          str(sorted(pd.to_datetime(ev['boundary']).dt.hour.unique())))
+    check("事件明細帶得出寫 CSV 需要的欄位",
+          {'boundary', 'kind', 'n_points', 'median_hours', 'tier'} <= set(ev.columns),
+          str(list(ev.columns)))
+
 
 # ──────────────────────────────────────────────────────────
 # STEP_CHANGE 的特徵集可覆寫（對照回測用）

@@ -262,9 +262,18 @@ def summarize_brief_outages(gaps_df: pd.DataFrame,
     missing_hours = float(d['_h'].sum())
     brief_hours = float(events['total_hours'].sum())
 
+    # 逐筆時間戳：IT 要拿這個去對自己的 log（換版紀錄、網路告警、排程作業），
+    # 只給「每天 1.8 次」他們無從查起。這是這份報表唯一能交到對方手上的線索。
+    detail = (events.reset_index()
+              .rename(columns={'_ts': 'boundary'})
+              .assign(kind='start', tier='brief')
+              [['boundary', 'kind', 'n_points', 'median_hours', 'tier']]
+              .sort_values('boundary'))
+
     return {
         'threshold_points': int(threshold),
         'n_events': int(len(events)),
+        'events': detail,
         'n_expected_by_chance': round(expected, 1),
         'n_excess': round(len(events) - expected, 1),
         'per_day': (len(events) / period_days) if period_days else None,
@@ -601,7 +610,8 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
                 lines.append('    當成系統問題報給 IT（他們會查不到東西）。')
                 if brief['n_excess'] > 0 and brief['missing_share'] is not None:
                     lines.append('    處置：超出巧合的部分代表收集系統有規律地停頓，對象是')
-                    lines.append('          IT／收集程式，不是感測器。')
+                    lines.append('          IT／收集程式，不是感測器。逐筆時間戳見')
+                    lines.append('          systemic_gaps.csv，可拿去對換版紀錄／網路告警／排程作業。')
                     if brief['missing_share'] > 0.4:
                         lines.append('          它佔了缺口的一大塊，先修它比逐台查感測器有效。')
                 else:
@@ -781,8 +791,18 @@ def write_reports(result: BacktestResult, rule_configs: dict[str, RuleConfigRow]
         result.gaps_df.rename(columns=_GAPS_COLS), os.path.join(out_dir, 'gaps.csv'))
     systemic = detect_systemic_gaps(result.gaps_df)
     if not systemic.empty:
-        written['systemic_gaps'] = _safe_write_csv(
-            systemic.rename(columns=_SYSTEMIC_COLS), os.path.join(out_dir, 'systemic_gaps.csv'))
+        # CSV 裡的 brief 列換成「逐筆、已扣掉巧合」的版本：分叢版的 brief
+        # 時間戳是 ±6 小時併出來的，對 log 會對不上，而且沒有扣巧合。
+        brief_sum = summarize_brief_outages(
+            result.gaps_df, span_weeks(result.span_start, result.span_end) * 7.0)
+        parts = [systemic[systemic['tier'] == 'sustained']]
+        if brief_sum is not None:
+            parts.append(brief_sum['events'])
+        out = pd.concat([p for p in parts if not p.empty], ignore_index=True)
+        if not out.empty:
+            written['systemic_gaps'] = _safe_write_csv(
+                out.rename(columns=_SYSTEMIC_COLS),
+                os.path.join(out_dir, 'systemic_gaps.csv'))
     written['finding_stats_by_rule'] = _safe_write_csv(
         stats_by_rule, os.path.join(out_dir, 'finding_stats_by_rule.csv'))
     written['finding_stats_by_device'] = _safe_write_csv(
