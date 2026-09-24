@@ -76,6 +76,7 @@ _COVERAGE_COLS = {
 _SYSTEMIC_COLS = {
     'boundary': '邊界時刻', 'kind': '種類(start=同時開始/end=同時結束)',
     'n_points': '量測點數', 'points': '量測點清單', 'median_hours': '時長中位數(小時)',
+    'tier': '層級(sustained=持續性中斷/brief=短暫停頓)',
 }
 
 _GAPS_COLS = {
@@ -94,26 +95,36 @@ _SYSTEMIC_MIN_POINTS = 3
 #: 散在數小時內（設備是逐台被切換的），但結束時間往往完全一致。
 _SYSTEMIC_TOLERANCE_H = 6
 
+#: 區分「持續性中斷」與「短暫停頓」的時長分界（小時）。
+#: **這個分界是報表可用性的關鍵**：實測 66 點 2.6 週的資料裡，全廠同時
+#: 發生的 1 小時停頓有上百組（每天約 6 次），若與 600 小時的重大中斷混在
+#: 同一張清單裡逐組列出，真正要處理的那幾筆會被淹沒到看不見。
+#: 兩者的處置也不同——持續性中斷要排除資料、重算基準；短暫停頓改不了
+#: 過去，但它是收集系統穩定度的指標，看的是「每天幾次」而不是「哪一次」。
+_SUSTAINED_MIN_HOURS = 12.0
+
 
 def detect_systemic_gaps(gaps_df: pd.DataFrame) -> pd.DataFrame:
     """
     找出「多個量測點共用同一個斷線邊界」的區段——系統層級事件的特徵。
 
     **為什麼要自動找**：同一個結論我們已經靠人眼在 gaps.csv 裡發現兩次
-    （2026-01-09 的收集程式換版、2026-08-03 的中斷），而兩次都是先得出
-    錯誤結論才回頭修正的——把它讀成「這些感測器壞了」會讓涵蓋率低估
-    設備健康度、讓 IT／儀電收到一堆不該開的單，更麻煩的是基準期會挑到
-    中斷前那一段再拿去跟中斷後比。人眼看得到是因為剛好去翻了 gaps.csv，
-    下一個人不會。
+    （2026-01-09 的收集程式換版、2026-08-03 的 14 點中斷），而兩次都是
+    先得出錯誤結論才回頭修正的——把它讀成「這些感測器壞了」會讓涵蓋率
+    低估設備健康度、讓 IT／儀電收到一堆不該開的單，更麻煩的是基準期會
+    挑到中斷前那一段再拿去跟中斷後比。
 
     判準只用一件客觀事實：**幾個不同的量測點在同一時刻（±容忍窗）開始或
     結束斷線**。這不推論成因——可能是收集程式換版、網路、機房電力，
     報表只說「這不像各點各自故障」，該查什麼由 IT 判斷。
 
+    結果分兩層（`tier` 欄）：時長中位數達 `_SUSTAINED_MIN_HOURS` 的是
+    `sustained`（逐筆列出、要處理），其餘是 `brief`（數量太多，改以
+    「每天幾次」的頻率呈現，見 `summarize_brief_outages`）。
+
     Returns:
-        每列一個疑似系統事件，欄位 `boundary`（邊界時刻）、`kind`
-        （`start` 或 `end`）、`n_points`、`points`（量測點清單）、
-        `median_hours`（這些區段的時長中位數）。空表代表沒有發現。
+        每列一個疑似系統事件，欄位 `boundary`、`kind`（`start`/`end`）、
+        `n_points`、`points`、`median_hours`、`tier`。空表代表沒有發現。
     """
     if gaps_df.empty or not {'gap_start', 'gap_end', 'device_id'} <= set(gaps_df.columns):
         return pd.DataFrame()
@@ -144,19 +155,79 @@ def detect_systemic_gaps(gaps_df: pd.DataFrame) -> pd.DataFrame:
                           for r in sub.itertuples()})
             if len(pts) < _SYSTEMIC_MIN_POINTS:
                 continue
+            median_h = float(sub['hours'].median()) if 'hours' in sub else float('nan')
             rows.append({
                 'boundary': sub['_ts'].min(),
                 'kind': kind,
                 'n_points': len(pts),
                 'points': '、'.join(pts),
-                'median_hours': float(sub['hours'].median()) if 'hours' in sub else float('nan'),
+                'median_hours': median_h,
+                'tier': ('sustained' if median_h >= _SUSTAINED_MIN_HOURS else 'brief'),
             })
 
     if not rows:
         return pd.DataFrame()
-    return (pd.DataFrame(rows)
-            .sort_values(['n_points', 'boundary'], ascending=[False, True])
+    out = pd.DataFrame(rows)
+    # 明確指定層級順序：要處理的持續性中斷排最前面。不能靠字串排序
+    # ——'brief' < 'sustained'，升冪會把該看的那幾筆推到最後面。
+    out['_rank'] = (out['tier'] == 'brief').astype(int)
+    return (out.sort_values(['_rank', 'n_points', 'boundary'],
+                            ascending=[True, False, True])
+            .drop(columns='_rank')
             .reset_index(drop=True))
+
+
+def summarize_brief_outages(gaps_df: pd.DataFrame,
+                            period_days: float | None = None) -> dict | None:
+    """
+    把「短暫但全廠同時」的停頓壓成幾個數字。
+
+    逐組列出沒有意義（實測 66 點 2.6 週就有上百組），但**這個型態本身是
+    重要的發現**：它代表缺口不是散落在各台設備的感測器問題，而是收集
+    系統每天規律地停幾次。處置對象因此是 IT／收集程式，不是 66 顆感測器。
+
+    **這裡不沿用 `detect_systemic_gaps` 的分叢結果**，而是直接從 gaps_df
+    以「整點對齊」重數一次。原因是那邊的 ±6 小時容忍窗是為持續性中斷設
+    計的（各點被逐台切換，起始時間散在數小時內），套到一天發生好幾次的
+    短暫停頓上會把相鄰幾次併成一次，頻率因此被低估。短暫停頓是同一刻
+    整齊地開始，用整點對齊數才準，也不需要任何容忍參數。
+
+    Returns:
+        `{'n_events', 'per_day', 'median_points', 'median_hours',
+        'missing_hours', 'missing_share'}`；沒有短暫停頓時回傳 None。
+        `missing_share` 是這些停頓佔「全部缺口小時數」的比例——回答
+        「把收集系統修好，涵蓋率能救回多少」。
+    """
+    if gaps_df.empty or 'hours' not in gaps_df or 'gap_start' not in gaps_df:
+        return None
+
+    d = gaps_df.copy()
+    d['_h'] = pd.to_numeric(d['hours'], errors='coerce')
+    d['_ts'] = pd.to_datetime(d['gap_start'], errors='coerce').dt.floor('h')
+    d = d.dropna(subset=['_h', '_ts'])
+    brief = d[d['_h'] < _SUSTAINED_MIN_HOURS]
+    if brief.empty:
+        return None
+
+    grouped = brief.groupby('_ts').agg(n_points=('device_id', 'nunique'),
+                                       median_hours=('_h', 'median'),
+                                       total_hours=('_h', 'sum'))
+    events = grouped[grouped['n_points'] >= _SYSTEMIC_MIN_POINTS]
+    if events.empty:
+        return None
+
+    missing_hours = float(d['_h'].sum())
+    brief_hours = float(events['total_hours'].sum())
+
+    return {
+        'n_events': int(len(events)),
+        'per_day': (len(events) / period_days) if period_days else None,
+        'median_points': float(events['n_points'].median()),
+        'median_hours': float(events['median_hours'].median()),
+        'missing_hours': brief_hours,
+        'missing_share': (brief_hours / missing_hours
+                          if missing_hours > 0 else None),
+    }
 
 
 def _safe_write_csv(df: pd.DataFrame, path: str) -> str:
@@ -409,6 +480,7 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
                  f"（約 {span_weeks(result.span_start, result.span_end):.1f} 週）")
     lines.append(f"設備數：{result.n_devices}　量測點數：{result.n_points}")
     lines.append('')
+    period_days = span_weeks(result.span_start, result.span_end) * 7.0
 
     lines.append('-- 指標／規則層實作來源（影響本次回測結果的可信度）--')
     for name, is_real in using_real.items():
@@ -435,23 +507,47 @@ def _build_summary_text(result: BacktestResult, rule_configs: dict[str, RuleConf
 
         systemic = detect_systemic_gaps(result.gaps_df)
         if not systemic.empty:
+            sustained = systemic[systemic['tier'] == 'sustained']
             lines.append('-- ⚠ 疑似系統層級的中斷（多點共用同一個斷線邊界）--')
             lines.append(f'  判準：{_SYSTEMIC_MIN_POINTS} 個以上量測點在同一時刻'
                          f'（±{_SYSTEMIC_TOLERANCE_H} 小時）同時開始或同時結束斷線。')
             lines.append('  多顆感測器各自故障不會挑同一刻，所以這比較像收集程式換版、')
             lines.append('  網路或機房層級的事件——本報表只陳述這個型態，不推論成因。')
-            for _, r in systemic.head(5).iterrows():
-                kind = '同時開始' if r['kind'] == 'start' else '同時結束'
-                lines.append(f"  {r['boundary']}　{kind}　{r['n_points']} 個量測點"
-                             f"（時長中位數 {r['median_hours']:.0f} 小時）")
-            if len(systemic) > 5:
-                lines.append(f'  …另有 {len(systemic) - 5} 組，見 systemic_gaps.csv')
             lines.append('')
-            lines.append('  處置建議：')
-            lines.append('    · 這些區間的低涵蓋率**不代表感測器健康度差**，不該據此換感測器。')
-            lines.append('    · 基準期會受影響——演算法挑「最穩定窗口」時可能挑到中斷前那一段，')
-            lines.append('      再拿去跟中斷後的資料比，整段看起來都在偏離。建議用 --since')
-            lines.append('      把最後一次系統層級中斷之前的資料整段排除，重跑一次對照。')
+
+            if sustained.empty:
+                lines.append(f'  持續性中斷（時長 ≥ {_SUSTAINED_MIN_HOURS:.0f} 小時）：無')
+            else:
+                lines.append(f'  【持續性中斷】時長 ≥ {_SUSTAINED_MIN_HOURS:.0f} 小時，'
+                             f'共 {len(sustained)} 組——這些要處理：')
+                for _, r in sustained.head(8).iterrows():
+                    kind = '同時開始' if r['kind'] == 'start' else '同時結束'
+                    lines.append(f"    {r['boundary']}　{kind}　{r['n_points']} 個量測點"
+                                 f"（時長中位數 {r['median_hours']:.0f} 小時）")
+                if len(sustained) > 8:
+                    lines.append(f'    …另有 {len(sustained) - 8} 組，見 systemic_gaps.csv')
+                lines.append('    處置：這段期間的低涵蓋率**不代表感測器健康度差**，不該據此換')
+                lines.append('          感測器。基準期也會受影響——演算法挑「最穩定窗口」時可能')
+                lines.append('          挑到中斷前那一段，再拿去跟中斷後比，整段看起來都在偏離。')
+                lines.append('          建議用 --since 把最後一次持續性中斷之前整段排除後重跑。')
+
+            brief = summarize_brief_outages(result.gaps_df, period_days)
+            if brief:
+                lines.append('')
+                lines.append(f'  【短暫全廠停頓】時長 < {_SUSTAINED_MIN_HOURS:.0f} 小時，'
+                             f'共 {brief["n_events"]} 次——數量太多，逐筆列出沒有意義，')
+                lines.append('    改看頻率：')
+                per_day = (f'每天約 {brief["per_day"]:.1f} 次　'
+                           if brief['per_day'] else '')
+                lines.append(f'    {per_day}每次影響 {brief["median_points"]:.0f} 個量測點'
+                             f'（中位數）、持續 {brief["median_hours"]:.0f} 小時')
+                if brief['missing_share'] is not None:
+                    lines.append(f'    合計約佔全部資料缺口的 '
+                                 f'{brief["missing_share"] * 100:.0f}%')
+                lines.append('    處置：這個型態代表缺口不是散落在各台設備的感測器問題，而是')
+                lines.append('          收集系統規律地停頓。**對象是 IT／收集程式，不是感測器。**')
+                if brief['missing_share'] is not None and brief['missing_share'] > 0.5:
+                    lines.append('          它佔了缺口的大半，修好它比逐台查感測器有效得多。')
             lines.append('')
 
     lines.append('-- 嚴重度分級說明 --')

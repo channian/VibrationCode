@@ -401,8 +401,9 @@ def test_guardrail() -> None:
 def test_systemic_gaps() -> None:
     print("\n[8] 疑似系統層級中斷（多點共用同一斷線邊界）")
 
-    from validate.report import (_SYSTEMIC_MIN_POINTS, _SYSTEMIC_TOLERANCE_H,
-                                 detect_systemic_gaps)
+    from validate.report import (_SUSTAINED_MIN_HOURS, _SYSTEMIC_MIN_POINTS,
+                                 _SYSTEMIC_TOLERANCE_H, detect_systemic_gaps,
+                                 summarize_brief_outages)
 
     # 重現 2026-08-03 那次：14 個點結束於同一刻，起始散在數小時內
     rows = [{'device_id': f'DEV{i:02d}', 'position': 'M1',
@@ -448,6 +449,41 @@ def test_systemic_gaps() -> None:
           str(ends[['boundary', 'n_points']].to_dict('records')))
 
     check("空表不拋錯", detect_systemic_gaps(pd.DataFrame()).empty)
+
+    # ── 兩層分流：實測 66 點 2.6 週跑出 106 組，其中絕大多數是每天好幾次
+    # 的 1 小時全廠停頓。混在同一張清單裡逐組列出，真正要處理的那幾筆
+    # 會被淹沒——所以依時長分成兩層，短的改用頻率呈現。
+    mixed = list(rows)
+    base = pd.Timestamp('2026-08-04 00:00')
+    for day in range(18):
+        for k in range(6):          # 每天 6 次
+            t = base + dt.timedelta(days=day, hours=k * 4)
+            for i in range(30):     # 每次 30 個點
+                mixed.append({'device_id': f'P{i:02d}', 'position': 'M1',
+                              'gap_start': t, 'gap_end': t + dt.timedelta(hours=1),
+                              'hours': 1.0, 'status': 'no_data'})
+    mixed_df = pd.DataFrame(mixed)
+    sy = detect_systemic_gaps(mixed_df)
+
+    sustained = sy[sy['tier'] == 'sustained']
+    check(f"643 小時的中斷歸為 sustained（≥ {_SUSTAINED_MIN_HOURS:.0f} 小時）",
+          len(sustained) == 2 and set(sustained['n_points']) == {14},
+          str(sustained[['kind', 'n_points', 'median_hours']].to_dict('records')))
+    check("1 小時的全廠停頓歸為 brief，不混進要處理的清單",
+          (sy[sy['tier'] == 'brief']['median_hours'] < _SUSTAINED_MIN_HOURS).all())
+    check("持續性中斷排在最前面（tier 升冪，sustained < brief）",
+          sy['tier'].iloc[0] == 'sustained', str(sy['tier'].head(3).tolist()))
+
+    brief = summarize_brief_outages(mixed_df, period_days=18.0)
+    # 頻率要直接從 gaps 以整點重數——沿用 ±6 小時容忍窗的分叢結果會把
+    # 相隔 4 小時的相鄰兩次併成一次，把每天 6 次低估成 3 次
+    check("短暫停頓的每日次數沒有被容忍窗低估（真值 6.0/天）",
+          abs(brief['per_day'] - 6.0) < 0.2, f"{brief['per_day']:.2f}")
+    check("短暫停頓的影響點數正確（30 點）", brief['median_points'] == 30.0)
+    check("有算出佔全部缺口的比例", 0.0 < brief['missing_share'] < 1.0,
+          str(brief['missing_share']))
+    check("沒有短暫停頓時回傳 None",
+          summarize_brief_outages(pd.DataFrame(rows), period_days=18.0) is None)
 
 
 # ──────────────────────────────────────────────────────────
