@@ -281,6 +281,16 @@ def evaluate_iso(agg: pd.DataFrame,
             # 台帳看起來「已分類」，實際上算不出 Zone。要講清楚缺什麼。
             note = ('群組或基礎剛性未完整填寫（兩者皆為 Zone 判定的必要條件），'
                     '僅以相對基準與趨勢監測')
+        elif key is not None and class_source == 'unset':
+            # **這是補完台帳之後最可能踩到的坑。** 群組與基礎剛性都填好了，
+            # 分類算得出來，卻因為 iso_class_source 還停在 'unset' 而整個
+            # 不套用——台帳看起來補完了，ISO_ZONE 卻依然 0 次，而且沒有
+            # 任何訊息說明為什麼。回測路徑會依「有沒有分類」自動把它設成
+            # manual_override，但直接寫資料庫或走管理介面補的不會。
+            note = (f'群組與基礎剛性均已填寫（{"/".join(key)}），但 '
+                    f'iso_class_source 仍為 unset，因此不套用 Zone 判定。'
+                    f'請把該欄位設為 manual_override 或 frontend')
+            logger.warning(f"evaluate_iso：device={device.device_id} {note}")
         else:
             note = '未分級，僅以相對基準與趨勢監測'
         vel_rms = _latest_ok_vel_rms(agg)

@@ -190,6 +190,31 @@ def test_iso() -> None:
     check("基礎剛性未填即不判定，且 note 說明缺什麼",
           not res.applicable and res.zone is None and '基礎剛性' in res.note, res.note)
 
+    # 補完台帳之後最可能踩到的坑：群組與基礎剛性都填好了，卻因為
+    # iso_class_source 還停在 unset 而整個不套用——台帳看起來補完了，
+    # ISO_ZONE 依然 0 次，而且沒有任何訊息說明為什麼。
+    res = evaluate_iso(pd.DataFrame([{'ts_hour': NOW, 'data_status': 'ok', 'vel_rms': 1.76}]),
+                       device(iso_machine_group='2', iso_foundation='rigid',
+                              iso_class_source='unset'), None)
+    check("分類已填但 class_source 仍 unset 時，note 講得出是哪裡卡住",
+          not res.applicable and 'iso_class_source' in res.note
+          and 'manual_override' in res.note, res.note)
+
+    # 回測路徑會依「有沒有分類」自動補上 manual_override——這是 D1
+    # 補完台帳之後 ISO_ZONE 能不能真的開始判定的關鍵
+    from validate.points import _build_device_context
+    ctx_from_ledger = _build_device_context(
+        'ZP-TEST', {'Name': 'ZP-TEST', 'RPM': 1775},
+        {'iso_machine_group': '3', 'iso_foundation': 'rigid'}, None)
+    check("台帳只給群組＋基礎剛性時，class_source 自動成為 manual_override",
+          ctx_from_ledger.iso_class_source == 'manual_override',
+          ctx_from_ledger.iso_class_source)
+    res = evaluate_iso(pd.DataFrame([{'ts_hour': NOW, 'data_status': 'ok', 'vel_rms': 3.2}]),
+                       ctx_from_ledger, None)
+    check("缺額定功率不影響 Zone 判定成立（缺資料 ≠ 超出範圍）",
+          res.applicable and res.zone == 'B' and res.machine_class == '3/rigid',
+          f"applicable={res.applicable} zone={res.zone} note={res.note}")
+
     for kw, keyword in (({'rated_power_kw': 11.0}, '15 kW'), ({'rated_rpm': 60.0}, 'rpm')):
         res = evaluate_iso(pd.DataFrame([{'ts_hour': NOW, 'data_status': 'ok', 'vel_rms': 1.0}]),
                            device(iso_machine_group='2', iso_foundation='rigid', **kw), None)
