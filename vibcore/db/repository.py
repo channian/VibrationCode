@@ -532,6 +532,116 @@ def find_missing_ingestion(conn: Connection, start_date: date, end_date: date) -
 # 基準期
 # =============================================================
 
+# ──────────────────────────────────────────────────────────
+# SCADA：tag 對應與讀值
+# ──────────────────────────────────────────────────────────
+
+def upsert_tag_mappings(conn: Connection, mappings: list) -> int:
+    """
+    寫入／更新 SCADA tag 對應（`vibcore.io.scada.TagMapping` 的清單）。
+
+    `device_id` 對不到 `device` 表的列會被外鍵擋下。**這裡刻意不先過濾**
+    ——對不到代表對應表的 device_id 拼錯或設備尚未入庫，那是要讓人知道
+    的錯誤，不是該安靜跳過的雜訊。呼叫端負責決定要不要先 upsert 設備。
+
+    Returns:
+        寫入的列數。
+    """
+    if not mappings:
+        return 0
+    rows = [(m.tag_id, m.device_id, m.variable_type, m.unit, m.is_active)
+            for m in mappings]
+    sql = """
+        INSERT INTO tag_mapping (tag_id, device_id, variable_type, unit, is_active)
+        VALUES %s
+        ON CONFLICT (tag_id) DO UPDATE SET
+            device_id     = EXCLUDED.device_id,
+            variable_type = EXCLUDED.variable_type,
+            unit          = EXCLUDED.unit,
+            is_active     = EXCLUDED.is_active
+    """
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=200)
+    return len(rows)
+
+
+def get_tag_mappings(conn: Connection, device_id: str | None = None,
+                      variable_type: str | None = None,
+                      active_only: bool = True) -> list[dict]:
+    """取出 tag 對應，可依設備與變數型別過濾。"""
+    sql = ["SELECT tag_id, device_id, variable_type, unit, is_active",
+           "FROM tag_mapping WHERE TRUE"]
+    params: dict[str, Any] = {}
+    if device_id is not None:
+        sql.append("AND device_id = %(device_id)s"); params["device_id"] = device_id
+    if variable_type is not None:
+        sql.append("AND variable_type = %(variable_type)s")
+        params["variable_type"] = variable_type
+    if active_only:
+        sql.append("AND is_active")
+    sql.append("ORDER BY device_id, variable_type, tag_id")
+    with conn.cursor() as cur:
+        cur.execute(" ".join(sql), params)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def bulk_insert_scada(conn: Connection, readings: pd.DataFrame) -> int:
+    """
+    把 `vibcore.io.scada.parse_readings()` 的輸出寫入 `scada_reading`。
+
+    用 `ON CONFLICT (tag_id, ts) DO UPDATE` 而非先刪後插，理由同
+    `bulk_insert_agg`：重新匯入某一段期間要是安全、可重複的操作。
+
+    **對應表沒有的 tag_id 會被外鍵擋下。** 這是刻意的——讀值檔通常涵蓋
+    整廠上千個 tag，只有對應表列出的那些是我們要的；讓資料庫擋下來，
+    比在這裡安靜丟掉更容易發現「對應表漏填」。呼叫端若要先篩，用
+    `get_tag_mappings()` 取得清單自行過濾。
+    """
+    if readings is None or readings.empty:
+        return 0
+    rows = [(str(r.tag_id), _clean_value(r.ts), _clean_value(r.value))
+            for r in readings.itertuples()]
+    sql = """
+        INSERT INTO scada_reading (tag_id, ts, value) VALUES %s
+        ON CONFLICT (tag_id, ts) DO UPDATE SET value = EXCLUDED.value
+    """
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=1000)
+    return len(rows)
+
+
+def get_scada(conn: Connection, device_id: str, variable_type: str,
+               start: Any, end: Any) -> pd.DataFrame:
+    """
+    讀回某設備某型別在 `[start, end)` 的 SCADA 讀值。
+
+    Returns:
+        欄位 `tag_id` / `ts` / `value` 的 DataFrame，格式與
+        `vibcore.io.scada.parse_readings()` 一致，可直接餵給
+        `attach_to_agg()`。
+    """
+    sql = """
+        SELECT s.tag_id, s.ts, s.value
+          FROM scada_reading s
+          JOIN tag_mapping m ON m.tag_id = s.tag_id
+         WHERE m.device_id = %(device_id)s
+           AND m.variable_type = %(variable_type)s
+           AND m.is_active
+           AND s.ts >= %(start)s AND s.ts < %(end)s
+         ORDER BY s.ts
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"device_id": device_id, "variable_type": variable_type,
+                          "start": start, "end": end})
+        rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        return pd.DataFrame(columns=["tag_id", "ts", "value"])
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    return df
+
+
 def save_baseline(conn: Connection, baseline: BaselineStats) -> None:
     """
     寫入/更新基準期統計。

@@ -661,11 +661,118 @@ def test_step_change_features() -> None:
 
 
 # ──────────────────────────────────────────────────────────
+# SCADA 對應與時間對齊（Q3 第一階段）
+# ──────────────────────────────────────────────────────────
+
+def test_scada() -> None:
+    print("\n[10] SCADA：tag 對應、有效樣本數與時間對齊")
+
+    import tempfile
+
+    from vibcore.io.scada import (SCADA_REFRESH_MINUTES, STALENESS_TOLERANCE_MINUTES,
+                                  attach_to_agg, effective_sample_count,
+                                  emit_tagmap_template, parse_readings, parse_tagmap)
+
+    # ── 對應表：範本預填、型別把關 ──────────────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'tagmap.csv')
+        n = emit_tagmap_template(
+            {'ZP 3-5_M1': 'FACC|K12_ZP350_INV_I', 'CP 10_M1': None}, path)
+        check("範本每台設備兩列（電流＋頻率）", n == 4, str(n))
+        written = pd.read_csv(path, encoding='utf-8-sig', dtype=str)
+        cur = written[(written['device_id'] == 'ZP 3-5_M1')
+                      & (written['variable_type'] == 'current')]
+        check("Label 有值的設備預填成 current",
+              len(cur) == 1 and cur.iloc[0]['tag_id'] == 'FACC|K12_ZP350_INV_I')
+        check("預填列有標明「請確認」（型別是從 tag 命名猜的）",
+              '確認' in str(cur.iloc[0]['note']), str(cur.iloc[0]['note']))
+        check("沒有 Label 的設備留白等人填",
+              written[(written['device_id'] == 'CP 10_M1')
+                      & written['tag_id'].isna()].shape[0] == 2)
+        # 範本預填的那一列本來就是有效的——預填的用意就是讓它直接可用。
+        # 其餘三列（缺 tag_id）視為待填，不逐列噴警告。
+        fresh = parse_tagmap(path)
+        check("剛產出的範本，預填那列直接可用、其餘視為待填",
+              len(fresh) == 1 and fresh[0].device_id == 'ZP 3-5_M1'
+              and fresh[0].variable_type == 'current',
+              str([(m.device_id, m.variable_type) for m in fresh]))
+
+        # 填好之後
+        with open(path, 'w', encoding='utf-8-sig') as f:
+            f.write('device_id,tag_id,variable_type,unit,is_active,note\n')
+            f.write('ZP 3-5_M1,T.I,current,A,TRUE,\n')
+            f.write('ZP 3-5_M1,T.F,frequency,Hz,TRUE,\n')
+            f.write('CP 10_M1,T.BAD,電流,A,TRUE,型別用中文\n')
+            f.write('CP 10_M1,,frequency,Hz,,還沒填\n')
+        got = parse_tagmap(path)
+        check("合法的兩列讀得回來", len(got) == 2, str([m.tag_id for m in got]))
+        check("不在允許值內的 variable_type 被拒收，不自動對應",
+              all(m.tag_id != 'T.BAD' for m in got),
+              "「電流」被當成 current 了——猜錯型別會讓頻率被當電流用")
+
+    # ── 有效樣本數：2 分鐘一列 ≠ 2 分鐘一個獨立樣本 ─────────
+    # 這是本模組存在的主要理由之一：檔案每 2 分鐘一列，但值約 15 分鐘才
+    # 真的更新，直接拿列數當樣本數會高估約 7 倍。
+    n_rows, span = 2000, 2000 * 2.0
+    eff = effective_sample_count(n_rows, span)
+    check("列數不等於有效樣本數（2000 列 / 4000 分鐘 → 266）",
+          eff == int(span // SCADA_REFRESH_MINUTES) == 266, str(eff))
+    check("資料稀疏時不因公式而虛報（列數才 5 筆）",
+          effective_sample_count(5, span) == 5)
+    check("跨度為 0 或列數為 0 時回 0（不除以零）",
+          effective_sample_count(0, span) == 0 and effective_sample_count(10, 0) == 0)
+
+    # ── 時間對齊：同小時取中位數、過期值不硬貼 ──────────────
+    base = pd.Timestamp('2026-08-01 00:00', tz='UTC')
+    readings = pd.DataFrame([
+        {'tag_id': 'T.I', 'ts': base + dt.timedelta(minutes=m), 'value': v}
+        # 第 0 小時內四筆；最後一筆刻意落在 00:55，讓第 1 小時距它只有
+        # 5 分鐘，在容忍窗內——這樣才走得到「沿用前一筆」那條路徑。
+        for m, v in ((2, 40.0), (17, 44.0), (32, 60.0), (55, 44.0))
+    ])
+    agg = pd.DataFrame({'ts_hour': [base,
+                                    base + dt.timedelta(hours=1),
+                                    base + dt.timedelta(hours=5)]})
+    out = attach_to_agg(agg, readings, 'current')
+
+    check("同一小時內取中位數（40/44/60/44 → 44）",
+          float(out['scada_current'].iloc[0]) == 44.0, str(out['scada_current'].iloc[0]))
+    check("該小時沒有讀值但在容忍窗內時，沿用最近一筆並標記已過期",
+          pd.notna(out['scada_current'].iloc[1])
+          and float(out['scada_current_stale_min'].iloc[1]) > 0,
+          str(out[['scada_current', 'scada_current_stale_min']].iloc[1].to_dict()))
+    # 這一項是整個模組最重要的防線：沒有它，SCADA 斷線期間的所有振動樣本
+    # 都會被貼上斷線前那一筆值，整段被分到錯的工況，而且不會有錯誤訊息。
+    check(f"超過 {STALENESS_TOLERANCE_MINUTES:.0f} 分鐘的過期值不硬貼，留 NaN",
+          pd.isna(out['scada_current'].iloc[2]),
+          f"5 小時前的值被貼上了：{out['scada_current'].iloc[2]}")
+
+    check("沒有讀值時欄位仍建立（分得出「沒接上」與「沒資料」）",
+          all(c in attach_to_agg(agg, pd.DataFrame(), 'current').columns
+              for c in ('scada_current', 'scada_current_n', 'scada_current_stale_min')))
+
+    # ── 讀值檔解析 ──────────────────────────────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        rp = os.path.join(tmp, 'r.csv')
+        with open(rp, 'w', encoding='utf-8') as f:
+            f.write('tag_id,ts,value\n')
+            f.write('T.I,2026-08-01T00:00:00Z,40\n')
+            f.write('T.I,2026-08-01T00:00:00Z,41\n')      # 重複時間戳
+            f.write('T.I,壞掉的時間,42\n')                  # 解析不了
+            f.write('T.I,2026-08-01T00:02:00Z,沒有數字\n')
+        r = parse_readings(rp)
+        check("重複的 (tag_id, ts) 去重且保留後者",
+              len(r) == 1 and float(r['value'].iloc[0]) == 41.0,
+              str(r.to_dict('records')))
+        check("解析不了的列丟掉而不是讓整份失敗", not r.empty)
+
+
+# ──────────────────────────────────────────────────────────
 # 台帳補填：CSV 範本與匯入（D1）
 # ──────────────────────────────────────────────────────────
 
 def test_ledger() -> None:
-    print("\n[10] 台帳補填：CSV 範本產出與匯入")
+    print("\n[11] 台帳補填：CSV 範本產出與匯入")
 
     import tempfile
 
@@ -815,7 +922,7 @@ def _psql_env() -> dict:
 
 
 def test_db(dbname: str) -> None:
-    print("\n[11] 資料庫：台帳欄位保留與 migration 冪等性")
+    print("\n[12] 資料庫：台帳欄位保留與 migration 冪等性")
     env = _psql_env()
     try:
         subprocess.run(["dropdb", "--if-exists", dbname], env=env, check=True, capture_output=True)
@@ -876,6 +983,57 @@ def test_db(dbname: str) -> None:
     conn.commit()
     check("台帳明確填 false 時仍可把備機旗標改回來",
           repo.get_device(conn, 'P1').is_standby is False)
+    # ── SCADA：tag 對應與讀值的落庫（Q3 第一階段）──────────
+    from vibcore.io.scada import TagMapping, attach_to_agg
+
+    repo.upsert_tag_mappings(conn, [
+        TagMapping(tag_id='T.I', device_id='P1', variable_type='current', unit='A'),
+        TagMapping(tag_id='T.F', device_id='P1', variable_type='frequency', unit='Hz'),
+    ])
+    conn.commit()
+    got_tags = repo.get_tag_mappings(conn, device_id='P1')
+    check("tag 對應寫得進去、讀得回來", len(got_tags) == 2, str(got_tags))
+    check("可依變數型別過濾",
+          len(repo.get_tag_mappings(conn, device_id='P1', variable_type='current')) == 1)
+
+    base_ts = dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)
+    readings = pd.DataFrame([
+        {'tag_id': 'T.I', 'ts': base_ts + dt.timedelta(minutes=2 * i),
+         'value': 40.0 + (i % 5)} for i in range(30)
+    ])
+    n_ins = repo.bulk_insert_scada(conn, readings)
+    conn.commit()
+    check("讀值寫得進去", n_ins == 30, str(n_ins))
+
+    # 重覆匯入同一段期間要是安全的（同 bulk_insert_agg 的理由）
+    repo.bulk_insert_scada(conn, readings.assign(value=readings['value'] + 1))
+    conn.commit()
+    back = repo.get_scada(conn, 'P1', 'current',
+                          base_ts, base_ts + dt.timedelta(hours=2))
+    check("重覆匯入是 upsert 而非重複插入（30 筆仍是 30 筆）",
+          len(back) == 30, str(len(back)))
+    check("重覆匯入會更新數值", float(back['value'].iloc[0]) == 41.0,
+          str(back['value'].iloc[0]))
+
+    # 對應表沒有的 tag 應被外鍵擋下，而不是安靜丟掉
+    try:
+        repo.bulk_insert_scada(conn, pd.DataFrame([
+            {'tag_id': 'T.UNKNOWN', 'ts': base_ts, 'value': 1.0}]))
+        conn.commit()
+        fk_blocked = False
+    except Exception:                       # noqa: BLE001 - 就是要確認會擋
+        conn.rollback()
+        fk_blocked = True
+    check("對應表沒有的 tag_id 被擋下（而非安靜丟掉，那樣會讓漏填查不出來）",
+          fk_blocked)
+
+    # 從資料庫讀回來的格式要能直接餵進對齊函式
+    agg_db = pd.DataFrame({'ts_hour': [base_ts]})
+    joined = attach_to_agg(agg_db, back, 'current')
+    check("get_scada 的輸出可直接餵給 attach_to_agg",
+          pd.notna(joined['scada_current'].iloc[0]),
+          str(joined.iloc[0].to_dict()))
+
     conn.close()
 
     for mig, label in (("db/migration_004_iso10816_3_and_median.sql", "migration_004"),
@@ -923,6 +1081,7 @@ def main() -> int:
         test_guardrail()
         test_systemic_gaps()
         test_step_change_features()
+        test_scada()
         test_ledger()
         test_db(args.dbname)
     except AssertionError as e:
