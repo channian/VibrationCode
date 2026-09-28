@@ -723,7 +723,9 @@ def test_scada() -> None:
           effective_sample_count(0, span) == 0 and effective_sample_count(10, 0) == 0)
 
     # ── 時間對齊：同小時取中位數、過期值不硬貼 ──────────────
-    base = pd.Timestamp('2026-08-01 00:00', tz='UTC')
+    # naive = 廠內當地時間，與振動端（analytic_reader.parse_datetime 不指定
+    # 時區）一致。這裡刻意不用 tz-aware——用了就測不到真正的使用情境。
+    base = pd.Timestamp('2026-08-01 00:00')
     readings = pd.DataFrame([
         {'tag_id': 'T.I', 'ts': base + dt.timedelta(minutes=m), 'value': v}
         # 第 0 小時內四筆；最後一筆刻意落在 00:55，讓第 1 小時距它只有
@@ -751,16 +753,32 @@ def test_scada() -> None:
           all(c in attach_to_agg(agg, pd.DataFrame(), 'current').columns
               for c in ('scada_current', 'scada_current_n', 'scada_current_stale_min')))
 
+    # ── 時區：兩邊必須是同一個時鐘 ──────────────────────────
+    # 這是整個模組最容易安靜出錯的地方：振動端是 naive 當地時間，
+    # SCADA 若被讀成 UTC，對齊時要嘛拋錯、要嘛整批錯開 8 小時，
+    # 然後每個振動樣本都配到 8 小時前的工況，而且沒有任何訊息。
+    aware = readings.assign(ts=readings['ts'].dt.tz_localize('UTC'))
+    mixed = attach_to_agg(agg, aware, 'current')
+    check("聚合是 naive、讀值帶時區時拒絕對齊（而不是硬轉或拋錯）",
+          mixed['scada_current'].isna().all(),
+          str(mixed['scada_current'].tolist()))
+
     # ── 讀值檔解析 ──────────────────────────────────────────
     with tempfile.TemporaryDirectory() as tmp:
         rp = os.path.join(tmp, 'r.csv')
+        # 現場實際匯出的欄名是 DATETIME / TAGNAME / VALUE，不是我們原本
+        # 假設的 tag_id / ts / value。與其要求現場重新匯出，不如在這裡收。
         with open(rp, 'w', encoding='utf-8') as f:
-            f.write('tag_id,ts,value\n')
-            f.write('T.I,2026-08-01T00:00:00Z,40\n')
-            f.write('T.I,2026-08-01T00:00:00Z,41\n')      # 重複時間戳
-            f.write('T.I,壞掉的時間,42\n')                  # 解析不了
-            f.write('T.I,2026-08-01T00:02:00Z,沒有數字\n')
+            f.write('DATETIME,TAGNAME,VALUE\n')
+            f.write('2026/8/1 00:00,T.I,40\n')
+            f.write('2026/8/1 00:00,T.I,41\n')            # 重複時間戳
+            f.write('壞掉的時間,T.I,42\n')                  # 解析不了
+            f.write('2026/8/1 00:02,T.I,沒有數字\n')
         r = parse_readings(rp)
+        check("現場的 DATETIME/TAGNAME/VALUE 欄名讀得進來",
+              list(r.columns) == ['tag_id', 'ts', 'value'], str(list(r.columns)))
+        check("解析出來是 naive 當地時間（與振動端同一個時鐘）",
+              getattr(r['ts'].dtype, 'tz', None) is None, str(r['ts'].dtype))
         check("重複的 (tag_id, ts) 去重且保留後者",
               len(r) == 1 and float(r['value'].iloc[0]) == 41.0,
               str(r.to_dict('records')))

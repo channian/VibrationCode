@@ -51,6 +51,10 @@ DEFAULT_UNITS: dict[str, str] = {
     'power': 'kW',
 }
 
+#: 廠內當地時區。只在「輸入帶時區、要轉成當地時間」時用得到——
+#: 振動端的時間是 naive 當地時間，SCADA 必須對齊到同一個時鐘。
+PLANT_TZ = 'Asia/Taipei'
+
 #: SCADA 值的實際刷新週期（分鐘）。檔案裡約每 2 分鐘一列，但連續數列是
 #: 同一個值，真正的更新大約 15 分鐘一次（使用者確認）。
 SCADA_REFRESH_MINUTES = 15.0
@@ -60,6 +64,28 @@ SCADA_REFRESH_MINUTES = 15.0
 #: 期間的所有振動樣本都會被貼上斷線前那一筆值，然後整段被分到錯的工況，
 #: 而且不會有任何錯誤訊息。這與備機旗標被覆寫是同一類的安靜失效。
 STALENESS_TOLERANCE_MINUTES = 20.0
+
+#: 讀值檔的欄位別名（一律轉小寫後比對）。現場匯出的欄名不見得跟我們
+#: 想要的一樣——實際拿到的是 `DATETIME / TAGNAME / VALUE`。與其要求現場
+#: 重新匯出，不如在這裡收。找不到任何別名才報錯。
+_READING_ALIASES: dict[str, tuple[str, ...]] = {
+    'tag_id': ('tag_id', 'tagname', 'tag_name', 'tag', 'point', 'pointname'),
+    'ts':     ('ts', 'datetime', 'date_time', 'timestamp', 'time', 'date'),
+    'value':  ('value', 'val', 'v', 'reading'),
+}
+
+
+def _resolve_columns(columns) -> dict[str, str] | None:
+    """把實際欄名對到我們要的三個欄位；對不到就回 None。"""
+    lower = {str(c).strip().lower(): c for c in columns}
+    out = {}
+    for want, aliases in _READING_ALIASES.items():
+        hit = next((lower[a] for a in aliases if a in lower), None)
+        if hit is None:
+            return None
+        out[want] = hit
+    return out
+
 
 #: 對應表的欄位。與 `tag_mapping` 資料表一致。
 TAGMAP_COLUMNS: tuple[str, ...] = (
@@ -211,6 +237,30 @@ def emit_tagmap_template(labels: dict[str, str | None], path: str) -> int:
     return len(out)
 
 
+def _to_plant_naive(series: pd.Series, source: str = '') -> pd.Series:
+    """
+    把時間欄解析成**無時區的廠內當地時間**，與振動端一致。
+
+    **這一步錯了會安靜地差 8 小時。** 振動端
+    （`vibcore.io.analytic_reader.parse_datetime`）解析 Analytic CSV 的
+    `Time` 欄時沒有指定時區，得到的是 naive 時間——那是廠內當地時間。
+    SCADA 若被解析成 UTC，兩邊做時間對齊時要嘛型別不合直接拋錯，要嘛
+    被硬轉而整批錯開一個時區，然後每個振動樣本都配到 8 小時前的工況。
+    不會有錯誤訊息，只會讓分層結果莫名其妙。
+
+    所以這裡一律產出 naive：輸入若帶時區偏移（例如 `...+08:00` 或結尾
+    `Z`），先轉成廠內當地時間再把時區拿掉；輸入若本來就是 naive，
+    原樣保留（視為已是當地時間）。
+    """
+    dt = pd.to_datetime(series, errors='coerce')
+
+    if getattr(dt.dtype, 'tz', None) is not None:
+        logger.info(f"{source}：時間欄帶時區，已轉成 {PLANT_TZ} 當地時間後去除時區，"
+                    f"以對齊振動端的 naive 時間")
+        dt = dt.dt.tz_convert(PLANT_TZ).dt.tz_localize(None)
+    return dt
+
+
 def parse_readings(path: str) -> pd.DataFrame:
     """
     讀 SCADA 讀值 CSV，欄位為 `tag_id, ts, value`。
@@ -234,17 +284,19 @@ def parse_readings(path: str) -> pd.DataFrame:
         logger.error(f"SCADA 讀值檔 {path} 無法以 utf-8/cp950 讀取")
         return pd.DataFrame(columns=['tag_id', 'ts', 'value'])
 
-    missing = [c for c in ('tag_id', 'ts', 'value') if c not in df.columns]
-    if missing:
-        logger.error(f"SCADA 讀值檔 {path} 缺少欄位 {missing}"
-                     f"（實際欄位：{list(df.columns)}）")
+    cols = _resolve_columns(df.columns)
+    if cols is None:
+        logger.error(
+            f"SCADA 讀值檔 {path} 找不到必要欄位（實際欄位：{list(df.columns)}）。"
+            f"可接受的別名：{_READING_ALIASES}")
         return pd.DataFrame(columns=['tag_id', 'ts', 'value'])
 
     n_raw = len(df)
+    ts = _to_plant_naive(df[cols['ts']], source=os.path.basename(path))
     out = pd.DataFrame({
-        'tag_id': df['tag_id'].astype(str).str.strip(),
-        'ts': pd.to_datetime(df['ts'], errors='coerce', utc=True),
-        'value': pd.to_numeric(df['value'], errors='coerce'),
+        'tag_id': df[cols['tag_id']].astype(str).str.strip(),
+        'ts': ts,
+        'value': pd.to_numeric(df[cols['value']], errors='coerce'),
     }).dropna(subset=['tag_id', 'ts', 'value'])
     out = out[out['tag_id'] != '']
 
@@ -315,9 +367,27 @@ def attach_to_agg(agg: pd.DataFrame, readings: pd.DataFrame,
     if out.empty or 'ts_hour' not in out.columns or readings is None or readings.empty:
         return out
 
-    ts_hour = pd.to_datetime(out['ts_hour'], errors='coerce', utc=True)
-    r = readings.dropna(subset=['ts', 'value']).sort_values('ts')
+    ts_hour = pd.to_datetime(out['ts_hour'], errors='coerce')
+    r = readings.dropna(subset=['ts', 'value']).copy()
     if r.empty:
+        return out
+    r['ts'] = pd.to_datetime(r['ts'], errors='coerce')
+    r = r.dropna(subset=['ts']).sort_values('ts')
+    if r.empty:
+        return out
+
+    # 兩邊的時區狀態必須一致，否則 pandas 的比較會直接拋錯，或者更糟——
+    # 被某一端硬轉而整批錯開一個時區。寧可拒絕對齊並講清楚，也不要產出
+    # 一份看起來正常、實際上每筆都配到 8 小時前工況的結果。
+    agg_tz = getattr(ts_hour.dtype, 'tz', None)
+    read_tz = getattr(r['ts'].dtype, 'tz', None)
+    if (agg_tz is None) != (read_tz is None):
+        logger.error(
+            f"時間對齊中止：聚合的 ts_hour 是 "
+            f"{'帶時區' if agg_tz else 'naive'}、SCADA 讀值是 "
+            f"{'帶時區' if read_tz else 'naive'}，兩者不可直接比較。"
+            f"振動端的時間是 naive 當地時間，SCADA 應以 "
+            f"vibcore.io.scada.parse_readings 讀取以對齊到同一個時鐘。")
         return out
 
     # 該小時內的讀值：以整點對齊分組，一次算完所有小時

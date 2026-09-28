@@ -17,6 +17,10 @@ scada_setup.py — SCADA tag 對應表的產出與檢查
     python -m validate.scada_setup emit  --data-dir data/ --out out/tagmap.csv
     python -m validate.scada_setup check --tagmap out/tagmap.csv --data-dir data/
     python -m validate.scada_setup probe --tagmap out/tagmap.csv --readings out/scada.csv
+
+讀值檔的欄名接受別名，現場匯出的 `DATETIME / TAGNAME / VALUE` 可直接使用。
+**時間一律視為廠內當地時間（naive）**，與振動端一致——這一點錯了會安靜地
+差 8 小時，讓每個振動樣本配到錯的工況。
 """
 
 from __future__ import annotations
@@ -252,7 +256,8 @@ def main(argv: list[str] | None = None) -> int:
 
     r = sub.add_parser('probe', help='拿讀值檔實測刷新週期')
     r.add_argument('--tagmap', required=True)
-    r.add_argument('--readings', required=True, help='tag_id,ts,value 的 CSV')
+    r.add_argument('--readings', required=True,
+               help='SCADA 讀值 CSV。欄名接受別名——現場的 DATETIME/TAGNAME/VALUE 可直接使用')
     r.set_defaults(func=cmd_probe)
 
     args = p.parse_args(argv)
