@@ -23,7 +23,18 @@ SCADA 的頻率 tag 是唯一能知道實際運轉轉速的來源。
    所以對應表有一部分是現成的，`emit_tagmap_template` 會把它預填進去，
    工程師只要補沒有的、以及補上頻率 tag。
 
-2. **每 2 分鐘一列，但底層更新週期約 15 分鐘。** 連續數列會是同一個值，
+2. **tag 的寫法兩邊不同。** 對應表的 tag 來自 `Label` 欄，格式是
+   `資料表名|tag名`；SCADA 匯出的歷史讀值，`TAGNAME` 欄通常只有 tag 名
+   那一半。純字串比對會**一筆都對不上**，而且只會表現成「沒有資料」
+   ——查不出是對不上還是真的沒有。所以比對一律經過 `normalize_tag_id()`
+   （忽略前綴與大小寫），並由 `match_readings()` 回報兩邊各自對不上的
+   部分，讓對不上時看得到兩邊的 tag 長什麼樣。
+
+3. **時間是廠內當地時間（UTC+8），不是 UTC**（使用者確認）。振動端解析
+   Analytic CSV 也沒有指定時區，得到的同樣是 naive 當地時間。兩邊必須
+   是同一個時鐘，否則整批錯開 8 小時而不會報錯。
+
+4. **每 2 分鐘一列，但底層更新週期約 15 分鐘。** 連續數列會是同一個值，
    直到下一次刷新。這代表**有效獨立樣本約每 15 分鐘才一個，不是每 2 分鐘**
    ——任何拿這些值做統計的地方都得按 15 分鐘算，否則樣本數會高估約 7 倍。
    這跟既有的「accKURT 滾動 10 秒窗、相鄰兩筆共用 90% 原始資料」是同一類
@@ -93,6 +104,26 @@ TAGMAP_COLUMNS: tuple[str, ...] = (
 )
 
 
+def normalize_tag_id(tag: str) -> str:
+    """
+    把 tag 正規化成比對用的鍵：取最後一個 `|` 之後的部分，去空白、轉小寫。
+
+    **為什麼需要**：對應表的 tag 來自 Analytic CSV 的 `Label` 欄，格式是
+    `資料表名|tag名`（實測
+    `FACCIMTAB.ZONE1_K12_CHS|K12_BF_CHS_ZP350_INV_I`）；但 SCADA 匯出的
+    歷史讀值，`TAGNAME` 欄通常只有 tag 名那一半。兩邊直接字串比對會
+    **一筆都對不上**——而且不會報錯，只會讓所有 SCADA 相關結果安靜地
+    變成空的。這是這個介面最容易踩的坑，所以比對一律經過這個函式。
+
+    只取最後一段而不是切兩半，是為了容忍 tag 名本身含 `|` 的情況；
+    轉小寫是因為 SCADA 系統的 tag 名多半不分大小寫，而人工填表時大小寫
+    最容易不一致。
+    """
+    if tag is None:
+        return ''
+    return str(tag).split('|')[-1].strip().lower()
+
+
 @dataclass(frozen=True)
 class TagMapping:
     """一台設備的一個 SCADA tag。"""
@@ -101,6 +132,11 @@ class TagMapping:
     variable_type: str
     unit: str | None = None
     is_active: bool = True
+
+    @property
+    def match_key(self) -> str:
+        """與讀值檔比對用的正規化鍵；`tag_id` 本身維持台帳填的原樣。"""
+        return normalize_tag_id(self.tag_id)
 
 
 def _norm_bool(value, default: bool = True) -> bool:
@@ -312,6 +348,93 @@ def parse_readings(path: str) -> pd.DataFrame:
     if len(out) < before:
         logger.info(f"SCADA 讀值檔 {path}：去除 {before - len(out)} 筆重複的 (tag_id, ts)")
     return out
+
+
+@dataclass(frozen=True)
+class TagMatchReport:
+    """對應表與讀值檔的比對結果。"""
+    n_readings_in: int
+    n_readings_matched: int
+    matched_tags: tuple[str, ...]        # 對上的（對應表側的原始 tag_id）
+    unmatched_mappings: tuple[str, ...]  # 對應表有、讀值檔沒有
+    unmatched_readings: tuple[str, ...]  # 讀值檔有、對應表沒有
+
+    @property
+    def ok(self) -> bool:
+        return self.n_readings_matched > 0
+
+
+def match_readings(readings: pd.DataFrame,
+                   mappings: list) -> tuple[pd.DataFrame, TagMatchReport]:
+    """
+    把讀值的 `tag_id` 換成對應表裡的正式寫法，並回報兩邊對不上的部分。
+
+    對應表的 tag 來自 Analytic CSV 的 `Label` 欄（`資料表名|tag名`），
+    SCADA 匯出的歷史讀值多半只有 tag 名那一半。比對經過
+    `normalize_tag_id()`，所以兩種寫法都能對上；輸出一律改寫成**對應表
+    裡的 tag_id**，讓資料庫只有一種正式寫法（`scada_reading.tag_id` 的
+    外鍵指向 `tag_mapping.tag_id`，不統一就會被擋下）。
+
+    **一筆都對不上時不是回傳空表就算了** ——那會讓現場看到「沒有資料」
+    卻查不出是對不上還是真的沒有。報告裡帶著兩邊各自的 tag 範例，
+    呼叫端負責把它印出來。
+
+    Returns:
+        `(改寫後的讀值, 比對報告)`。讀值只保留對得上的列。
+    """
+    empty = pd.DataFrame(columns=['tag_id', 'ts', 'value'])
+    if readings is None or readings.empty or not mappings:
+        return empty, TagMatchReport(0, 0, (), tuple(m.tag_id for m in mappings or []), ())
+
+    by_key: dict[str, str] = {}
+    for m in mappings:
+        key = m.match_key
+        if key and key not in by_key:
+            by_key[key] = m.tag_id
+
+    keys = readings['tag_id'].map(normalize_tag_id)
+    hit = keys.isin(by_key)
+    out = readings[hit].copy()
+    out['tag_id'] = keys[hit].map(by_key)
+
+    matched_keys = set(keys[hit])
+    return out, TagMatchReport(
+        n_readings_in=len(readings),
+        n_readings_matched=len(out),
+        matched_tags=tuple(sorted({by_key[k] for k in matched_keys})),
+        unmatched_mappings=tuple(sorted(
+            m.tag_id for m in mappings if m.match_key and m.match_key not in matched_keys)),
+        unmatched_readings=tuple(sorted(set(readings.loc[~hit, 'tag_id'].astype(str)))),
+    )
+
+
+def describe_match(report: TagMatchReport) -> list[str]:
+    """把比對報告轉成可以直接印的人話。分開寫是為了讓 CLI 與測試共用。"""
+    lines = [f'讀值 {report.n_readings_in:,} 筆中，對得上對應表的有 '
+             f'{report.n_readings_matched:,} 筆'
+             f'（{report.n_readings_matched / max(report.n_readings_in, 1) * 100:.0f}%）',
+             f'對上的 tag：{len(report.matched_tags)} 個']
+    if not report.ok:
+        lines += [
+            '',
+            '⚠ 一筆都對不上。兩邊的 tag 寫法可能不同——比對已經會自動忽略',
+            '  「資料表名|」前綴與大小寫，所以若仍對不上，代表 tag 名本身不一樣。',
+            '  對應表的 tag（前 3 個）：',
+            *[f'    {t}' for t in report.unmatched_mappings[:3]],
+            '  讀值檔的 tag（前 3 個）：',
+            *[f'    {t}' for t in report.unmatched_readings[:3]],
+        ]
+        return lines
+    if report.unmatched_mappings:
+        lines += ['',
+                  f'對應表有、但讀值檔裡沒出現：{len(report.unmatched_mappings)} 個 tag',
+                  '  ——可能是 tag 名填錯，或這段期間該點沒有資料：',
+                  *[f'    {t}' for t in report.unmatched_mappings[:5]]]
+    if report.unmatched_readings:
+        lines += ['',
+                  f'讀值檔有、但不在對應表裡：{len(report.unmatched_readings)} 個 tag'
+                  f'（正常——匯出通常涵蓋整廠，只有對應表列出的才是我們要的）']
+    return lines
 
 
 def effective_sample_count(n_rows: int, span_minutes: float,

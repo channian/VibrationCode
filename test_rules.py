@@ -753,6 +753,43 @@ def test_scada() -> None:
           all(c in attach_to_agg(agg, pd.DataFrame(), 'current').columns
               for c in ('scada_current', 'scada_current_n', 'scada_current_stale_min')))
 
+    # ── tag 寫法不同時要對得上，對不上時要講得出來 ──────────
+    # 對應表的 tag 來自 Analytic CSV 的 Label 欄（`資料表名|tag名`），
+    # 讀值檔的 TAGNAME 多半只有 tag 名那一半。純字串比對會一筆都對不上，
+    # 而且只會表現成「沒有資料」——查不出是對不上還是真的沒有。
+    from vibcore.io.scada import (TagMapping, describe_match, match_readings,
+                                  normalize_tag_id)
+
+    long_id = 'FACCIMTAB.ZONE1_K12_CHS|K12_BF_CHS_ZP350_INV_I'
+    check("正規化忽略「資料表名|」前綴",
+          normalize_tag_id(long_id) == normalize_tag_id('K12_BF_CHS_ZP350_INV_I'))
+    check("正規化忽略大小寫與前後空白",
+          normalize_tag_id('  k12_bf_chs_zp350_inv_i ') == normalize_tag_id(long_id))
+    check("tag 名本身含 | 時只取最後一段", normalize_tag_id('A|B|C') == 'c')
+
+    maps = [TagMapping(long_id, 'ZP 3-5_M1', 'current'),
+            TagMapping('TBL|K12_NOT_IN_READINGS', 'ZP 3-5_M1', 'frequency')]
+    short = pd.DataFrame([
+        {'tag_id': 'K12_BF_CHS_ZP350_INV_I', 'ts': base, 'value': 40.0},
+        {'tag_id': 'SOMETHING_ELSE', 'ts': base, 'value': 1.0},
+    ])
+    matched, rep = match_readings(short, maps)
+    check("讀值只有短名時仍對得上對應表的長名", rep.n_readings_matched == 1)
+    check("對上之後改寫成對應表的正式寫法（外鍵才對得上）",
+          matched['tag_id'].tolist() == [long_id], str(matched['tag_id'].tolist()))
+    check("點得出「對應表有、讀值檔沒有」的 tag",
+          rep.unmatched_mappings == ('TBL|K12_NOT_IN_READINGS',),
+          str(rep.unmatched_mappings))
+    check("點得出「讀值檔有、對應表沒有」的 tag（這種正常，匯出涵蓋整廠）",
+          rep.unmatched_readings == ('SOMETHING_ELSE',), str(rep.unmatched_readings))
+
+    # 完全對不上時，訊息要能讓人當場看出兩邊長什麼樣
+    _, rep_bad = match_readings(
+        pd.DataFrame([{'tag_id': 'TOTALLY_OTHER', 'ts': base, 'value': 1.0}]), maps)
+    text = '\n'.join(describe_match(rep_bad))
+    check("一筆都對不上時，報告同時列出兩邊的 tag 範例",
+          not rep_bad.ok and 'TOTALLY_OTHER' in text and long_id in text, text[:120])
+
     # ── 時區：兩邊必須是同一個時鐘 ──────────────────────────
     # 這是整個模組最容易安靜出錯的地方：振動端是 naive 當地時間，
     # SCADA 若被讀成 UTC，對齊時要嘛拋錯、要嘛整批錯開 8 小時，

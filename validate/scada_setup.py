@@ -34,7 +34,8 @@ import pandas as pd
 
 from vibcore.io.analytic_reader import _ENCODINGS
 from vibcore.io.scada import (SCADA_REFRESH_MINUTES, VARIABLE_TYPES,
-                              effective_sample_count, emit_tagmap_template,
+                              describe_match, effective_sample_count,
+                              emit_tagmap_template, match_readings,
                               parse_readings, parse_tagmap)
 
 logger = logging.getLogger(__name__)
@@ -191,15 +192,21 @@ def cmd_probe(args) -> int:
         print('讀值檔沒有可用資料。')
         return 1
 
-    known = {m.tag_id: m for m in mappings}
-    readings = readings[readings['tag_id'].isin(known)]
-    if readings.empty:
-        print('讀值檔裡沒有任何 tag 出現在對應表中——請確認兩邊的 tag_id 一致。')
-        return 1
+    # 對應表的 tag 來自 Analytic CSV 的 Label 欄（`資料表名|tag名`），
+    # 讀值檔的 TAGNAME 多半只有 tag 名那一半。比對會自動忽略前綴與大小寫，
+    # 對不上時把兩邊的範例印出來，而不是只說「沒有資料」。
+    readings, report = match_readings(readings, mappings)
 
     print('=' * 66)
     print('  SCADA 讀值實測')
     print('=' * 66)
+    print()
+    for line in describe_match(report):
+        print('  ' + line if line else '')
+    if not report.ok:
+        print()
+        return 1
+
     print(f'\n可用讀值 {len(readings):,} 筆，涵蓋 {readings["tag_id"].nunique()} 個 tag')
     print(f'期間 {readings["ts"].min()} ～ {readings["ts"].max()}')
 
