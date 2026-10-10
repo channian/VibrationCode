@@ -55,6 +55,7 @@ SCADA 的頻率 tag 是唯一能知道實際運轉轉速的來源。
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 from dataclasses import dataclass
@@ -345,9 +346,109 @@ def _to_plant_naive(series: pd.Series, source: str = '') -> pd.Series:
     return dt
 
 
+def resolve_reading_paths(path: str) -> list[str]:
+    """
+    讀值來源 → 檔案清單。接受三種寫法：
+
+    · 資料夾：其中所有 `.csv`（不分大小寫，不含子資料夾），依檔名排序
+    · 萬用字元：`scada/2026-*.csv`
+    · 單一檔案
+
+    依檔名排序是為了讓「同一個 (tag, 時間) 出現在多個檔案時以哪個為準」
+    有確定的答案（後面的檔案勝出），不隨檔案系統的列舉順序漂移。
+    """
+    if not path:
+        return []
+    if os.path.isdir(path):
+        return sorted(
+            os.path.join(path, f) for f in os.listdir(path)
+            if f.lower().endswith('.csv') and os.path.isfile(os.path.join(path, f)))
+    if any(ch in path for ch in '*?['):
+        return sorted(f for f in glob.glob(path) if os.path.isfile(f))
+    return [path] if os.path.exists(path) else []
+
+
+def _read_reading_file(path: str) -> tuple[pd.DataFrame, int] | None:
+    """
+    讀單一讀值檔。
+
+    Returns:
+        `(欄位 tag_id / ts / value 的 DataFrame, 原始列數)`；
+        檔案讀不了或欄位不符時回 None（呼叫端負責彙整回報，這裡只記錄原因）。
+    """
+    name = os.path.basename(path)
+    for enc in ('utf-8-sig', 'utf-8', 'cp950'):
+        try:
+            df = pd.read_csv(path, encoding=enc)
+            break
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            logger.warning(f"SCADA 讀值檔 {name} 讀取失敗（{type(e).__name__}: {e}），略過")
+            return None
+    else:
+        logger.warning(f"SCADA 讀值檔 {name} 無法以 utf-8/cp950 讀取，略過")
+        return None
+
+    cols = _resolve_columns(df.columns)
+    if cols is None:
+        logger.warning(
+            f"SCADA 讀值檔 {name} 找不到必要欄位，略過（實際欄位：{list(df.columns)[:8]}；"
+            f"可接受的別名：{_READING_ALIASES}）。若這不是讀值檔，可忽略此訊息。")
+        return None
+
+    n_raw = len(df)
+    out = pd.DataFrame({
+        'tag_id': df[cols['tag_id']].astype(str).str.strip(),
+        'ts': _to_plant_naive(df[cols['ts']], source=name),
+        'value': pd.to_numeric(df[cols['value']], errors='coerce'),
+    }).dropna(subset=['tag_id', 'ts', 'value'])
+    return out[out['tag_id'] != ''], n_raw
+
+
+def _report_missing_days(ts: pd.Series, n_files: int) -> None:
+    """
+    合併多個檔案後，整天完全沒有讀值的日期要講出來。
+
+    少拿一個檔案（例如漏了某週的匯出）合併後不會有任何錯誤，只是資料
+    安靜地短了一段，之後所有統計都建立在比預期短的窗口上。
+    只在多檔案時檢查——單一檔案裡的空白日更可能是 SCADA 真的斷線。
+    """
+    if n_files < 2 or ts.empty:
+        return
+    days = pd.DatetimeIndex(ts.dt.normalize().unique()).sort_values()
+    full = pd.date_range(days[0], days[-1], freq='D')
+    missing = full.difference(days)
+    if len(missing) == 0:
+        return
+    # 連續缺的日子併成區間，免得缺一個月時印出三十行
+    runs, start, prev = [], missing[0], missing[0]
+    for d in missing[1:]:
+        if d - prev > pd.Timedelta(days=1):
+            runs.append((start, prev))
+            start = d
+        prev = d
+    runs.append((start, prev))
+    text = '、'.join(f'{a:%m-%d}' if a == b else f'{a:%m-%d}～{b:%m-%d}' for a, b in runs[:6])
+    logger.warning(
+        f"SCADA 讀值：合併 {n_files} 個檔案後，有 {len(missing)} 天完全沒有讀值"
+        f"（{text}{' …' if len(runs) > 6 else ''}）。"
+        f"若不是 SCADA 真的斷線，可能漏了某個檔案。")
+
+
 def parse_readings(path: str) -> pd.DataFrame:
     """
     讀 SCADA 讀值 CSV，欄位為 `tag_id, ts, value`。
+
+    `path` 可以是單一檔案、**資料夾**（讀其中所有 `.csv` 並合併），或
+    萬用字元（`scada/2026-*.csv`），見 `resolve_reading_paths`。多個檔案
+    時：
+
+    · 欄位別名、編碼逐檔判斷，各檔可以不同
+    · 欄位不符的檔案（例如資料夾裡混了 tagmap.csv）略過並記警告，不讓整批失敗
+    · 時間相近的檔案重疊時，同一個 (tag, 時間) 只留一筆，**後面的檔案勝出**；
+      若重疊部分的數值不一致會警告——那代表兩次匯出對同一時刻有不同說法
+    · 合併後整天都沒有讀值的日期會警告（可能漏了檔案）
 
     Returns:
         欄位 `tag_id`（str）、`ts`（**naive 廠內當地時間**，與振動端一致，
@@ -355,47 +456,55 @@ def parse_readings(path: str) -> pd.DataFrame:
         依 `(tag_id, ts)` 排序並去重。解析不了的列直接丟掉並
         統計筆數——讀值檔動輒數十萬列，逐列記警告只會把 log 灌爆。
     """
-    if not path or not os.path.exists(path):
-        logger.warning(f"SCADA 讀值檔 {path} 不存在")
-        return pd.DataFrame(columns=['tag_id', 'ts', 'value'])
+    empty = pd.DataFrame(columns=['tag_id', 'ts', 'value'])
+    paths = resolve_reading_paths(path)
+    if not paths:
+        if path and os.path.isdir(path):
+            logger.warning(f"SCADA 讀值資料夾 {path} 內沒有 .csv 檔案")
+        else:
+            logger.warning(f"SCADA 讀值來源 {path} 不存在或沒有符合的檔案")
+        return empty
 
-    for enc in ('utf-8-sig', 'utf-8', 'cp950'):
-        try:
-            df = pd.read_csv(path, encoding=enc)
-            break
-        except UnicodeDecodeError:
+    frames, n_raw_total, n_used = [], 0, 0
+    for order, fp in enumerate(paths):
+        got = _read_reading_file(fp)
+        if got is None:
             continue
-    else:
-        logger.error(f"SCADA 讀值檔 {path} 無法以 utf-8/cp950 讀取")
-        return pd.DataFrame(columns=['tag_id', 'ts', 'value'])
+        df, n_raw = got
+        n_used += 1
+        n_raw_total += n_raw
+        frames.append(df.assign(_order=order))
 
-    cols = _resolve_columns(df.columns)
-    if cols is None:
-        logger.error(
-            f"SCADA 讀值檔 {path} 找不到必要欄位（實際欄位：{list(df.columns)}）。"
-            f"可接受的別名：{_READING_ALIASES}")
-        return pd.DataFrame(columns=['tag_id', 'ts', 'value'])
+    if not frames:
+        logger.error(f"SCADA 讀值來源 {path}：{len(paths)} 個檔案都無法使用"
+                     f"（找不到必要欄位 {list(_READING_ALIASES)}，或編碼無法讀取）")
+        return empty
+    if len(paths) > 1:
+        logger.info(f"SCADA 讀值：讀入 {n_used} / {len(paths)} 個檔案")
 
-    n_raw = len(df)
-    ts = _to_plant_naive(df[cols['ts']], source=os.path.basename(path))
-    out = pd.DataFrame({
-        'tag_id': df[cols['tag_id']].astype(str).str.strip(),
-        'ts': ts,
-        'value': pd.to_numeric(df[cols['value']], errors='coerce'),
-    }).dropna(subset=['tag_id', 'ts', 'value'])
-    out = out[out['tag_id'] != '']
-
-    n_dropped = n_raw - len(out)
+    out = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    n_dropped = n_raw_total - len(out)
     if n_dropped:
-        logger.warning(f"SCADA 讀值檔 {path}：{n_raw} 列中有 {n_dropped} 列"
+        logger.warning(f"SCADA 讀值檔 {path}：{n_raw_total} 列中有 {n_dropped} 列"
                        f"因時間或數值無法解析而略過")
 
+    # 檔案順序排在最後一個排序鍵，keep='last' 才確實是「後面的檔案勝出」
+    out = out.sort_values(['tag_id', 'ts', '_order'])
+    dup = out[out.duplicated(subset=['tag_id', 'ts'], keep=False)]
     before = len(out)
-    out = (out.sort_values(['tag_id', 'ts'])
-           .drop_duplicates(subset=['tag_id', 'ts'], keep='last')
-           .reset_index(drop=True))
+    out = out.drop_duplicates(subset=['tag_id', 'ts'], keep='last')
     if len(out) < before:
+        n_conflict = 0
+        if len(frames) > 1:
+            n_conflict = int((dup.groupby(['tag_id', 'ts'])['value'].nunique() > 1).sum())
         logger.info(f"SCADA 讀值檔 {path}：去除 {before - len(out)} 筆重複的 (tag_id, ts)")
+        if n_conflict:
+            logger.warning(
+                f"SCADA 讀值：{n_conflict} 個 (tag, 時間) 在不同檔案裡數值不一致，"
+                f"已以檔名排序較後的檔案為準。請確認檔案重疊的部分是否來自不同次匯出。")
+
+    out = out.drop(columns='_order').reset_index(drop=True)
+    _report_missing_days(out['ts'], n_used)
     return out
 
 

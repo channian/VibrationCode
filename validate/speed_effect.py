@@ -386,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description='velRMS 對轉速（SCADA 頻率）的相依性')
     ap.add_argument('--data-dir', required=True, help='Analytic CSV 資料夾')
     ap.add_argument('--tagmap', required=True, help='tag 對應表 CSV')
-    ap.add_argument('--readings', required=True, help='SCADA 讀值 CSV（DATETIME/TAGNAME/VALUE）')
+    ap.add_argument('--readings', required=True,
+                    help='SCADA 讀值：單一 CSV、放了多個 CSV 的資料夾（自動合併），或萬用字元')
     ap.add_argument('--pattern', default='*.csv')
     ap.add_argument('--since', help='起日 YYYY-MM-DD（含）')
     ap.add_argument('--until', help='迄日 YYYY-MM-DD（含）')

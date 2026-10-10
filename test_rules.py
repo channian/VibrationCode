@@ -673,7 +673,8 @@ def test_scada() -> None:
                                   STALENESS_TOLERANCE_MINUTES, attach_to_agg,
                                   effective_sample_count, emit_tagmap_template,
                                   describe_speed, estimate_refresh_minutes,
-                                  parse_readings, parse_tagmap, profile_tag)
+                                  parse_readings, parse_tagmap, profile_tag,
+                                  resolve_reading_paths)
 
     # ── 對應表：範本預填、型別把關 ──────────────────────────
     with tempfile.TemporaryDirectory() as tmp:
@@ -822,6 +823,82 @@ def test_scada() -> None:
           est is not None and abs(est - 10.0) < 1.0 and n_used == 1, f"{est}, n={n_used}")
     check("沒有任何 tag 夠格時回 None 而不是亂估",
           estimate_refresh_minutes([p_zero, p_const, p_rare]) == (None, 0))
+
+    # ── 讀值來源可以是資料夾：不用先手動合併 ──────────────────
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.msgs: list[str] = []
+
+        def emit(self, record):
+            self.msgs.append(record.getMessage())
+
+    def read_quiet(path):
+        # 測試套件把 root 設成 ERROR；要接到 WARNING 得調這個 logger 自己的層級
+        h, lg = _Capture(), logging.getLogger('vibcore.io.scada')
+        old_level = lg.level
+        lg.setLevel(logging.WARNING)
+        lg.addHandler(h)
+        try:
+            return parse_readings(path), h.msgs
+        finally:
+            lg.removeHandler(h)
+            lg.setLevel(old_level)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = os.path.join(tmp, 'scada')
+        os.makedirs(d)
+
+        def write(name, rows, cols=('DATETIME', 'TAGNAME', 'VALUE'), enc='utf-8'):
+            pd.DataFrame(rows, columns=list(cols)).to_csv(
+                os.path.join(d, name), index=False, encoding=enc)
+
+        # 三個檔案，各自涵蓋不同日期；07-03 整天刻意不給（漏檔）。
+        # 第二個檔案用別的欄名、cp950 編碼，驗證逐檔判斷。
+        write('a_0701.csv', [('2026-07-01 08:00:00', 'T.I', 10.0), ('2026-07-01 08:10:00', 'T.I', 11.0),
+                             ('2026-07-02 08:00:00', 'T.I', 12.0)])
+        write('b_0702.csv', [('2026-07-02 08:00:00', 'T.I', 12.0),            # 與 a 重疊、數值相同
+                             ('2026-07-02 08:10:00', 'T.I', 13.0)],
+              cols=('time', 'tag', 'value'), enc='cp950')
+        write('c_0704.csv', [('2026-07-04 08:00:00', 'T.I', 14.0),
+                             ('2026-07-02 08:10:00', 'T.I', 99.0)])            # 與 b 重疊、數值衝突
+        write('tagmap.csv', [('X', 'Y')], cols=('device_id', 'tag_id'))       # 混進資料夾的非讀值檔
+        pd.DataFrame({'x': [1]}).to_csv(os.path.join(d, 'notes.txt'), index=False)   # 非 csv，不該被讀
+
+        check("資料夾 → 列出所有 .csv，依檔名排序，不含非 csv",
+              [os.path.basename(x) for x in resolve_reading_paths(d)]
+              == ['a_0701.csv', 'b_0702.csv', 'c_0704.csv', 'tagmap.csv'],
+              str([os.path.basename(x) for x in resolve_reading_paths(d)]))
+        check("萬用字元也可以",
+              len(resolve_reading_paths(os.path.join(d, '[abc]_*.csv'))) == 3)
+        check("不存在的路徑 → 空清單，不丟例外", resolve_reading_paths(os.path.join(tmp, 'nope')) == [])
+
+        merged, msgs = read_quiet(d)
+        check("資料夾合併：重疊的 (tag, 時間) 只留一筆",
+              len(merged) == 5 and merged.duplicated(['tag_id', 'ts']).sum() == 0, str(len(merged)))
+        check("輸出依 (tag, 時間) 排序", merged['ts'].is_monotonic_increasing)
+        row = merged[merged['ts'] == pd.Timestamp('2026-07-02 08:10:00')].iloc[0]
+        check("數值衝突時以檔名排序較後的檔案為準（c 的 99，不是 b 的 13）",
+              row['value'] == 99.0, str(row['value']))
+        check("數值衝突有警告（兩次匯出對同一時刻說法不同）",
+              any('不一致' in m for m in msgs), str(msgs))
+        check("相同數值的重疊不算衝突（只有 1 個 (tag, 時間) 衝突，不是 2 個）",
+              any('1 個' in m and '不一致' in m for m in msgs), str(msgs))
+        check("混進資料夾的非讀值 CSV 被略過、有說明，不讓整批失敗",
+              any('tagmap.csv' in m for m in msgs) and len(merged) == 5, str(msgs))
+        check("整天沒有讀值的日期有警告（07-03 漏檔）",
+              any('07-03' in m for m in msgs), str(msgs))
+
+        # 單一檔案的行為不變，也不做「漏日」檢查（單檔的空白日更可能是真的斷線）
+        single, msgs1 = read_quiet(os.path.join(d, 'a_0701.csv'))
+        check("單一檔案仍可直接讀", len(single) == 3)
+        check("單一檔案不做漏日檢查", not any('完全沒有讀值' in m for m in msgs1), str(msgs1))
+
+        empty_dir = os.path.join(tmp, 'empty')
+        os.makedirs(empty_dir)
+        e, emsgs = read_quiet(empty_dir)
+        check("空資料夾 → 空結果並說明是資料夾內沒有 csv",
+              e.empty and any('沒有 .csv' in m for m in emsgs), str(emsgs))
 
     # ── 時間對齊：同小時取中位數、過期值不硬貼 ──────────────
     # naive = 廠內當地時間，與振動端（analytic_reader.parse_datetime 不指定

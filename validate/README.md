@@ -135,6 +135,11 @@ python -m validate.speed_effect --data-dir data/ --tagmap out/tagmap.csv \
     --readings out/scada.csv --since 2026-06-01 --until 2026-06-14 --csv out/speed_effect.csv
 ```
 
+`--readings` 可以給單一 CSV、**放了多個 CSV 的資料夾**（自動合併，不必先手動併檔），
+或萬用字元（`scada/2026-*.csv`）。合併時：各檔欄名／編碼可以不同；欄位不符的檔
+（例如資料夾裡混了 tagmap.csv）會略過並說明；檔案重疊的時段只留一筆，數值不一致
+時警告並以檔名較後者為準；合併後整天沒有讀值的日期也會警告（可能漏了某個檔案）。
+
 讀值檔欄名接受 `DATETIME / TAGNAME / VALUE`；時間視為廠內當地時間（UTC+8），
 tag 寫成 `資料表名|tag名` 或只有 `tag名` 都對得上。`speed_effect` 的判定與
 限制（相關非因果、只涵蓋指定時段、M1/M2 共用頻率 tag 不是兩份獨立證據）

@@ -17,6 +17,8 @@ scada_setup.py — SCADA tag 對應表的產出與檢查
     python -m validate.scada_setup emit  --data-dir data/ --out out/tagmap.csv
     python -m validate.scada_setup check --tagmap out/tagmap.csv --data-dir data/
     python -m validate.scada_setup probe --tagmap out/tagmap.csv --readings out/scada.csv
+    # --readings 也可以給放了多個 CSV 的資料夾，會自動合併
+    python -m validate.scada_setup probe --tagmap out/tagmap.csv --readings scada_csv/
 
 讀值檔的欄名接受別名，現場匯出的 `DATETIME / TAGNAME / VALUE` 可直接使用。
 **時間一律視為廠內當地時間（naive）**，與振動端一致——這一點錯了會安靜地
@@ -38,6 +40,7 @@ from vibcore.io.scada import (ACTIVE_MIN_CHANGES, REFRESH_TOLERANCE,
                               describe_match, describe_speed, effective_sample_count,
                               emit_tagmap_template, estimate_refresh_minutes,
                               match_readings, parse_readings, parse_tagmap,
+                              resolve_reading_paths,
                               profile_tag)
 
 logger = logging.getLogger(__name__)
@@ -189,10 +192,13 @@ def cmd_check(args) -> int:
 def cmd_probe(args) -> int:
     """拿實際讀值驗證：tag 對得上嗎、訊號有沒有在動、刷新週期是多少。"""
     mappings = parse_tagmap(args.tagmap)
+    n_src = len(resolve_reading_paths(args.readings))
     readings = parse_readings(args.readings)
     if readings.empty:
         print('讀值檔沒有可用資料。')
         return 1
+    if n_src > 1:
+        print(f'讀值來源：{n_src} 個檔案，合併後 {len(readings):,} 筆')
 
     # 對應表的 tag 來自 Analytic CSV 的 Label 欄（`資料表名|tag名`），
     # 讀值檔的 TAGNAME 多半只有 tag 名那一半。比對會自動忽略前綴與大小寫，
@@ -317,7 +323,8 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser('probe', help='拿讀值檔實測刷新週期')
     r.add_argument('--tagmap', required=True)
     r.add_argument('--readings', required=True,
-               help='SCADA 讀值 CSV。欄名接受別名——現場的 DATETIME/TAGNAME/VALUE 可直接使用')
+               help='SCADA 讀值：單一 CSV、放了多個 CSV 的資料夾（自動合併），或萬用字元'
+                    '（如 scada/2026-*.csv）。欄名接受別名——現場的 DATETIME/TAGNAME/VALUE 可直接使用')
     r.set_defaults(func=cmd_probe)
 
     args = p.parse_args(argv)
