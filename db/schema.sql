@@ -341,16 +341,32 @@ CREATE INDEX idx_ingestion_problem    ON ingestion_log(ingest_date, point_id)
 -- 四、SCADA（電流等）
 -- =============================================================
 
-CREATE TABLE tag_mapping (
+-- SCADA 的 tag 是一個「訊號」，與設備是多對多：一台馬達的驅動端（M1）與
+-- 非驅動端（M2）是兩個量測點（兩個 device_id），卻共用同一組電流與頻率 tag。
+-- 早期版本把 tag_id 當 tag_mapping 的主鍵，等於假設一個 tag 只屬於一台設備
+-- ——一次寫兩列會報 CardinalityViolation，分兩次寫則後寫的覆蓋先寫的，
+-- 先寫那台的 tag 就查不到了，而且沒有任何錯誤。所以拆成兩張：
+--   scada_tag    訊號本身（型別、單位）
+--   tag_mapping  設備與訊號的連結（多對多）
+CREATE TABLE scada_tag (
     tag_id        TEXT PRIMARY KEY,
-    device_id     TEXT REFERENCES device(device_id) ON DELETE CASCADE,
-    variable_type TEXT NOT NULL,                  -- 電流 / 頻率 / 輸入功率 …
-    unit          TEXT,
-    is_active     BOOLEAN NOT NULL DEFAULT TRUE
+    variable_type TEXT NOT NULL
+                  CHECK (variable_type IN ('current','frequency','power')),
+    unit          TEXT
 );
 
+CREATE TABLE tag_mapping (
+    device_id TEXT    NOT NULL REFERENCES device(device_id)   ON DELETE CASCADE,
+    tag_id    TEXT    NOT NULL REFERENCES scada_tag(tag_id)   ON DELETE CASCADE,
+    -- is_active 放在連結上而不是 tag 上：同一個 tag 可能對某台設備填錯
+    -- 而停用，卻仍然正確地屬於另一台。
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (device_id, tag_id)
+);
+CREATE INDEX idx_tag_mapping_tag ON tag_mapping(tag_id);
+
 CREATE TABLE scada_reading (
-    tag_id TEXT        NOT NULL REFERENCES tag_mapping(tag_id) ON DELETE CASCADE,
+    tag_id TEXT        NOT NULL REFERENCES scada_tag(tag_id) ON DELETE CASCADE,
     ts     TIMESTAMPTZ NOT NULL,
     value  NUMERIC(16,6),
     PRIMARY KEY (tag_id, ts)

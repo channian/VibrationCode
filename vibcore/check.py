@@ -27,7 +27,7 @@ EXPECTED_TABLES = (
     "app_user", "app_role", "user_role",
     "device", "measure_point",
     "measurement_agg", "measurement_daily", "raw_file", "ingestion_log",
-    "tag_mapping", "scada_reading",
+    "scada_tag", "tag_mapping", "scada_reading",
     "point_baseline", "iso_threshold", "rule_config", "sla_config",
     "finding", "finding_note", "finding_status_history",
     "weekly_report", "audit_log",

@@ -669,9 +669,11 @@ def test_scada() -> None:
 
     import tempfile
 
-    from vibcore.io.scada import (SCADA_REFRESH_MINUTES, STALENESS_TOLERANCE_MINUTES,
-                                  attach_to_agg, effective_sample_count,
-                                  emit_tagmap_template, parse_readings, parse_tagmap)
+    from vibcore.io.scada import (REFRESH_TOLERANCE, SCADA_REFRESH_MINUTES,
+                                  STALENESS_TOLERANCE_MINUTES, attach_to_agg,
+                                  effective_sample_count, emit_tagmap_template,
+                                  estimate_refresh_minutes, parse_readings,
+                                  parse_tagmap, profile_tag)
 
     # ── 對應表：範本預填、型別把關 ──────────────────────────
     with tempfile.TemporaryDirectory() as tmp:
@@ -706,21 +708,92 @@ def test_scada() -> None:
             f.write('CP 10_M1,,frequency,Hz,,還沒填\n')
         got = parse_tagmap(path)
         check("合法的兩列讀得回來", len(got) == 2, str([m.tag_id for m in got]))
+
+        # 一台馬達的驅動端（M1）與非驅動端（M2）是兩個量測點，卻共用同一組
+        # 電流與頻率。早期假設「一個 tag 只屬於一台設備」，實際的對應表
+        # 一寫就會撞到。
+        with open(path, 'w', encoding='utf-8-sig') as f:
+            f.write('device_id,tag_id,variable_type,unit,is_active,note\n')
+            f.write('CWP 01_M1,FACC|CWP01_INV_I,current,A,TRUE,\n')
+            f.write('CWP 01_M2,FACC|CWP01_INV_I,current,A,TRUE,\n')      # 共用
+            f.write('CWP 01_M2,cwp01_inv_i,current,A,TRUE,\n')            # 同一列換寫法：重複
+            f.write('CWP 01_M2,FACC|CWP01_INV_I,frequency,Hz,TRUE,\n')    # 同訊號填成別的型別
+        shared = parse_tagmap(path)
+        pairs = sorted((m.device_id, m.variable_type) for m in shared)
+        check("同一個 tag 對應多台設備是正常的，兩台都保留",
+              pairs == [('CWP 01_M1', 'current'), ('CWP 01_M2', 'current')], str(pairs))
+        check("同一台設備的重複列（換了寫法）靜默去重", len(shared) == 2, str(len(shared)))
+        check("同一個訊號被填成兩種型別時拒收那一列（不可能同時成立）",
+              all(m.variable_type == 'current' for m in shared))
+        check("同一個訊號只留一種寫法（資料庫只能有一種）",
+              len({m.tag_id for m in shared}) == 1, str({m.tag_id for m in shared}))
         check("不在允許值內的 variable_type 被拒收，不自動對應",
               all(m.tag_id != 'T.BAD' for m in got),
               "「電流」被當成 current 了——猜錯型別會讓頻率被當電流用")
 
-    # ── 有效樣本數：2 分鐘一列 ≠ 2 分鐘一個獨立樣本 ─────────
-    # 這是本模組存在的主要理由之一：檔案每 2 分鐘一列，但值約 15 分鐘才
-    # 真的更新，直接拿列數當樣本數會高估約 7 倍。
+    # ── 有效樣本數：一列 ≠ 一個獨立樣本 ───────────────────
+    # 這是本模組存在的主要理由之一：匯出檔每分鐘一列，但值約 10 分鐘才真的
+    # 更新一次，直接拿列數當樣本數會高估一個數量級。期望值由常數推導而不是
+    # 寫死——刷新週期曾由口述的 15 分鐘依實測改為 10 分鐘，寫死的數字
+    # 會在改常數時無謂地失敗，也掩蓋「測的是公式不是某個數字」。
     n_rows, span = 2000, 2000 * 2.0
     eff = effective_sample_count(n_rows, span)
-    check("列數不等於有效樣本數（2000 列 / 4000 分鐘 → 266）",
-          eff == int(span // SCADA_REFRESH_MINUTES) == 266, str(eff))
+    check("有效樣本數 = 時間跨度能容納幾個刷新週期，而不是列數",
+          eff == int(span // SCADA_REFRESH_MINUTES) and eff < n_rows,
+          f"eff={eff}, 列數={n_rows}")
     check("資料稀疏時不因公式而虛報（列數才 5 筆）",
           effective_sample_count(5, span) == 5)
     check("跨度為 0 或列數為 0 時回 0（不除以零）",
           effective_sample_count(0, span) == 0 and effective_sample_count(10, 0) == 0)
+
+    # ── 刷新週期的估計與判定 ────────────────────────────────
+    # 先前 probe 用「差距超過 5 分鐘」判相符：實測 10.2 對假設的 15 差 4.8，
+    # 剛好沒過門檻，於是打了「✓ 相符」——實際差了三分之一。改成相對容忍度。
+    measured, assumed = 10.2, 15.0
+    check("回歸：舊的絕對門檻會把 10.2 對 15 誤判為相符",
+          abs(measured - assumed) <= 5)
+    check("新的相對門檻能抓到這個落差",
+          abs(measured - assumed) / assumed > REFRESH_TOLERANCE,
+          f"{abs(measured - assumed) / assumed:.2f} vs {REFRESH_TOLERANCE}")
+    check("程式內的刷新週期與 2026-06 實測（10.2 分鐘）相符",
+          abs(measured - SCADA_REFRESH_MINUTES) / SCADA_REFRESH_MINUTES <= REFRESH_TOLERANCE,
+          str(SCADA_REFRESH_MINUTES))
+
+    # ── 訊號輪廓：不變動的 tag 要分得出是關機、定頻還是凍結 ─────
+    rng = np.random.default_rng(2)
+    minutes = pd.date_range('2026-06-01', periods=14 * 1440, freq='min')
+
+    def held(period, gen):
+        out, cur = np.empty(len(minutes)), gen()
+        for i in range(len(minutes)):
+            if i % period == 0:
+                cur = gen()
+            out[i] = cur
+        return out
+
+    def frame(v):
+        return pd.DataFrame({'ts': minutes, 'value': v})
+
+    p_fast = profile_tag('fast', frame(held(10, lambda: float(rng.normal(60, 4)))))
+    p_slow = profile_tag('slow', frame(held(110, lambda: float(rng.choice([42., 45., 50.])))))
+    p_zero = profile_tag('zero', frame(np.zeros(len(minutes))))
+    p_const = profile_tag('const', frame(np.full(len(minutes), 50.0)))
+    p_rare = profile_tag('rare', frame(np.r_[np.full(5000, 59.9), np.full(len(minutes) - 5000, 60.0)]))
+
+    check("持續變動的 tag 歸為 varying", p_fast.kind == 'varying', p_fast.kind)
+    check("恆為 0 歸為 constant_zero（設備沒開機）", p_zero.kind == 'constant_zero', p_zero.kind)
+    check("恆為非零歸為 constant_nonzero（定頻或凍結）",
+          p_const.kind == 'constant_nonzero', p_const.kind)
+    check("只變動幾次的歸為 rare", p_rare.kind == 'rare', p_rare.kind)
+    check("變得慢的訊號（頻率設定值）不拿來估刷新週期",
+          p_fast.tracks_refresh and not p_slow.tracks_refresh,
+          f"fast={p_fast.median_gap_min}, slow={p_slow.median_gap_min}")
+
+    est, n_used = estimate_refresh_minutes([p_fast, p_slow, p_zero, p_const, p_rare])
+    check("刷新週期只由持續變動的 tag 估出（約 10 分鐘，且只用 1 個 tag）",
+          est is not None and abs(est - 10.0) < 1.0 and n_used == 1, f"{est}, n={n_used}")
+    check("沒有任何 tag 夠格時回 None 而不是亂估",
+          estimate_refresh_minutes([p_zero, p_const, p_rare]) == (None, 0))
 
     # ── 時間對齊：同小時取中位數、過期值不硬貼 ──────────────
     # naive = 廠內當地時間，與振動端（analytic_reader.parse_datetime 不指定
@@ -1082,6 +1155,54 @@ def test_db(dbname: str) -> None:
     check("對應表沒有的 tag_id 被擋下（而非安靜丟掉，那樣會讓漏填查不出來）",
           fk_blocked)
 
+    # ── 多對多：M1 與 M2 共用同一組 tag ─────────────────────
+    # 舊結構以 tag_id 為 tag_mapping 的主鍵：一次寫兩列報 CardinalityViolation，
+    # 分兩次寫則後寫的覆蓋先寫的——先寫那台的 tag 查不到，而且沒有任何錯誤。
+    for d in ('M1', 'M2'):
+        repo.upsert_device(conn, DeviceContext(device_id=f'CWP 01_{d}',
+                                               device_name=f'CWP 01_{d}'))
+    conn.commit()
+    shared_tag = 'FACC|CWP01_INV_I'
+    n_links = repo.upsert_tag_mappings(conn, [
+        TagMapping(shared_tag, 'CWP 01_M1', 'current', 'A'),
+        TagMapping(shared_tag, 'CWP 01_M2', 'current', 'A')])
+    conn.commit()
+    check("同一次寫入兩台共用同一個 tag 不報錯", n_links == 2, str(n_links))
+    for d in ('CWP 01_M1', 'CWP 01_M2'):
+        check(f"共用 tag 的 {d} 查得到",
+              [r['tag_id'] for r in repo.get_tag_mappings(conn, device_id=d)] == [shared_tag])
+
+    # 分兩次寫（先 M1、後 M2）不能讓先寫的那台消失
+    repo.upsert_device(conn, DeviceContext(device_id='CWP 02_M1', device_name='CWP 02_M1'))
+    repo.upsert_device(conn, DeviceContext(device_id='CWP 02_M2', device_name='CWP 02_M2'))
+    conn.commit()
+    repo.upsert_tag_mappings(conn, [TagMapping('FACC|CWP02_I', 'CWP 02_M1', 'current')])
+    conn.commit()
+    repo.upsert_tag_mappings(conn, [TagMapping('FACC|CWP02_I', 'CWP 02_M2', 'current')])
+    conn.commit()
+    check("分兩次寫入時，先寫的設備不會被後寫的覆蓋",
+          len(repo.get_tag_mappings(conn, device_id='CWP 02_M1')) == 1
+          and len(repo.get_tag_mappings(conn, device_id='CWP 02_M2')) == 1)
+
+    # 同一個訊號被填成兩種型別 = 填錯，不該安靜擇一
+    try:
+        repo.upsert_tag_mappings(conn, [
+            TagMapping('FACC|CONFLICT', 'CWP 01_M1', 'current'),
+            TagMapping('FACC|CONFLICT', 'CWP 01_M2', 'frequency')])
+        conflict_raised = False
+    except ValueError:
+        conn.rollback()
+        conflict_raised = True
+    check("同一個 tag 在同批資料被填成不同型別時拒絕寫入", conflict_raised)
+
+    # is_active 在連結上：某台設備填錯而停用，不影響共用同一個 tag 的另一台
+    repo.upsert_tag_mappings(conn, [TagMapping(shared_tag, 'CWP 01_M1', 'current',
+                                               is_active=False)])
+    conn.commit()
+    check("停用其中一台的連結不影響共用同一個 tag 的另一台",
+          len(repo.get_tag_mappings(conn, device_id='CWP 01_M1')) == 0
+          and len(repo.get_tag_mappings(conn, device_id='CWP 01_M2')) == 1)
+
     # 從資料庫讀回來的格式要能直接餵進對齊函式
     agg_db = pd.DataFrame({'ts_hour': [base_ts]})
     joined = attach_to_agg(agg_db, back, 'current')
@@ -1090,6 +1211,53 @@ def test_db(dbname: str) -> None:
           str(joined.iloc[0].to_dict()))
 
     conn.close()
+
+    # ── migration 006：從舊結構（tag_id 為主鍵）搬到多對多 ──────
+    mig6 = "db/migration_006_tag_many_to_many.sql"
+    old_db = dbname.replace('_test', '') + "_mig6_test"
+    if not os.path.exists(mig6):
+        skip("migration_006 由舊結構搬資料", f"找不到 {mig6}")
+    else:
+        def _psql(*a):
+            return subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-d", old_db, *a],
+                                  env=env, capture_output=True, text=True)
+        subprocess.run(["dropdb", "--if-exists", old_db], env=env, capture_output=True)
+        subprocess.run(["createdb", old_db], env=env, capture_output=True)
+        _psql("-f", "db/schema.sql")
+        # 把 SCADA 三張表還原成舊結構，並塞一筆舊資料
+        r0 = _psql("-c", """
+            SET search_path TO vib, public;
+            DROP TABLE scada_reading; DROP TABLE tag_mapping; DROP TABLE scada_tag;
+            CREATE TABLE tag_mapping (
+                tag_id TEXT PRIMARY KEY,
+                device_id TEXT REFERENCES device(device_id) ON DELETE CASCADE,
+                variable_type TEXT NOT NULL, unit TEXT,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE);
+            CREATE TABLE scada_reading (
+                tag_id TEXT NOT NULL REFERENCES tag_mapping(tag_id) ON DELETE CASCADE,
+                ts TIMESTAMPTZ NOT NULL, value NUMERIC(16,6), PRIMARY KEY (tag_id, ts));
+            INSERT INTO device (device_id, device_name) VALUES ('OLD_DEV', 'OLD_DEV');
+            INSERT INTO tag_mapping VALUES ('OLD|TAG_I', 'OLD_DEV', 'current', 'A', TRUE);
+            INSERT INTO scada_reading VALUES ('OLD|TAG_I', '2026-08-01 00:00+08', 41.5);
+        """)
+        check("（準備）舊結構的測試資料建得起來", r0.returncode == 0, r0.stderr[:200])
+        runs = [_psql("-f", mig6) for _ in range(2)]
+        check("migration_006 由舊結構套用成功，且可重複套用（冪等）",
+              all(r.returncode == 0 for r in runs),
+              '；'.join(r.stderr[:200] for r in runs if r.returncode != 0))
+        q = subprocess.run(["psql", "-tAq", "-d", old_db, "-c", """
+            SET search_path TO vib, public;
+            SELECT (SELECT count(*) FROM scada_tag WHERE tag_id='OLD|TAG_I'),
+                   (SELECT count(*) FROM tag_mapping WHERE device_id='OLD_DEV'),
+                   (SELECT count(*) FROM scada_reading WHERE tag_id='OLD|TAG_I');"""],
+                           env=env, capture_output=True, text=True)
+        check("舊的對應與讀值原樣搬到新結構（訊號 1、連結 1、讀值 1）",
+              q.stdout.strip().splitlines()[-1] == '1|1|1', q.stdout.strip() or q.stderr[:200])
+        two = _psql("-c", """SET search_path TO vib, public;
+            INSERT INTO device (device_id, device_name) VALUES ('OLD_DEV2', 'OLD_DEV2');
+            INSERT INTO tag_mapping (device_id, tag_id) VALUES ('OLD_DEV2', 'OLD|TAG_I');""")
+        check("搬完之後同一個 tag 可以再對應第二台設備", two.returncode == 0, two.stderr[:200])
+        subprocess.run(["dropdb", "--if-exists", old_db], env=env, capture_output=True)
 
     for mig, label in (("db/migration_004_iso10816_3_and_median.sql", "migration_004"),
                        ("db/migration_005_drop_kurtosis_channel.sql", "migration_005")):

@@ -33,10 +33,12 @@ import os
 import pandas as pd
 
 from vibcore.io.analytic_reader import _ENCODINGS
-from vibcore.io.scada import (SCADA_REFRESH_MINUTES, VARIABLE_TYPES,
+from vibcore.io.scada import (ACTIVE_MIN_CHANGES, REFRESH_TOLERANCE,
+                              SCADA_REFRESH_MINUTES, VARIABLE_TYPES,
                               describe_match, effective_sample_count,
-                              emit_tagmap_template, match_readings,
-                              parse_readings, parse_tagmap)
+                              emit_tagmap_template, estimate_refresh_minutes,
+                              match_readings, parse_readings, parse_tagmap,
+                              profile_tag)
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +187,7 @@ def cmd_check(args) -> int:
 
 
 def cmd_probe(args) -> int:
-    """拿實際讀值驗證兩件事：刷新週期是不是約 15 分鐘、值的分布長什麼樣。"""
+    """拿實際讀值驗證：tag 對得上嗎、訊號有沒有在動、刷新週期是多少。"""
     mappings = parse_tagmap(args.tagmap)
     readings = parse_readings(args.readings)
     if readings.empty:
@@ -210,34 +212,83 @@ def cmd_probe(args) -> int:
     print(f'\n可用讀值 {len(readings):,} 筆，涵蓋 {readings["tag_id"].nunique()} 個 tag')
     print(f'期間 {readings["ts"].min()} ～ {readings["ts"].max()}')
 
-    print(f'\n{"tag":40s} {"列數":>8s} {"列間隔":>8s} {"值變動間隔":>11s} {"有效樣本":>9s}')
-    print('  ' + '-' * 78)
-    refreshes = []
-    for tag, sub in readings.groupby('tag_id'):
-        sub = sub.sort_values('ts')
-        row_gap = sub['ts'].diff().dt.total_seconds().median() / 60.0
-        # 值真正改變的間隔——這才是有效的刷新週期
-        changed = sub[sub['value'].diff().fillna(1) != 0]
-        val_gap = (changed['ts'].diff().dt.total_seconds().median() / 60.0
-                   if len(changed) > 1 else float('nan'))
-        span = (sub['ts'].max() - sub['ts'].min()).total_seconds() / 60.0
-        eff = effective_sample_count(len(sub), span)
-        if pd.notna(val_gap):
-            refreshes.append(val_gap)
-        label = tag if len(tag) <= 38 else '…' + tag[-37:]
-        print(f'  {label:40s} {len(sub):>8,} {row_gap:>7.1f}m '
-              f'{val_gap:>10.1f}m {eff:>9,}')
+    vtype_of = {m.tag_id: m.variable_type for m in mappings}
+    profiles = [profile_tag(tag, sub) for tag, sub in readings.groupby('tag_id')]
+    row_gap = (readings.sort_values(['tag_id', 'ts']).groupby('tag_id')['ts']
+               .diff().dt.total_seconds().median() / 60.0)
 
-    if refreshes:
-        med = pd.Series(refreshes).median()
-        print(f'\n值變動間隔的中位數：{med:.1f} 分鐘'
-              f'（程式假設 {SCADA_REFRESH_MINUTES:.0f} 分鐘）')
-        if abs(med - SCADA_REFRESH_MINUTES) > 5:
-            print(f'  ⚠ 與假設差距超過 5 分鐘。SCADA_REFRESH_MINUTES 應改成 {med:.0f}')
+    def _short(tag: str, width: int = 34) -> str:
+        t = tag.split('|')[-1]
+        return t if len(t) <= width else '…' + t[-(width - 1):]
+
+    # ── 1. 訊號輪廓：這個 tag 到底有沒有在動 ───────────────────
+    kinds = {'varying': '持續變動', 'rare': '很少變動（< %d 次）' % ACTIVE_MIN_CHANGES,
+             'constant_zero': '全程恆為 0', 'constant_nonzero': '全程恆為同一個非零值'}
+    print(f'\n檔案列間隔中位數 {row_gap:.1f} 分鐘（這是匯出的取樣密度，不是刷新週期）')
+    print('\n訊號輪廓：')
+    for k, label in kinds.items():
+        group = [p for p in profiles if p.kind == k]
+        if group:
+            print(f'  {label:22s} {len(group):3d} 個 tag')
+
+    # ── 2. 不怎麼動的 tag：要人判斷是關機、定頻還是凍結 ─────────
+    flat = [p for p in profiles if p.kind != 'varying']
+    if flat:
+        print(f'\n不怎麼動的 tag（{len(flat)} 個）——這些要人判斷：')
+        print(f'  {"tag":36s} {"型別":10s} {"狀況":18s} {"值（p5 / 中位 / p95）":>24s}')
+        print('  ' + '-' * 92)
+        for p in sorted(flat, key=lambda x: (x.kind, x.tag_id)):
+            vt = vtype_of.get(p.tag_id, '?')
+            if p.kind == 'constant_zero':
+                state = '全程恆為 0'
+            elif p.kind == 'constant_nonzero':
+                state = '全程恆為非零'
+            else:
+                state = f'僅變動 {p.n_changes} 次'
+            vals = f'{p.v_p05:.1f} / {p.v_median:.1f} / {p.v_p95:.1f}'
+            print(f'  {_short(p.tag_id):36s} {vt:10s} {state:18s} {vals:>24s}')
+        print('\n  怎麼讀：')
+        print('    · 電流恆為 0 → 這段期間設備沒開機（備機的線索，Q4 第二階段會用到）')
+        print('    · 頻率恆為非零 → 變頻器定頻運轉，**沒有轉速變化可供分層**')
+        print('    · 電流恆為非零且完全不動 → 訊號可能凍結失效，要回頭查 tag 是否正確')
+
+    # ── 3. 頻率 tag：能不能拿來分層，看變動範圍 ────────────────
+    freq = [p for p in profiles if vtype_of.get(p.tag_id) == 'frequency']
+    if freq:
+        print(f'\n頻率 tag 的變動範圍（{len(freq)} 個）——這決定分層是不是在解真問題：')
+        print(f'  {"tag":36s} {"p5":>7s} {"中位":>7s} {"p95":>7s} {"最常見值佔比":>12s}  狀況')
+        print('  ' + '-' * 88)
+        for p in sorted(freq, key=lambda x: x.tag_id):
+            span = p.v_p95 - p.v_p05
+            if p.kind in ('constant_zero', 'constant_nonzero'):
+                note = '定值，無法分層'
+            elif span < 1.0 or p.top_share > 0.9:
+                note = '變化很小，分層意義不大'
+            else:
+                note = f'有變化（p5–p95 差 {span:.1f} Hz）'
+            print(f'  {_short(p.tag_id):36s} {p.v_p05:7.1f} {p.v_median:7.1f} '
+                  f'{p.v_p95:7.1f} {p.top_share * 100:11.0f}%  {note}')
+
+    # ── 4. 刷新週期：只用變動節奏反映系統刷新的 tag 來估 ─────────
+    est, n_used = estimate_refresh_minutes(profiles)
+    print('\n' + '-' * 66)
+    if est is None:
+        print('沒有足夠頻繁變動的 tag，無法估計刷新週期。')
+    else:
+        rel = abs(est - SCADA_REFRESH_MINUTES) / SCADA_REFRESH_MINUTES
+        print(f'實測刷新週期：{est:.1f} 分鐘'
+              f'（由 {n_used} 個持續變動的 tag 的中位數得出）')
+        print(f'程式假設：{SCADA_REFRESH_MINUTES:.0f} 分鐘　'
+              f'差距 {rel * 100:.0f}%（容忍 {REFRESH_TOLERANCE * 100:.0f}%）')
+        if rel > REFRESH_TOLERANCE:
+            print(f'  ⚠ 差距超過容忍度。SCADA_REFRESH_MINUTES 應改成 {round(est):.0f}')
             print('    ——這個常數決定「有效獨立樣本數」怎麼算，訂錯會讓所有以它')
             print('    為分母的統計（標準差、分層後每層夠不夠樣本）跟著失真。')
         else:
             print('  ✓ 與程式假設相符，有效樣本數的換算成立。')
+        span_min = (readings['ts'].max() - readings['ts'].min()).total_seconds() / 60.0
+        print(f'  一個 {len(readings) // max(len(profiles), 1):,} 列的 tag，有效獨立樣本約 '
+              f'{effective_sample_count(len(readings) // max(len(profiles), 1), span_min):,} 個。')
 
     print('\n' + '=' * 66)
     return 0

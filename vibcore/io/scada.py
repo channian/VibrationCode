@@ -34,11 +34,23 @@ SCADA 的頻率 tag 是唯一能知道實際運轉轉速的來源。
    Analytic CSV 也沒有指定時區，得到的同樣是 naive 當地時間。兩邊必須
    是同一個時鐘，否則整批錯開 8 小時而不會報錯。
 
-4. **每 2 分鐘一列，但底層更新週期約 15 分鐘。** 連續數列會是同一個值，
-   直到下一次刷新。這代表**有效獨立樣本約每 15 分鐘才一個，不是每 2 分鐘**
-   ——任何拿這些值做統計的地方都得按 15 分鐘算，否則樣本數會高估約 7 倍。
+4. **每分鐘一列，但值約每 10 分鐘才真的更新一次。** 連續數列會是同一個值，
+   直到下一次刷新。這代表**有效獨立樣本約每 10 分鐘才一個，不是每分鐘**
+   ——任何拿這些值做統計的地方都得按刷新週期算，否則樣本數會高估一個數量級。
    這跟既有的「accKURT 滾動 10 秒窗、相鄰兩筆共用 90% 原始資料」是同一類
    陷阱，`effective_sample_count()` 就是為了不讓它被忘記而存在。
+
+   （口述是「約 15 分鐘」，2026-06 實測 62 個 tag、14 天，變動間隔的中位數
+   是 10.2 分鐘，故以實測為準。匯出檔的列間隔是 1 分鐘，不是 2 分鐘。）
+
+5. **不是每個 tag 都會動。** 實測有不少 tag 在整段期間完全不變（恆為 0、
+   定值、或只變幾次）。「值多久變一次」同時混了「系統多久刷新」與「訊號
+   本身變得多勤」，所以刷新週期只由持續變動的 tag 來估（`profile_tag`、
+   `estimate_refresh_minutes`）；完全不變的 tag 要人判斷是關機、定頻運轉，
+   還是訊號凍結失效。
+
+6. **tag 與設備是多對多。** 一台馬達的驅動端（M1）與非驅動端（M2）是兩個量測
+   點，卻共用同一組電流與頻率 tag。
 """
 
 from __future__ import annotations
@@ -47,6 +59,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -66,9 +79,25 @@ DEFAULT_UNITS: dict[str, str] = {
 #: 振動端的時間是 naive 當地時間，SCADA 必須對齊到同一個時鐘。
 PLANT_TZ = 'Asia/Taipei'
 
-#: SCADA 值的實際刷新週期（分鐘）。檔案裡約每 2 分鐘一列，但連續數列是
-#: 同一個值，真正的更新大約 15 分鐘一次（使用者確認）。
-SCADA_REFRESH_MINUTES = 15.0
+#: SCADA 值的實際刷新週期（分鐘）。
+#: 原本依口述訂 15 分鐘；2026-06 實測（62 個 tag、14 天）變動間隔的中位數
+#: 是 10.2 分鐘，頻繁變動的 tag 幾乎都落在 10.1–10.3，故改為 10。
+#: 檔案本身是每分鐘一列，但值每 10 分鐘左右才真的更新一次，連續數列
+#: 是同一個值——有效獨立樣本以此換算，不是以列數。
+SCADA_REFRESH_MINUTES = 10.0
+
+#: `probe` 判斷「實測刷新週期是否與程式假設相符」的相對容忍度。
+#: 用相對值而不是絕對差：先前用「差距超過 5 分鐘」，實測 10.2 對 15 差 4.8
+#: 剛好沒過門檻，於是打了「✓ 相符」——實際差了三分之一。
+REFRESH_TOLERANCE = 0.20
+
+#: 變動次數低於此值的 tag 不拿來估刷新週期，也不歸為「持續變動」。
+ACTIVE_MIN_CHANGES = 50
+
+#: 只有「幾乎每個刷新週期都在變」的 tag 才反映刷新週期本身。變動間隔的
+#: 中位數超過此值（分鐘）代表值本來就變得慢（例如變頻器頻率設定值幾小時
+#: 才調一次），那量到的是「訊號多久變一次」，不是「系統多久更新一次」。
+REFRESH_PROBE_MAX_GAP_MIN = 30.0
 
 #: 對齊振動資料時，SCADA 值可以「舊到什麼程度」還算數（分鐘）。
 #: 比刷新週期多一些餘裕，但必須有上限——沒有上限的話，SCADA 斷線兩小時
@@ -181,6 +210,9 @@ def parse_tagmap(path: str) -> list[TagMapping]:
 
     out: list[TagMapping] = []
     n_blank = 0          # 範本裡「還沒填」的列：只有 device_id，其餘全空
+    seen_type: dict[str, str] = {}      # 正規化 tag → 第一次出現的型別
+    canonical: dict[str, str] = {}      # 正規化 tag → 第一次出現的寫法
+    seen_link: set[tuple[str, str]] = set()   # (device_id, 正規化 tag)
     for i, row in enumerate(df.to_dict('records'), start=2):   # 2 = 表頭之後第一列
         def _get(col: str) -> str:
             v = row.get(col)
@@ -215,6 +247,28 @@ def parse_tagmap(path: str) -> list[TagMapping]:
                 f"猜錯會讓頻率被當成電流用")
             continue
 
+        # 同一個 tag 對應多台設備是正常的：一台馬達的驅動端（M1）與非驅動端
+        # （M2）是兩個量測點，卻共用同一組電流與頻率。tag 是「訊號」，與設備
+        # 是多對多，所以這裡不把重複的 tag_id 當錯誤。
+        #
+        # 真正要攔的是同一個訊號被填成兩種型別——那不可能同時成立，是填錯。
+        # 判斷用正規化後的鍵（忽略「資料表名|」前綴與大小寫），因為同一個
+        # tag 在不同列可能一個帶前綴、一個沒帶。
+        key = normalize_tag_id(tag_id)
+        if key in seen_type and seen_type[key] != vtype:
+            logger.warning(
+                f"tag 對應表第 {i} 列（{device_id}）把 {tag_id!r} 填成 {vtype!r}，"
+                f"但它在前面已被填成 {seen_type[key]!r}——同一個訊號不可能有兩種"
+                f"型別，略過這一列，請修正對應表")
+            continue
+        seen_type.setdefault(key, vtype)
+        # 同一個訊號在資料庫裡只能有一種寫法，一律沿用第一次出現的
+        tag_id = canonical.setdefault(key, tag_id)
+
+        if (device_id, key) in seen_link:
+            continue                                  # 完全重複的列，靜默去重
+        seen_link.add((device_id, key))
+
         out.append(TagMapping(
             tag_id=tag_id, device_id=device_id, variable_type=vtype,
             unit=_get('unit') or DEFAULT_UNITS.get(vtype),
@@ -223,12 +277,6 @@ def parse_tagmap(path: str) -> list[TagMapping]:
 
     if n_blank:
         logger.info(f"tag 對應表有 {n_blank} 列尚未填寫（只有 device_id），已略過")
-
-    dupes = pd.Series([m.tag_id for m in out])
-    dup_ids = dupes[dupes.duplicated()].unique().tolist()
-    if dup_ids:
-        logger.warning(f"tag 對應表有重複的 tag_id {dup_ids[:5]}——"
-                       f"tag_id 是主鍵，後面的會覆蓋前面的")
     return out
 
 
@@ -402,8 +450,10 @@ def match_readings(readings: pd.DataFrame,
         n_readings_in=len(readings),
         n_readings_matched=len(out),
         matched_tags=tuple(sorted({by_key[k] for k in matched_keys})),
-        unmatched_mappings=tuple(sorted(
-            m.tag_id for m in mappings if m.match_key and m.match_key not in matched_keys)),
+        # 去重：同一個 tag 對應多台設備（M1/M2 共用）時只列一次，否則
+        # 同一個 tag 會在清單裡重複出現而讓人以為填了兩次
+        unmatched_mappings=tuple(sorted({
+            m.tag_id for m in mappings if m.match_key and m.match_key not in matched_keys})),
         unmatched_readings=tuple(sorted(set(readings.loc[~hit, 'tag_id'].astype(str)))),
     )
 
@@ -437,12 +487,90 @@ def describe_match(report: TagMatchReport) -> list[str]:
     return lines
 
 
+@dataclass(frozen=True)
+class TagProfile:
+    """單一 tag 在讀值期間的樣貌。回答「這個訊號到底有沒有在動、動多少」。"""
+    tag_id: str
+    n_rows: int
+    n_changes: int                 # 值與前一列不同的次數
+    median_gap_min: float | None   # 相鄰兩次變動的間隔中位數；變動不足 2 次為 None
+    v_min: float
+    v_p05: float
+    v_median: float
+    v_p95: float
+    v_max: float
+    top_share: float               # 最常出現的那個值佔全部列數的比例
+    kind: str                      # varying / rare / constant_zero / constant_nonzero
+
+    @property
+    def tracks_refresh(self) -> bool:
+        """這個 tag 的變動節奏是否反映系統刷新週期（而非訊號本身變得慢）。"""
+        return (self.kind == 'varying' and self.median_gap_min is not None
+                and self.median_gap_min <= REFRESH_PROBE_MAX_GAP_MIN)
+
+
+def profile_tag(tag_id: str, readings: pd.DataFrame) -> TagProfile:
+    """
+    量一個 tag 的輪廓。`readings` 需含 `ts` 與 `value`，會自行依時間排序。
+
+    **為什麼要分 kind**：「值多久變一次」同時混了兩件事——系統多久刷新、
+    訊號本身變得多勤。對電流這種一直在抖的訊號，變動間隔就是刷新週期；
+    對變頻器頻率這種設定值，可能幾小時才調一次，變動間隔反映的是操作。
+    把兩者混成一個中位數，會把刷新週期估偏，也看不出「這個 tag 其實一直是
+    同一個值」——後者可能是設備關機（電流恆為 0）、變頻器定頻運轉，
+    或者訊號已經凍結失效，三者的處置完全不同。
+    """
+    r = readings.sort_values('ts')
+    v = r['value'].to_numpy(dtype=float)
+    n = len(v)
+    idx = np.flatnonzero(np.diff(v) != 0) + 1          # 值與前一列不同的位置
+    n_changes = int(len(idx))
+
+    median_gap = None
+    if n_changes >= 2:
+        gaps = r['ts'].iloc[idx].diff().dt.total_seconds().dropna() / 60.0
+        median_gap = float(gaps.median())
+
+    distinct = pd.unique(v)
+    if len(distinct) == 1:
+        kind = 'constant_zero' if float(distinct[0]) == 0.0 else 'constant_nonzero'
+    elif n_changes < ACTIVE_MIN_CHANGES:
+        kind = 'rare'
+    else:
+        kind = 'varying'
+
+    top = float(pd.Series(v).value_counts(normalize=True).iloc[0]) if n else 0.0
+    q = np.percentile(v, [5, 50, 95]) if n else (float('nan'),) * 3
+    return TagProfile(
+        tag_id=tag_id, n_rows=n, n_changes=n_changes, median_gap_min=median_gap,
+        v_min=float(np.min(v)) if n else float('nan'), v_p05=float(q[0]),
+        v_median=float(q[1]), v_p95=float(q[2]),
+        v_max=float(np.max(v)) if n else float('nan'),
+        top_share=top, kind=kind)
+
+
+def estimate_refresh_minutes(profiles: list[TagProfile]) -> tuple[float | None, int]:
+    """
+    由各 tag 的輪廓估系統刷新週期。
+
+    只用 `tracks_refresh` 的 tag（持續變動、且變動間隔夠短）——變得慢的
+    訊號量到的是操作節奏，不是刷新週期。取這些 tag 各自中位數的中位數。
+
+    Returns:
+        `(估計值或 None, 實際用了幾個 tag)`。沒有任何 tag 夠格時回 None。
+    """
+    gaps = [p.median_gap_min for p in profiles if p.tracks_refresh]
+    if not gaps:
+        return None, 0
+    return float(np.median(gaps)), len(gaps)
+
+
 def effective_sample_count(n_rows: int, span_minutes: float,
                            refresh_minutes: float = SCADA_REFRESH_MINUTES) -> int:
     """
     把「列數」換算成「有效獨立樣本數」。
 
-    SCADA 檔案約每 2 分鐘一列，但值大約每 15 分鐘才真的更新一次，連續數列
+    SCADA 檔案每分鐘一列，但值大約每 10 分鐘才真的更新一次，連續數列
     是同一個值。直接拿列數當樣本數會高估約 7 倍，任何以它為分母的統計
     （標準差、信心度、分層後每層夠不夠樣本）都會跟著失真。
 

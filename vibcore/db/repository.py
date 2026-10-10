@@ -538,48 +538,75 @@ def find_missing_ingestion(conn: Connection, start_date: date, end_date: date) -
 
 def upsert_tag_mappings(conn: Connection, mappings: list) -> int:
     """
-    寫入／更新 SCADA tag 對應（`vibcore.io.scada.TagMapping` 的清單）。
+    寫入／更新 SCADA tag 與設備的對應（`vibcore.io.scada.TagMapping` 的清單）。
+
+    **tag 與設備是多對多。** 一台馬達的驅動端（M1）與非驅動端（M2）是兩個
+    量測點（兩個 device_id），卻共用同一組電流與頻率 tag，所以同一個
+    tag_id 會對應到多個 device_id。早期版本以 tag_id 為主鍵，一次寫兩列
+    會報 CardinalityViolation、分兩次寫則後寫的覆蓋先寫的——先寫那台的
+    tag 查不到，而且沒有任何錯誤。
+
+    寫入分兩步：先寫訊號本身（`scada_tag`），再寫設備與訊號的連結
+    （`tag_mapping`）。同一個 tag_id 在這批資料裡若被填成不同的
+    variable_type，直接 `ValueError`——同一個訊號不可能既是電流又是頻率，
+    那是填錯，不是該安靜擇一的事。
 
     `device_id` 對不到 `device` 表的列會被外鍵擋下。**這裡刻意不先過濾**
     ——對不到代表對應表的 device_id 拼錯或設備尚未入庫，那是要讓人知道
     的錯誤，不是該安靜跳過的雜訊。呼叫端負責決定要不要先 upsert 設備。
 
+    只做新增與更新，**不會刪掉**資料庫裡已有、但這批資料沒提到的連結。
+
     Returns:
-        寫入的列數。
+        寫入的設備－tag 連結數（已去除重複）。
     """
     if not mappings:
         return 0
-    rows = [(m.tag_id, m.device_id, m.variable_type, m.unit, m.is_active)
-            for m in mappings]
-    sql = """
-        INSERT INTO tag_mapping (tag_id, device_id, variable_type, unit, is_active)
-        VALUES %s
-        ON CONFLICT (tag_id) DO UPDATE SET
-            device_id     = EXCLUDED.device_id,
-            variable_type = EXCLUDED.variable_type,
-            unit          = EXCLUDED.unit,
-            is_active     = EXCLUDED.is_active
-    """
+
+    tags: dict[str, tuple[str, str | None]] = {}
+    for m in mappings:
+        prev = tags.get(m.tag_id)
+        if prev is not None and prev[0] != m.variable_type:
+            raise ValueError(
+                f"tag {m.tag_id!r} 同時被填成 {prev[0]!r} 與 {m.variable_type!r}"
+                f"（設備 {m.device_id}）——同一個訊號不可能有兩種型別，請修正對應表")
+        if prev is None:
+            tags[m.tag_id] = (m.variable_type, m.unit)
+
+    links = {(m.device_id, m.tag_id): m.is_active for m in mappings}
+
+    tag_rows = [(tid, vt, unit) for tid, (vt, unit) in tags.items()]
+    link_rows = [(dev, tid, active) for (dev, tid), active in links.items()]
     with conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=200)
-    return len(rows)
+        execute_values(cur, """
+            INSERT INTO scada_tag (tag_id, variable_type, unit) VALUES %s
+            ON CONFLICT (tag_id) DO UPDATE SET
+                variable_type = EXCLUDED.variable_type,
+                unit          = COALESCE(EXCLUDED.unit, scada_tag.unit)
+        """, tag_rows, page_size=200)
+        execute_values(cur, """
+            INSERT INTO tag_mapping (device_id, tag_id, is_active) VALUES %s
+            ON CONFLICT (device_id, tag_id) DO UPDATE SET
+                is_active = EXCLUDED.is_active
+        """, link_rows, page_size=200)
+    return len(link_rows)
 
 
 def get_tag_mappings(conn: Connection, device_id: str | None = None,
                       variable_type: str | None = None,
                       active_only: bool = True) -> list[dict]:
-    """取出 tag 對應，可依設備與變數型別過濾。"""
-    sql = ["SELECT tag_id, device_id, variable_type, unit, is_active",
-           "FROM tag_mapping WHERE TRUE"]
+    """取出設備與 tag 的對應，可依設備與變數型別過濾。同一個 tag 會隨設備重複出現。"""
+    sql = ["SELECT m.tag_id, m.device_id, t.variable_type, t.unit, m.is_active",
+           "FROM tag_mapping m JOIN scada_tag t ON t.tag_id = m.tag_id WHERE TRUE"]
     params: dict[str, Any] = {}
     if device_id is not None:
-        sql.append("AND device_id = %(device_id)s"); params["device_id"] = device_id
+        sql.append("AND m.device_id = %(device_id)s"); params["device_id"] = device_id
     if variable_type is not None:
-        sql.append("AND variable_type = %(variable_type)s")
+        sql.append("AND t.variable_type = %(variable_type)s")
         params["variable_type"] = variable_type
     if active_only:
-        sql.append("AND is_active")
-    sql.append("ORDER BY device_id, variable_type, tag_id")
+        sql.append("AND m.is_active")
+    sql.append("ORDER BY m.device_id, t.variable_type, m.tag_id")
     with conn.cursor() as cur:
         cur.execute(" ".join(sql), params)
         return [dict(r) for r in cur.fetchall()]
@@ -592,7 +619,7 @@ def bulk_insert_scada(conn: Connection, readings: pd.DataFrame) -> int:
     用 `ON CONFLICT (tag_id, ts) DO UPDATE` 而非先刪後插，理由同
     `bulk_insert_agg`：重新匯入某一段期間要是安全、可重複的操作。
 
-    **對應表沒有的 tag_id 會被外鍵擋下。** 這是刻意的——讀值檔通常涵蓋
+    **`scada_tag` 沒有的 tag_id 會被外鍵擋下。** 這是刻意的——讀值檔通常涵蓋
     整廠上千個 tag，只有對應表列出的那些是我們要的；讓資料庫擋下來，
     比在這裡安靜丟掉更容易發現「對應表漏填」。呼叫端若要先篩，用
     `get_tag_mappings()` 取得清單自行過濾。
@@ -623,9 +650,10 @@ def get_scada(conn: Connection, device_id: str, variable_type: str,
     sql = """
         SELECT s.tag_id, s.ts, s.value
           FROM scada_reading s
+          JOIN scada_tag t   ON t.tag_id = s.tag_id
           JOIN tag_mapping m ON m.tag_id = s.tag_id
          WHERE m.device_id = %(device_id)s
-           AND m.variable_type = %(variable_type)s
+           AND t.variable_type = %(variable_type)s
            AND m.is_active
            AND s.ts >= %(start)s AND s.ts < %(end)s
          ORDER BY s.ts
