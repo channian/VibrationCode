@@ -672,8 +672,8 @@ def test_scada() -> None:
     from vibcore.io.scada import (REFRESH_TOLERANCE, SCADA_REFRESH_MINUTES,
                                   STALENESS_TOLERANCE_MINUTES, attach_to_agg,
                                   effective_sample_count, emit_tagmap_template,
-                                  estimate_refresh_minutes, parse_readings,
-                                  parse_tagmap, profile_tag)
+                                  describe_speed, estimate_refresh_minutes,
+                                  parse_readings, parse_tagmap, profile_tag)
 
     # ── 對應表：範本預填、型別把關 ──────────────────────────
     with tempfile.TemporaryDirectory() as tmp:
@@ -788,6 +788,34 @@ def test_scada() -> None:
     check("變得慢的訊號（頻率設定值）不拿來估刷新週期",
           p_fast.tracks_refresh and not p_slow.tracks_refresh,
           f"fast={p_fast.median_gap_min}, slow={p_slow.median_gap_min}")
+
+    # ── 頻率 tag：只看運轉時，停機不能算成「轉速有變化」 ──────
+    # 一台 40% 時間開機、開機時固定 50 Hz 的泵，含停機的 p5–p95 是 0–50 Hz，
+    # 單看範圍會誤判成變頻調速。這個陷阱就是 describe_speed 存在的原因。
+    n_min = len(minutes)
+    on = np.zeros(n_min, bool)
+    on[:int(n_min * 0.4)] = True
+    p_dutycycle = profile_tag('duty', frame(np.where(on, 50.0, 0.0)))
+    p_vfd = profile_tag('vfd', frame(np.where(on, rng.normal(50, 4, n_min).round(1), 0.0)))
+    p_off = profile_tag('off', frame(np.r_[np.full(n_min - 30, 0.0), np.full(30, 50.0)]))
+    p_small = profile_tag('small', frame(np.where(on, 50.0 + rng.normal(0, 0.3, n_min).round(1), 0.0)))
+
+    note, ok = describe_speed(p_dutycycle)
+    check("40% 時間開機、開機時固定 50 Hz → 定頻，不算有轉速變化",
+          not ok and '定頻' in note, note)
+    check("同一支 tag 含停機的 p5–p95 確實會被 0 拉寬（陷阱真的存在）",
+          p_dutycycle.v_p05 == 0.0 and p_dutycycle.v_p95 == 50.0,
+          f"{p_dutycycle.v_p05}–{p_dutycycle.v_p95}")
+    note, ok = describe_speed(p_vfd)
+    check("開機時轉速真的在變（σ≈4 Hz）→ 有足夠變動", ok and '有變化' in note, note)
+    check("運轉佔比正確（約 40%）", abs(p_vfd.run_share - 0.4) < 0.01, str(p_vfd.run_share))
+    note, ok = describe_speed(p_off)
+    check("幾乎沒開機 → 無從判斷，不給「有變化」", not ok and '沒開機' in note, note)
+    note, ok = describe_speed(p_small)
+    check("運轉時只有 ±0.3 Hz 的抖動 → 變化很小，不值得驗證",
+          not ok and '很小' in note, note)
+    check("整段都是 0 的 tag：沒有運轉統計，不會丟例外",
+          describe_speed(p_zero)[1] is False and p_zero.run_median is None)
 
     est, n_used = estimate_refresh_minutes([p_fast, p_slow, p_zero, p_const, p_rare])
     check("刷新週期只由持續變動的 tag 估出（約 10 分鐘，且只用 1 個 tag）",

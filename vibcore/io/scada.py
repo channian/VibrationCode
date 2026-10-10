@@ -501,6 +501,14 @@ class TagProfile:
     v_max: float
     top_share: float               # 最常出現的那個值佔全部列數的比例
     kind: str                      # varying / rare / constant_zero / constant_nonzero
+    # 以下只看「運轉時」（值 > 0）。頻率 tag 該看的是開機之後轉速變不變，
+    # 含停機的 p5–p95 會被 0 拉開：一台 40% 時間開機、開機時固定 50 Hz 的泵，
+    # 含停機算會顯示「差 50 Hz」，看起來像變頻調速，其實完全沒有轉速變化。
+    run_share: float = 0.0                 # 值 > 0 的列數佔比
+    run_p05: float | None = None
+    run_median: float | None = None
+    run_p95: float | None = None
+    run_top_share: float | None = None     # 運轉時最常見的值佔比
 
     @property
     def tracks_refresh(self) -> bool:
@@ -541,12 +549,52 @@ def profile_tag(tag_id: str, readings: pd.DataFrame) -> TagProfile:
 
     top = float(pd.Series(v).value_counts(normalize=True).iloc[0]) if n else 0.0
     q = np.percentile(v, [5, 50, 95]) if n else (float('nan'),) * 3
+
+    run = v[v > 0]
+    run_kw: dict = {'run_share': float(len(run) / n) if n else 0.0}
+    if len(run):
+        rq = np.percentile(run, [5, 50, 95])
+        run_kw.update(run_p05=float(rq[0]), run_median=float(rq[1]), run_p95=float(rq[2]),
+                      run_top_share=float(pd.Series(run).value_counts(normalize=True).iloc[0]))
     return TagProfile(
         tag_id=tag_id, n_rows=n, n_changes=n_changes, median_gap_min=median_gap,
         v_min=float(np.min(v)) if n else float('nan'), v_p05=float(q[0]),
         v_median=float(q[1]), v_p95=float(q[2]),
         v_max=float(np.max(v)) if n else float('nan'),
-        top_share=top, kind=kind)
+        top_share=top, kind=kind, **run_kw)
+
+
+#: 運轉時轉速變動的篩選門檻：p5–p95 相對中位數的比例。
+#: **這是篩選，不是結論。** 轉速變 5% 時振動速度大約跟著變個一成上下，
+#: 與一般設備的日常波動同量級，再小就很難從雜訊裡分辨；真正的判斷要看
+#: `validate.speed_effect`（轉速變了，velRMS 有沒有跟著變）。
+SPEED_VARIATION_MIN_PCT = 5.0
+
+#: 運轉時最常見的值佔比超過此值，視為「運轉時轉速固定」。
+SPEED_FIXED_TOP_SHARE = 0.9
+
+#: 運轉佔比低於此值，視為「這段期間幾乎沒開機」，無從判斷。
+SPEED_MIN_RUN_SHARE = 0.05
+
+
+def describe_speed(p: TagProfile) -> tuple[str, bool]:
+    """
+    頻率 tag 的白話說明，以及「轉速變動夠不夠大、值不值得進一步驗證」。
+
+    只看運轉時（值 > 0）的變動，停機不算轉速變化。
+
+    Returns:
+        `(說明, 是否有足夠的轉速變動)`。
+    """
+    if p.run_share < SPEED_MIN_RUN_SHARE or p.run_median is None:
+        return (f'幾乎沒開機（運轉僅 {p.run_share * 100:.0f}%）', False)
+    span = (p.run_p95 or 0.0) - (p.run_p05 or 0.0)
+    pct = span / p.run_median * 100.0 if p.run_median else 0.0
+    if p.run_top_share is not None and p.run_top_share > SPEED_FIXED_TOP_SHARE:
+        return (f'運轉時定頻（{p.run_median:.1f} Hz，{p.run_top_share * 100:.0f}% 的時間）', False)
+    if pct < SPEED_VARIATION_MIN_PCT:
+        return (f'運轉時變化很小（差 {span:.1f} Hz，{pct:.0f}%）', False)
+    return (f'運轉時有變化（差 {span:.1f} Hz，{pct:.0f}%）', True)
 
 
 def estimate_refresh_minutes(profiles: list[TagProfile]) -> tuple[float | None, int]:

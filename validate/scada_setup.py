@@ -35,7 +35,7 @@ import pandas as pd
 from vibcore.io.analytic_reader import _ENCODINGS
 from vibcore.io.scada import (ACTIVE_MIN_CHANGES, REFRESH_TOLERANCE,
                               SCADA_REFRESH_MINUTES, VARIABLE_TYPES,
-                              describe_match, effective_sample_count,
+                              describe_match, describe_speed, effective_sample_count,
                               emit_tagmap_template, estimate_refresh_minutes,
                               match_readings, parse_readings, parse_tagmap,
                               profile_tag)
@@ -252,22 +252,24 @@ def cmd_probe(args) -> int:
         print('    · 頻率恆為非零 → 變頻器定頻運轉，**沒有轉速變化可供分層**')
         print('    · 電流恆為非零且完全不動 → 訊號可能凍結失效，要回頭查 tag 是否正確')
 
-    # ── 3. 頻率 tag：能不能拿來分層，看變動範圍 ────────────────
+    # ── 3. 頻率 tag：能不能拿來分層，只看「運轉時」的變動 ───────
     freq = [p for p in profiles if vtype_of.get(p.tag_id) == 'frequency']
     if freq:
-        print(f'\n頻率 tag 的變動範圍（{len(freq)} 個）——這決定分層是不是在解真問題：')
-        print(f'  {"tag":36s} {"p5":>7s} {"中位":>7s} {"p95":>7s} {"最常見值佔比":>12s}  狀況')
-        print('  ' + '-' * 88)
-        for p in sorted(freq, key=lambda x: x.tag_id):
-            span = p.v_p95 - p.v_p05
-            if p.kind in ('constant_zero', 'constant_nonzero'):
-                note = '定值，無法分層'
-            elif span < 1.0 or p.top_share > 0.9:
-                note = '變化很小，分層意義不大'
+        rows = [(p, *describe_speed(p)) for p in sorted(freq, key=lambda x: x.tag_id)]
+        n_ok = sum(1 for _, _, ok in rows if ok)
+        print(f'\n頻率 tag 的轉速變動（{len(freq)} 個）——只看運轉時（> 0 Hz），'
+              f'停機不算轉速變化：')
+        print(f'  {"tag":34s} {"運轉佔比":>8s} {"p5":>6s} {"中位":>6s} {"p95":>6s}  說明')
+        print('  ' + '-' * 90)
+        for p, note, ok in rows:
+            if p.run_median is None:
+                cells = f'{"—":>6s} {"—":>6s} {"—":>6s}'
             else:
-                note = f'有變化（p5–p95 差 {span:.1f} Hz）'
-            print(f'  {_short(p.tag_id):36s} {p.v_p05:7.1f} {p.v_median:7.1f} '
-                  f'{p.v_p95:7.1f} {p.top_share * 100:11.0f}%  {note}')
+                cells = f'{p.run_p05:6.1f} {p.run_median:6.1f} {p.run_p95:6.1f}'
+            mark = '★ ' if ok else '  '
+            print(f'{mark}{_short(p.tag_id):34s} {p.run_share * 100:7.0f}% {cells}  {note}')
+        print(f'\n  ★ = 運轉時轉速有足夠變動、值得進一步驗證：{n_ok} / {len(freq)} 個 tag')
+        print('    （這是篩選。轉速變了、振動有沒有跟著變，要用 validate.speed_effect 驗。）')
 
     # ── 4. 刷新週期：只用變動節奏反映系統刷新的 tag 來估 ─────────
     est, n_used = estimate_refresh_minutes(profiles)
