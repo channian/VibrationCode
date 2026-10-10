@@ -1010,7 +1010,8 @@ def test_speed_effect() -> None:
     import tempfile
 
     from validate.speed_effect import (MAX_INHOUR_FREQ_RANGE, MIN_PAIRED_HOURS,
-                                       analyze_pair, hourly_frequency, run)
+                                       analyze_pair, floor_to_hour, hourly_frequency, run)
+    from vibcore.io.analytic_reader import parse_datetime
 
     rng = np.random.default_rng(7)
     hours = pd.date_range('2026-06-01', periods=14 * 24, freq='h')
@@ -1060,12 +1061,14 @@ def test_speed_effect() -> None:
         write_vib(os.path.join(vdir, 'd.csv'), '冰水泵 D', 1.0 + 0.05 * day + rng.normal(0, 0.10, n_h))
         write_vib(os.path.join(vdir, 'e1.csv'), 'PUMP E_M1', 1.2 + 0.08 * (f_e - 50) + rng.normal(0, 0.12, n_h))
         write_vib(os.path.join(vdir, 'e2.csv'), 'PUMP E_M2', 0.9 + 0.06 * (f_e - 50) + rng.normal(0, 0.10, n_h))
+        write_vib(os.path.join(vdir, 'idle.csv'), 'PUMP IDLE', np.full(n_h, 0.02))
 
         pd.DataFrame([
             ('PUMP A', 'FACC|T_A'), ('PUMP B', 'FACC|T_B'), ('PUMP C', 'FACC|T_C'),
             ('冰水泵 D', 'FACC|T_D'),
             ('PUMP E_M1', 'FACC|T_E'), ('PUMP E_M2', 'FACC|T_E'),    # M1/M2 共用同一個頻率 tag
             ('PUMP GHOST', 'FACC|T_A'),                              # 振動資料裡沒有這台
+            ('PUMP IDLE', 'FACC|T_C'),                               # 有這台，但整段沒運轉
         ], columns=['device_id', 'tag_id']).assign(
             variable_type='frequency', unit='Hz', is_active='TRUE', note=''
         ).to_csv(os.path.join(tmp, 'tagmap.csv'), index=False, encoding='utf-8-sig')
@@ -1098,6 +1101,12 @@ def test_speed_effect() -> None:
     check("中文設備名＋cp950 檔案能讀、能對上對應表", '冰水泵 D' in v)
     check("對應表有、振動資料沒有的設備明確列出（不是默默少一列）",
           info['map_only'] == ['PUMP GHOST'], str(info['map_only']))
+    # 篩選下推（先濾設備與運轉門檻、再解析時間）之後，表裡只剩有運轉的設備；
+    # 若不另外記檔內出現過的設備名，「名稱對不上」與「沒運轉」會混成一種訊息。
+    check("名稱對得上但整段沒運轉的設備，歸在 no_running，不算名稱對不上",
+          info['no_running'] == ['PUMP IDLE'] and 'PUMP IDLE' not in info['map_only'],
+          f"no_running={info['no_running']}, map_only={info['map_only']}")
+    check("沒運轉的設備不會出現在結果表", 'PUMP IDLE' not in v)
 
     # 前 7 天沒有 SCADA：配對小時數只剩約一半。若沿用過期值硬配，會是 336。
     check("SCADA 斷線的 7 天不被補上（嚴格同小時，不沿用前值）",
@@ -1114,6 +1123,48 @@ def test_speed_effect() -> None:
     check("小時內 40→60 Hz 的跳動被標出（(max−min)/中位數 ≫ 門檻）",
           hf['inhour_range'].iloc[0] > MAX_INHOUR_FREQ_RANGE, str(hf['inhour_range'].iloc[0]))
     check("穩定的小時不被標", hf['inhour_range'].iloc[1] < MAX_INHOUR_FREQ_RANGE)
+
+    # ── 單元：貼著下限／上限轉速運轉的變頻泵 ──────────────
+    # 實測（2026-06～08）CHP08、CHP09 有七成以上時間在 45 Hz 下限、CWP03 大多在
+    # 60 Hz 上限。此時第 25 與第 75 百分位同值，若仍用四分位切，其中一組是空的，
+    # 會把明明有變頻、velRMS 也確實隨轉速變的泵判成「轉速沒變」。
+    rng2 = np.random.default_rng(3)
+    n2 = 1500
+    t2 = pd.date_range('2026-06-01', periods=n2, freq='h')
+
+    def clamped(f):
+        return pd.DataFrame({'ts_hour': t2, 'freq': f,
+                             'vel': 1.5 + 0.10 * (f - 50) + rng2.normal(0, 0.15, n2)})
+
+    floor80 = np.where(rng2.random(n2) < 0.8, 45.0, rng2.uniform(46, 60, n2).round(1))
+    ceil80 = np.where(rng2.random(n2) < 0.8, 60.0, rng2.uniform(52, 59.9, n2).round(1))
+    r_floor, r_ceil = analyze_pair(clamped(floor80)), analyze_pair(clamped(ceil80))
+    check("80% 時間貼在下限轉速、velRMS 隨轉速上升 → 比較得出來（不是 no_variation）",
+          r_floor['verdict'] in ('material', 'moderate') and r_floor['shift_sigma'] > 0,
+          str((r_floor['verdict'], r_floor.get('n_low'), r_floor.get('n_high'))))
+    check("80% 時間貼在上限轉速 → 同樣比較得出來",
+          r_ceil['verdict'] in ('material', 'moderate') and r_ceil['n_low'] > 0 and r_ceil['n_high'] > 0,
+          str((r_ceil['verdict'], r_ceil.get('n_low'), r_ceil.get('n_high'))))
+    check("貼底案例的低轉速組是「貼底那一群」、高轉速組是「高於它」",
+          r_floor['n_low'] > r_floor['n_high'] > 0, f"{r_floor['n_low']}/{r_floor['n_high']}")
+    check("真正全程定頻仍判 no_variation（修正沒有把它放過）",
+          analyze_pair(clamped(np.full(n2, 50.0)))['verdict'] == 'no_variation')
+
+    # ── 單元：時間快速路徑與正式管線的 parse_datetime 一致 ──
+    ts_ok = pd.Series(['2026/06/01 08:05:03', '2026/06/01 08:59:59', '2026/06/02 00:00:00',
+                       '2026-06-02 23:30:30'])
+    check("快速路徑：斜線／連字號格式的整點結果與 parse_datetime 相同",
+          (floor_to_hour(ts_ok).reset_index(drop=True)
+           == parse_datetime(ts_ok).dt.floor('h')).all())
+    ts_odd = pd.Series(['2026/6/1 8:05:03', '2026/6/1 9:10:00'])      # 沒補零 → 必須退回
+    check("格式不是預期的（沒補零）→ 退回 parse_datetime，結果仍正確",
+          (floor_to_hour(ts_odd).reset_index(drop=True)
+           == parse_datetime(ts_odd).dt.floor('h')).all()
+          and floor_to_hour(ts_odd).notna().all())
+    ts_mixed = pd.Series(['2026/06/01 08:05:03', 'garbage'])          # 混了壞值 → 退回、壞值為 NaT
+    out_m = floor_to_hour(ts_mixed)
+    check("含無法解析的列時退回完整解析，壞值成 NaT 而不是整批失敗",
+          out_m.iloc[0] == pd.Timestamp('2026-06-01 08:00') and pd.isna(out_m.iloc[1]))
 
     # ── 單元：樣本不足時不下結論 ─────────────────────
     few = pd.DataFrame({'ts_hour': pd.date_range('2026-06-01', periods=MIN_PAIRED_HOURS - 1, freq='h'),

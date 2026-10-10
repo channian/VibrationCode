@@ -57,7 +57,7 @@ import numpy as np
 import pandas as pd
 
 from validate.iso_readiness import _sniff
-from vibcore.io.analytic_reader import parse_datetime
+from vibcore.io.analytic_reader import _YEAR_MAX, _YEAR_MIN, parse_datetime
 from vibcore.io.scada import (SPEED_VARIATION_MIN_PCT, match_readings,
                               parse_readings, parse_tagmap)
 
@@ -99,7 +99,35 @@ def _time_col(cols: list[str]) -> str | None:
     return None
 
 
-def hourly_vibration(path: str) -> pd.DataFrame:
+_HOUR_KEY = r'\d{4}-\d{2}-\d{2}[ T]\d{2}'
+
+
+def floor_to_hour(raw: pd.Series, source: str = '') -> pd.Series:
+    """
+    時間字串 → 該小時整點。結果與 `parse_datetime(...).dt.floor('h')` 相同，
+    但對逐秒資料快得多。
+
+    逐秒檔的時間字串每列都不同，逐列解析是最大的成本（數百萬列、每列一次
+    正規化與解析）；而我們只需要「哪一小時」。所以取前 13 個字元
+    （`YYYY-MM-DD HH`），只解析其中**不重複**的值（80 天也不過 1,920 個）再對回去。
+
+    **前 13 字元不是預期格式時**（沒補零的月日時、AM/PM、前導空白等），整批退回
+    `parse_datetime`，行為與正式管線一致，並照常警告無法解析或年份異常的列
+    ——快速路徑只是加速，不改變能讀與不能讀的範圍。
+    """
+    key = raw.astype(str).str.replace('/', '-', regex=False).str.slice(0, 13)
+    if len(key) and key.str.fullmatch(_HOUR_KEY).all():
+        uniq = key.unique()
+        parsed = pd.to_datetime(pd.Series(uniq).str.replace('T', ' ', regex=False),
+                                format='%Y-%m-%d %H', errors='coerce')
+        if parsed.notna().all() and parsed.dt.year.between(_YEAR_MIN, _YEAR_MAX).all():
+            return key.map(dict(zip(uniq, parsed)))
+    return parse_datetime(raw, source).dt.floor('h')
+
+
+def hourly_vibration(path: str, devices: set[str] | None = None,
+                     since: pd.Timestamp | None = None,
+                     until: pd.Timestamp | None = None) -> tuple[pd.DataFrame, set[str]]:
     """
     讀一個 Analytic CSV，直接壓成每小時 velRMS 中位數。
 
@@ -108,10 +136,15 @@ def hourly_vibration(path: str) -> pd.DataFrame:
     只取運轉中（velRMS > 門檻）的樣本——停機時的 velRMS 接近 0，混進來
     會讓「低轉速」其實只是「停機」。
 
+    `devices` 給定時，只處理這些設備的列；**在解析時間之前**就先用設備名與
+    運轉門檻篩列。全廠 66 台裡只有十幾台有頻率 tag，其餘不必花時間解析。
+
     Returns:
-        欄位 `device_id, ts_hour, vel, n_rows`；讀不了回空表。
+        `(每小時表, 檔內出現過的設備名)`。表的欄位為 `device_id, ts_hour, vel, n_rows`，
+        讀不了回空表。**設備名單獨回傳**，是因為篩選之後表裡只剩有運轉的設備，
+        看不出「名稱對不上」與「那段期間沒運轉」的差別——兩者的處置完全不同。
     """
-    empty = pd.DataFrame(columns=['device_id', 'ts_hour', 'vel', 'n_rows'])
+    empty = (pd.DataFrame(columns=['device_id', 'ts_hour', 'vel', 'n_rows']), set())
     sniffed = _sniff(path)
     if sniffed is None:
         return empty
@@ -121,44 +154,63 @@ def hourly_vibration(path: str) -> pd.DataFrame:
         logger.warning(f"{os.path.basename(path)} 缺少 Name / 時間 / velRMS 欄，略過")
         return empty
     try:
-        df = pd.read_csv(path, sep=sep, usecols=[tcol, 'Name', 'velRMS'], encoding=enc)
+        df = pd.read_csv(path, sep=sep, usecols=[tcol, 'Name', 'velRMS'], encoding=enc,
+                         dtype={'Name': 'category', tcol: str})
     except Exception as e:
         logger.warning(f"{os.path.basename(path)} 讀取失敗（{type(e).__name__}: {e}），略過")
         return empty
 
-    df['ts'] = parse_datetime(df[tcol], os.path.basename(path))
-    df['vel'] = pd.to_numeric(df['velRMS'], errors='coerce')
-    df['device_id'] = df['Name'].astype(str).str.strip()
-    df = df.dropna(subset=['ts', 'vel'])
-    df = df[df['vel'] > VEL_RUNNING_THRESHOLD]
-    if df.empty:
+    names = {str(c).strip() for c in df['Name'].cat.categories}
+    empty = (empty[0], names)
+
+    # Name 是 category：先對「類別」（個位數）做 strip 與比對，不對每一列做
+    vel = pd.to_numeric(df['velRMS'], errors='coerce')
+    mask = vel > VEL_RUNNING_THRESHOLD
+    if devices is not None:
+        keep = [c for c in df['Name'].cat.categories if str(c).strip() in devices]
+        mask &= df['Name'].isin(keep)
+    if not mask.any():
         return empty
 
-    df['ts_hour'] = df['ts'].dt.floor('h')
-    out = (df.groupby(['device_id', 'ts_hour'])['vel']
+    sub = pd.DataFrame({
+        'device_id': df.loc[mask, 'Name'].astype(str).str.strip(),
+        'vel': vel[mask],
+        'ts_hour': floor_to_hour(df.loc[mask, tcol], os.path.basename(path)),
+    }).dropna(subset=['ts_hour'])
+    if since is not None:
+        sub = sub[sub['ts_hour'] >= since]
+    if until is not None:
+        sub = sub[sub['ts_hour'] < until]
+    if sub.empty:
+        return empty
+
+    out = (sub.groupby(['device_id', 'ts_hour'])['vel']
            .agg(vel='median', n_rows='size').reset_index())
-    return out[out['n_rows'] >= MIN_VIB_ROWS_PER_HOUR].reset_index(drop=True)
+    return out[out['n_rows'] >= MIN_VIB_ROWS_PER_HOUR].reset_index(drop=True), names
 
 
 def load_vibration(data_dir: str, pattern: str = '*.csv',
-                   since: str | None = None, until: str | None = None) -> pd.DataFrame:
+                   since: str | None = None, until: str | None = None,
+                   devices: set[str] | None = None) -> tuple[pd.DataFrame, set[str]]:
+    """Returns `(每小時表, 所有檔案裡出現過的設備名)`。"""
     paths = sorted(glob.glob(os.path.join(data_dir, pattern)))
+    cols = ['device_id', 'ts_hour', 'vel', 'n_rows']
     if not paths:
         logger.error(f"{data_dir} 找不到符合 {pattern} 的檔案")
-        return pd.DataFrame(columns=['device_id', 'ts_hour', 'vel', 'n_rows'])
-    frames = [f for f in (hourly_vibration(p) for p in paths) if not f.empty]
+        return pd.DataFrame(columns=cols), set()
+    t0 = pd.Timestamp(since) if since else None
+    t1 = pd.Timestamp(until) + pd.Timedelta(days=1) if until else None
+    results = [hourly_vibration(p, devices, t0, t1) for p in paths]
+    all_names = set().union(*(n for _, n in results))
+    frames = [f for f, _ in results if not f.empty]
     if not frames:
-        return pd.DataFrame(columns=['device_id', 'ts_hour', 'vel', 'n_rows'])
+        return pd.DataFrame(columns=cols), all_names
     v = pd.concat(frames, ignore_index=True)
     # 同一台設備可能分在多個檔案、小時邊界重疊；合併時以樣本數加權取中位數
     # 不嚴謹，這裡取樣本數較多的那筆即可（重疊只發生在檔案交界的單一小時）。
     v = (v.sort_values('n_rows').drop_duplicates(['device_id', 'ts_hour'], keep='last')
          .sort_values(['device_id', 'ts_hour']).reset_index(drop=True))
-    if since:
-        v = v[v['ts_hour'] >= pd.Timestamp(since)]
-    if until:
-        v = v[v['ts_hour'] < pd.Timestamp(until) + pd.Timedelta(days=1)]
-    return v.reset_index(drop=True)
+    return v, all_names
 
 
 def hourly_frequency(readings: pd.DataFrame) -> pd.DataFrame:
@@ -193,6 +245,34 @@ def _spearman(a: pd.Series, b: pd.Series) -> float:
     return float(a.corr(b, method='spearman'))
 
 
+def _split_low_high(f: pd.Series, v: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """
+    依轉速把 velRMS 分成「低轉速組」與「高轉速組」。
+
+    一般情形取最低與最高四分位。但變頻泵常**貼著下限或上限轉速運轉**
+    （實測 CHP08、CHP09 有七成以上的時間在 45 Hz 下限，CWP03 大多在 60 Hz
+    上限），這時第 25 與第 75 百分位是同一個值，四分位切法會讓其中一組
+    變空，把明明有變頻的泵判成「轉速沒變」。此時改成：
+
+    · 眾數兩側都有足夠樣本 → 比較眾數以下與眾數以上（眾數本身不入任一組）
+    · 只有上側夠（貼下限）→ 比較「眾數」與「眾數以上」
+    · 只有下側夠（貼上限）→ 比較「眾數以下」與「眾數」
+    """
+    q25, q75 = np.percentile(f, [25, 75])
+    if q25 != q75:
+        return v[f <= q25], v[f >= q75]
+
+    m = q25
+    below, at, above = v[f < m], v[f == m], v[f > m]
+    if len(below) >= MIN_GROUP_HOURS and len(above) >= MIN_GROUP_HOURS:
+        return below, above
+    if len(above) >= MIN_GROUP_HOURS:
+        return at, above
+    if len(below) >= MIN_GROUP_HOURS:
+        return below, at
+    return below, above        # 都不夠：呼叫端會判 no_variation
+
+
 def analyze_pair(paired: pd.DataFrame) -> dict:
     """
     單一 (設備, 頻率 tag) 的配對資料 → 統計量與判定。
@@ -215,11 +295,7 @@ def analyze_pair(paired: pd.DataFrame) -> dict:
         res['verdict'] = 'no_variation'
         return res
 
-    q25, q75 = np.percentile(f, [25, 75])
-    if q25 == q75:        # 設定值離散、中間一大塊同一個值：取兩側
-        low, high = v[f < q25], v[f > q75]
-    else:
-        low, high = v[f <= q25], v[f >= q75]
+    low, high = _split_low_high(f, v)
     res.update(n_low=int(len(low)), n_high=int(len(high)))
     if len(low) < MIN_GROUP_HOURS or len(high) < MIN_GROUP_HOURS:
         res['verdict'] = 'no_variation'
@@ -277,22 +353,26 @@ def run(data_dir: str, tagmap_path: str, readings_path: str, pattern: str = '*.c
     if until:
         freq_h = freq_h[freq_h['ts_hour'] < pd.Timestamp(until) + pd.Timedelta(days=1)]
 
-    vib = load_vibration(data_dir, pattern, since, until)
+    vib, seen = load_vibration(data_dir, pattern, since, until,
+                               devices={m.device_id for m in mappings})
 
-    vib_devices = set(vib['device_id'].unique()) if not vib.empty else set()
+    running = set(vib['device_id'].unique()) if not vib.empty else set()
     map_devices = {m.device_id for m in mappings}
     info = {
-        'n_vib_devices': len(vib_devices),
+        'n_vib_devices': len(seen),
         'n_map_devices': len(map_devices),
-        'map_only': sorted(map_devices - vib_devices),
-        'vib_only': sorted(vib_devices - map_devices),
+        # 名稱對不上（振動檔裡根本沒有這個設備名）
+        'map_only': sorted(map_devices - seen),
+        # 對得上，但指定期間沒有任何運轉小時（停機／備機，或期間內沒資料）
+        'no_running': sorted((map_devices & seen) - running),
+        'vib_only': sorted(seen - map_devices),
         'n_freq_tags': len({m.tag_id for m in mappings}),
     }
 
     rows = []
     # 對應表記錄的是 mapping 側的 tag_id；match_readings 已把讀值改寫成同一種寫法
     for m in sorted(mappings, key=lambda x: (x.device_id, x.tag_id)):
-        if m.device_id not in vib_devices:
+        if m.device_id not in running:
             continue
         fh = freq_h[freq_h['tag_id'] == m.tag_id]
         fh = fh[(fh['freq'] > 0) & ~(fh['inhour_range'] > MAX_INHOUR_FREQ_RANGE)]
@@ -332,6 +412,10 @@ def report(df: pd.DataFrame, info: dict) -> None:
         print(f"\n⚠ 對應表有、但振動資料找不到的設備（{len(info['map_only'])}）："
               f"{info['map_only'][:8]}{' …' if len(info['map_only']) > 8 else ''}")
         print('  → 多半是 device_id 寫法與振動檔 Name 欄不一致（大小寫、空白、M1/M2 後綴）')
+    if info['no_running']:
+        print(f"ℹ 名稱對得上、但指定期間沒有任何運轉小時的設備（{len(info['no_running'])}）："
+              f"{info['no_running'][:8]}{' …' if len(info['no_running']) > 8 else ''}")
+        print('  → 停機或備機，或振動資料沒涵蓋這段期間；不是名稱問題')
     if info['vib_only']:
         print(f"ℹ 振動資料有、但對應表沒有頻率 tag 的設備：{len(info['vib_only'])} 台"
               f"（定頻設備本來就可能沒填，不一定是漏）")
