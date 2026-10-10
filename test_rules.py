@@ -927,8 +927,126 @@ def test_scada() -> None:
 # 台帳補填：CSV 範本與匯入（D1）
 # ──────────────────────────────────────────────────────────
 
+def test_speed_effect() -> None:
+    print("\n[11] 轉速對 velRMS 的影響（validate.speed_effect）")
+
+    import tempfile
+
+    from validate.speed_effect import (MAX_INHOUR_FREQ_RANGE, MIN_PAIRED_HOURS,
+                                       analyze_pair, hourly_frequency, run)
+
+    rng = np.random.default_rng(7)
+    hours = pd.date_range('2026-06-01', periods=14 * 24, freq='h')
+    n_h = len(hours)
+    day = np.arange(n_h) // 24
+
+    def scada_rows(tag, freq_h, skip=None):
+        rows = []
+        for i, (h, f) in enumerate(zip(hours, freq_h)):
+            if skip is not None and skip(i):
+                continue
+            for m in range(0, 60, 10):
+                rows.append((tag, (h + pd.Timedelta(minutes=m + 2)).strftime('%Y-%m-%d %H:%M:%S'),
+                             f + rng.normal(0, 0.05)))
+        return rows
+
+    def write_vib(path, name, vel_h):
+        rows = [(name, (h + pd.Timedelta(minutes=m + 3)).strftime('%Y/%m/%d %H:%M:%S'),
+                 v + rng.normal(0, 0.01))
+                for h, v in zip(hours, vel_h) for m in range(0, 60, 10)]
+        df = pd.DataFrame(rows, columns=['Name', 'Time', 'velRMS'])
+        for i in range(3):          # 真檔有數百欄；這裡補到 _sniff 要求的欄數
+            df[f'pad{i}'] = 0.0
+        # 現場匯出檔是 cp950 + TAB；設備名含中文，驗證編碼路徑
+        df.to_csv(path, sep='\t', index=False, encoding='cp950')
+
+    f_a = rng.uniform(42, 58, n_h).round(1)
+    f_e = rng.uniform(42, 58, n_h).round(1)
+    f_d = 45 + 10 * day / 13 + rng.normal(0, 0.3, n_h)       # 緩慢爬升，日內幾乎不動
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vdir = os.path.join(tmp, 'vib')
+        os.makedirs(vdir)
+        readings = []
+        # A 的 SCADA 前 7 天斷線：不得被前面的值（或之後的值）補上
+        readings += scada_rows('T_A', f_a, skip=lambda i: i < 7 * 24)
+        readings += scada_rows('T_B', rng.uniform(42, 58, n_h).round(1))
+        readings += scada_rows('T_C', np.full(n_h, 60.0))
+        readings += scada_rows('T_D', f_d)
+        readings += scada_rows('T_E', f_e)
+        pd.DataFrame(readings, columns=['TAGNAME', 'DATETIME', 'VALUE']).to_csv(
+            os.path.join(tmp, 'scada.csv'), index=False)
+
+        write_vib(os.path.join(vdir, 'a.csv'), 'PUMP A', 1.5 + 0.10 * (f_a - 50) + rng.normal(0, 0.15, n_h))
+        write_vib(os.path.join(vdir, 'b.csv'), 'PUMP B', 2.0 + rng.normal(0, 0.15, n_h))
+        write_vib(os.path.join(vdir, 'c.csv'), 'PUMP C', 1.5 + rng.normal(0, 0.15, n_h))
+        write_vib(os.path.join(vdir, 'd.csv'), '冰水泵 D', 1.0 + 0.05 * day + rng.normal(0, 0.10, n_h))
+        write_vib(os.path.join(vdir, 'e1.csv'), 'PUMP E_M1', 1.2 + 0.08 * (f_e - 50) + rng.normal(0, 0.12, n_h))
+        write_vib(os.path.join(vdir, 'e2.csv'), 'PUMP E_M2', 0.9 + 0.06 * (f_e - 50) + rng.normal(0, 0.10, n_h))
+
+        pd.DataFrame([
+            ('PUMP A', 'FACC|T_A'), ('PUMP B', 'FACC|T_B'), ('PUMP C', 'FACC|T_C'),
+            ('冰水泵 D', 'FACC|T_D'),
+            ('PUMP E_M1', 'FACC|T_E'), ('PUMP E_M2', 'FACC|T_E'),    # M1/M2 共用同一個頻率 tag
+            ('PUMP GHOST', 'FACC|T_A'),                              # 振動資料裡沒有這台
+        ], columns=['device_id', 'tag_id']).assign(
+            variable_type='frequency', unit='Hz', is_active='TRUE', note=''
+        ).to_csv(os.path.join(tmp, 'tagmap.csv'), index=False, encoding='utf-8-sig')
+
+        res, info = run(vdir, os.path.join(tmp, 'tagmap.csv'), os.path.join(tmp, 'scada.csv'))
+
+    v = {r['device_id']: r for _, r in res.iterrows()}
+
+    check("速度與轉速正相關（vel ≈ 0.1×Δf）→ material 且 shift_σ 為正",
+          v['PUMP A']['verdict'] == 'material' and v['PUMP A']['shift_sigma'] > 2.5,
+          str(v['PUMP A'].to_dict()))
+    check("轉速在變、velRMS 完全無關 → minor（不能因為「有變動」就判有影響）",
+          v['PUMP B']['verdict'] == 'minor' and abs(v['PUMP B']['shift_sigma']) < 1.0,
+          str(v['PUMP B'].to_dict()))
+    check("運轉時定頻 → no_variation，不是 minor（量不到不等於沒影響）",
+          v['PUMP C']['verdict'] == 'no_variation', str(v['PUMP C'].to_dict()))
+    # 這項是整支工具最重要的防線：頻率與 velRMS 同時緩慢爬升，高低頻組之間
+    # 差距很大（shift_σ 輕易 > 2.5），但同一天之內毫無關係。若算成 material，
+    # 「值得分層的設備數」會被趨勢灌水。
+    check("兩者各自緩慢爬升（跨日趨勢）→ confounded，不計入 material",
+          v['冰水泵 D']['verdict'] == 'confounded' and bool(v['冰水泵 D']['trend_suspect']),
+          str({k: v['冰水泵 D'][k] for k in ('verdict', 'rho', 'rho_day', 'shift_sigma')}))
+    check("該趨勢案例的跨日 rho 很高、日內 rho_day 接近 0",
+          v['冰水泵 D']['rho'] > 0.8 and abs(v['冰水泵 D']['rho_day']) < 0.15,
+          f"rho={v['冰水泵 D']['rho']:.2f}, rho_day={v['冰水泵 D']['rho_day']:.2f}")
+    check("M1/M2 共用同一個頻率 tag，兩台各自有結果（不是只剩一台）",
+          'PUMP E_M1' in v and 'PUMP E_M2' in v
+          and v['PUMP E_M1']['verdict'] == v['PUMP E_M2']['verdict'] == 'material',
+          f"{sorted(v)}")
+    check("中文設備名＋cp950 檔案能讀、能對上對應表", '冰水泵 D' in v)
+    check("對應表有、振動資料沒有的設備明確列出（不是默默少一列）",
+          info['map_only'] == ['PUMP GHOST'], str(info['map_only']))
+
+    # 前 7 天沒有 SCADA：配對小時數只剩約一半。若沿用過期值硬配，會是 336。
+    check("SCADA 斷線的 7 天不被補上（嚴格同小時，不沿用前值）",
+          v['PUMP A']['n_hours'] <= 7 * 24 + 4, str(v['PUMP A']['n_hours']))
+
+    # ── 單元：小時內轉速在跳的小時整個剔除 ───────────────
+    r = pd.DataFrame({
+        'tag_id': ['t'] * 6,
+        'ts': pd.to_datetime(['2026-06-01 00:05', '2026-06-01 00:15', '2026-06-01 00:25',
+                              '2026-06-01 01:05', '2026-06-01 01:15', '2026-06-01 01:25']),
+        'value': [40.0, 60.0, 50.0, 50.0, 50.1, 49.9],
+    })
+    hf = hourly_frequency(r).set_index('ts_hour')
+    check("小時內 40→60 Hz 的跳動被標出（(max−min)/中位數 ≫ 門檻）",
+          hf['inhour_range'].iloc[0] > MAX_INHOUR_FREQ_RANGE, str(hf['inhour_range'].iloc[0]))
+    check("穩定的小時不被標", hf['inhour_range'].iloc[1] < MAX_INHOUR_FREQ_RANGE)
+
+    # ── 單元：樣本不足時不下結論 ─────────────────────
+    few = pd.DataFrame({'ts_hour': pd.date_range('2026-06-01', periods=MIN_PAIRED_HOURS - 1, freq='h'),
+                        'vel': 1.0, 'freq': np.linspace(40, 60, MIN_PAIRED_HOURS - 1)})
+    check(f"配對小時數 < {MIN_PAIRED_HOURS} → insufficient",
+          analyze_pair(few)['verdict'] == 'insufficient')
+
+
 def test_ledger() -> None:
-    print("\n[11] 台帳補填：CSV 範本產出與匯入")
+    print("\n[12] 台帳補填：CSV 範本產出與匯入")
 
     import tempfile
 
@@ -1078,7 +1196,7 @@ def _psql_env() -> dict:
 
 
 def test_db(dbname: str) -> None:
-    print("\n[12] 資料庫：台帳欄位保留與 migration 冪等性")
+    print("\n[13] 資料庫：台帳欄位保留與 migration 冪等性")
     env = _psql_env()
     try:
         subprocess.run(["dropdb", "--if-exists", dbname], env=env, check=True, capture_output=True)
@@ -1333,6 +1451,7 @@ def main() -> int:
         test_systemic_gaps()
         test_step_change_features()
         test_scada()
+        test_speed_effect()
         test_ledger()
         test_db(args.dbname)
     except AssertionError as e:

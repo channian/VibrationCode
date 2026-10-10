@@ -99,7 +99,7 @@ python -m validate.offline --data-dir data/ --sweep "SPECTRAL_SHIFT:shift_pct:10
 ```json
 {
   "VEL_HIGH": { "params": { "sigma": 3.5 } },
-  "IMPACT_RISE": { "params": { "crest_sigma": 3.0, "kurt_sigma": 3.0 } }
+  "IMPACT_RISE": { "params": { "crest_sigma": 3.0, "crest_axis_sigma": 3.0 } }
 }
 ```
 
@@ -117,6 +117,28 @@ python -m validate.offline --data-dir /tmp/vib_synth \
 `--samples-per-hour 60` 告訴聚合管線正確的每小時預期樣本數，否則涵蓋率
 會被誤判成 partial；`validate/synthetic.py` 檔頭的 docstring 寫明了五台
 合成設備各自的劇本與應該觸發哪些規則，可以拿來核對框架有沒有算對。）
+
+## SCADA 工況（電流／頻率）
+
+要不要依轉速對基準線分層（專家會議 Q3），先量再決定。三步，各自獨立：
+
+```bash
+# 1. 產對應表範本（Analytic CSV 的 Label 欄已有的電流 tag 會預填）
+python -m validate.scada_setup emit  --data-dir data/ --out out/tagmap.csv
+python -m validate.scada_setup check --tagmap out/tagmap.csv --data-dir data/
+
+# 2. 拿一段 SCADA 匯出實測：tag 對不對得上、刷新週期、哪些頻率 tag 運轉時真的在變
+python -m validate.scada_setup probe --tagmap out/tagmap.csv --readings out/scada.csv
+
+# 3. 對有 ★ 的設備：轉速變了，velRMS 有沒有跟著變
+python -m validate.speed_effect --data-dir data/ --tagmap out/tagmap.csv \
+    --readings out/scada.csv --since 2026-06-01 --until 2026-06-14 --csv out/speed_effect.csv
+```
+
+讀值檔欄名接受 `DATETIME / TAGNAME / VALUE`；時間視為廠內當地時間（UTC+8），
+tag 寫成 `資料表名|tag名` 或只有 `tag名` 都對得上。`speed_effect` 的判定與
+限制（相關非因果、只涵蓋指定時段、M1/M2 共用頻率 tag 不是兩份獨立證據）
+見該檔開頭的說明與 `docs/DECISIONS_2026-09_expert_review.md` 的 Q3 一節。
 
 ## 報告怎麼看
 

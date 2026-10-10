@@ -350,8 +350,9 @@ def parse_readings(path: str) -> pd.DataFrame:
     讀 SCADA 讀值 CSV，欄位為 `tag_id, ts, value`。
 
     Returns:
-        欄位 `tag_id`（str）、`ts`（tz-aware UTC）、`value`（float）的
-        DataFrame，依 `(tag_id, ts)` 排序並去重。解析不了的列直接丟掉並
+        欄位 `tag_id`（str）、`ts`（**naive 廠內當地時間**，與振動端一致，
+        見 `_to_plant_naive`）、`value`（float）的 DataFrame，
+        依 `(tag_id, ts)` 排序並去重。解析不了的列直接丟掉並
         統計筆數——讀值檔動輒數十萬列，逐列記警告只會把 log 灌爆。
     """
     if not path or not os.path.exists(path):

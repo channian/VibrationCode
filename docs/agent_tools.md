@@ -93,7 +93,7 @@ ISO 分級、趨勢回歸都已在規則層用確定性程式算完；Agent 的�
 | 禁止（故障類型判定） | 允許（現象 + 下一步） |
 |---|---|
 | 「疑似對心不良」 | 「整體振動位準上升，衝擊性指標未同步上升」 |
-| 「軸承內環缺陷」 | 「衝擊性指標（Crest/Kurtosis）持續上升，常見於軸承或潤滑劣化，本系統無法區分成因」 |
+| 「軸承內環缺陷」 | 「衝擊性指標（Crest）持續上升，常見於軸承或潤滑劣化，本系統無法區分成因」 |
 | 「建議更換軸承」 | 「建議安排專家系統複測以確認成因」 |
 | 「剩餘壽命約 2 個月」 | 「以目前劣化速率，約 N 天後將觸及 Zone C 門檻（信心度：中）」 |
 
@@ -187,9 +187,9 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
       "family": "monotonic",
       "issue_type": "impact_rise",
       "severity": "warn",
-      "params": {"crest_sigma": 2.5, "kurt_sigma": 2.5, "require_both": false},
+      "params": {"crest_sigma": 2.5, "crest_axis_sigma": 2.5},
       "is_active": true,
-      "description": "accCREST / accKURT 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）"
+      "description": "accCREST 相對基準顯著上升，常見於軸承或潤滑劣化（不判定成因）"
     }
   },
   "sla_days": {"open": 5, "engineer_replied": 5, "supervisor_reviewed": 5},
@@ -386,13 +386,13 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
       "device_name": "6F 空調箱 601", "building": "FAB7", "floor": "6F", "system_name": "空調",
       "issue_type": "impact_rise", "family": "monotonic", "rule_code": "IMPACT_RISE",
       "title": "AHU-601 M1 衝擊性指標上升",
-      "detail": "accCREST 相對基準 +2.6σ，accKURT 相對基準 +2.1σ",
+      "detail": "波峰因子（accCREST）相對基準期中位數 4.00 上升至 5.80（+2.6σ）。",
       "severity": "warn", "peak_severity": "warn", "status": "open",
       "occurrence_count": 1,
       "first_seen_at": "2026-08-26T16:00:22+00:00", "last_seen_at": "2026-08-26T16:00:22+00:00",
       "baseline_value": 4.0, "current_value": 5.8, "value_unit": "",
-      "evidence": {"acc_crest_sigma": 2.6, "acc_kurt_sigma": 2.1},
-      "interpretation_limit": "衝擊性指標（Crest/Kurtosis）持續上升，常見於軸承或潤滑劣化，本系統無法區分成因，建議安排專家系統複測以確認成因。",
+      "evidence": {"primary_metric": "acc_crest_median", "trigger_source": "composite"},
+      "interpretation_limit": "波峰因子（Crest）反映衝擊成分的強弱，上升常見於軸承或潤滑劣化，本系統無法區分成因，建議安排專家系統複測以確認成因。",
       "escalated_at": null, "needs_expert_measurement": false,
       "days_open": 0, "days_in_stage": 0, "sla_days": 5, "is_sla_breached": false,
       "latest_note": null
@@ -462,7 +462,7 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
        "device_label": "AHU-601 / M1", "location": "A棟 · 6F · 空調",
        "title": "衝擊性指標上升", "detail": "accKURT 由 3.1 升至 4.6",
        "current_value": 4.6, "baseline_value": 3.1, "value_unit": "",
-       "occurrence_count": 3, "interpretation_limit": "kurtosis 上升代表波形衝擊性增加，不指向特定故障。",
+       "occurrence_count": 3, "interpretation_limit": "波峰因子上升代表波形衝擊性增加，不指向特定故障。",
        "first_seen_at": "…", "last_seen_at": "…"}
     ],
     "tracking": ["...同上結構，本期之前就存在、本期仍再現..."],
@@ -520,11 +520,11 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
     "device_name": "6F 空調箱 601", "building": "FAB7", "floor": "6F", "system_name": "空調",
     "issue_type": "impact_rise", "family": "monotonic", "rule_code": "IMPACT_RISE",
     "title": "AHU-601 M1 衝擊性指標上升",
-    "detail": "accCREST 相對基準 +2.6σ，accKURT 相對基準 +2.1σ",
+    "detail": "波峰因子（accCREST）相對基準期中位數 4.00 上升至 5.80（+2.6σ）。",
     "severity": "warn", "status": "open", "occurrence_count": 1,
     "baseline_value": 4.0, "current_value": 5.8,
-    "evidence": {"acc_crest_sigma": 2.6, "acc_kurt_sigma": 2.1},
-    "interpretation_limit": "衝擊性指標（Crest/Kurtosis）持續上升，常見於軸承或潤滑劣化，本系統無法區分成因，建議安排專家系統複測以確認成因。",
+    "evidence": {"primary_metric": "acc_crest_median", "trigger_source": "composite"},
+    "interpretation_limit": "波峰因子（Crest）反映衝擊成分的強弱，上升常見於軸承或潤滑劣化，本系統無法區分成因，建議安排專家系統複測以確認成因。",
     "days_open": 0, "days_in_stage": 0
   },
   "notes": [],
@@ -536,7 +536,7 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
     "total_hours": 719, "ok_hours": 719, "analyzable_ratio": 1.0,
     "period_start": "2026-07-27T17:00:00+00:00", "period_end": "2026-08-26T15:00:00+00:00"
   },
-  "interpretation_limit": "衝擊性指標（Crest/Kurtosis）持續上升，常見於軸承或潤滑劣化，本系統無法區分成因，建議安排專家系統複測以確認成因。",
+  "interpretation_limit": "波峰因子（Crest）反映衝擊成分的強弱，上升常見於軸承或潤滑劣化，本系統無法區分成因，建議安排專家系統複測以確認成因。",
   "agent_guidance": "本系統定位為篩選與預警，不做故障診斷……（見 §2）"
 }
 ```
