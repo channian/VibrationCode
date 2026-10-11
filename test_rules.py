@@ -23,6 +23,7 @@ DB 連線沿用 VIB_DB_HOST / VIB_DB_PORT / VIB_DB_USER / VIB_DB_PASSWORD；
 import argparse
 import dataclasses
 import datetime as dt
+import json
 import logging
 import os
 import subprocess
@@ -418,6 +419,86 @@ def test_backtest_instrumentation() -> None:
     for k in ('threshold_mode', 'machine_class', 'evidence_json', 'duration_days'):
         check(f"事件列含 {k} 欄位", k in row)
     check("duration_days 含頭尾（8/01–8/03 為 3 天）", row['duration_days'] == 3)
+
+
+def test_vel_high_policy() -> None:
+    """VEL_HIGH 相對基準路徑的兩道把關：實用顯著性下限，與「退回 sigma 只列觀察名單」。"""
+    print("\n[6b] VEL_HIGH：實用顯著性下限與退回 sigma 的嚴重度")
+
+    from vibcore.types import SEVERITY_OBSERVE, SEVERITY_WARN
+
+    def vh(rows_v, med, std, dev=None, params=None):
+        stats = {'vel_rms': (med, med, std, 300), 'vel_oa': (med, med, std, 300)}
+        rows = [{'vel_rms': v, 'vel_oa': v} for v in rows_v]
+        return vel_high(ctx(rows, stats, params=params, dev=dev))
+
+    small = device(iso_machine_group='4', iso_foundation='rigid', rated_power_kw=11.0)   # ≤ 15 kW
+    unclassified = device(iso_machine_group=None, iso_foundation=None, iso_class_source='unset')
+    big = device(iso_machine_group='2', iso_foundation='rigid', rated_power_kw=45.0)
+
+    # ── 實用顯著性下限 ──
+    # 實測 CP 07_M1：基準 0.257、標準差 0.0117，當前 0.293 → 3.04σ，但只多了 0.036 mm/s（+14%）。
+    tiny = vh([0.293, 0.301, 0.293], 0.257, 0.0117, dev=small)
+    check("3σ 以上、但增幅只有 +14%／0.04 mm/s → 不算偏高（實用顯著性下限）", not tiny.triggered)
+    old_style = vh([0.293, 0.301, 0.293], 0.257, 0.0117, dev=small,
+                   params={'min_rel_change': 0, 'min_abs_change': 0})
+    check("下限設為 0 就回到原本純 σ 的行為（可調、可回復）", old_style.triggered)
+    only_rel = vh([0.34, 0.34, 0.34], 0.257, 0.0117, dev=small)     # +32%、+0.083 mm/s
+    check("相對夠大但絕對不到 0.10 mm/s → 不算（兩個下限要同時達到）", not only_rel.triggered)
+    only_abs = vh([1.55, 1.56, 1.55], 1.425, 0.040, dev=small)      # +9%、+0.13 mm/s
+    check("絕對夠大但相對不到 25% → 不算（CP 08_M2 的 +10% 小幅超標）", not only_abs.triggered)
+    real = vh([1.33, 1.38, 1.48], 0.664, 0.0116, dev=small)         # +123%
+    check("增幅同時達標（+123%）→ 觸發", real.triggered, str(real.evidence))
+    just_over = vh([0.359, 0.359, 0.359], 0.257, 0.0117, dev=small)     # +0.102、+40%
+    just_under = vh([0.355, 0.355, 0.355], 0.257, 0.0117, dev=small)    # +0.098、+38%
+    check("增幅剛好跨過 0.10 mm/s 下限 → 算；差一點點 → 不算（浮點邊界不拿來比等號）",
+          just_over.triggered and not just_under.triggered)
+    dip = vh([1.33, 0.70, 1.48], 0.664, 0.0116, dev=small)
+    check("持續性緩衝：三筆中有一筆沒達下限 → 不觸發", not dip.triggered)
+    zero_med = vh([0.4, 0.4, 0.4], 0.0, 0.02, dev=small)
+    check("基準中位數為 0（無法算相對增幅）→ 只看絕對下限", zero_med.triggered)
+    check("門檻參數記進 evidence，事後可知當時用的下限",
+          real.evidence['min_rel_change'] == 0.25 and real.evidence['min_abs_change'] == 0.10)
+
+    # ── 嚴重度 ──
+    check("額定 ≤ 15 kW（ISO 不適用）退回 sigma 的結果 → observe（不派工）",
+          real.severity == SEVERITY_OBSERVE and real.evidence['threshold_mode'] == 'sigma_fallback',
+          str((real.severity, real.evidence['threshold_mode'])))
+    unc = vh([1.33, 1.38, 1.48], 0.664, 0.0116, dev=unclassified)
+    check("未分級退回 sigma 的結果同樣是 observe", unc.triggered and unc.severity == SEVERITY_OBSERVE)
+    iso_hit = vh([2.0, 2.1, 2.0], 0.45, 0.1, dev=big)
+    check("ISO 錨定的觸發維持 warn（有外部標準可引用）",
+          iso_hit.triggered and iso_hit.severity == SEVERITY_WARN
+          and iso_hit.evidence['threshold_mode'] == 'iso', str(iso_hit.severity))
+    check("ISO 路徑不套用相對基準下限（evidence 為 None）",
+          iso_hit.evidence['min_rel_change'] is None and iso_hit.evidence['min_abs_change'] is None)
+    explicit = vh([1.33, 1.38, 1.48], 0.664, 0.0116, dev=small, params={'threshold_mode': 'sigma'})
+    check("使用者明確指定 threshold_mode='sigma' → 維持 warn（那是他自己選的對照組）",
+          explicit.triggered and explicit.severity == SEVERITY_WARN
+          and explicit.evidence['threshold_mode'] == 'sigma')
+    back = vh([1.33, 1.38, 1.48], 0.664, 0.0116, dev=small, params={'fallback_severity': 'warn'})
+    check("fallback_severity='warn' 可改回派工", back.severity == SEVERITY_WARN)
+    bad = vh([1.33, 1.38, 1.48], 0.664, 0.0116, dev=small, params={'fallback_severity': 'err'})
+    check("fallback_severity 填了不合法的值 → 退回預設 observe，不因此升到 err",
+          bad.severity == SEVERITY_OBSERVE)
+
+    # ── 說明文字 ──
+    check("說明文字帶出增幅（絕對值與百分比），工程師看得出「多了多少」",
+          '+123%' in real.detail and '0.8' in real.detail, real.detail)
+    check("observe 的解讀邊界明講沒有外部標準、不建立待辦、沒排除工況與鄰機",
+          '觀察名單' in real.interpretation_limit and '工況' in real.interpretation_limit
+          and '鄰近機組' in real.interpretation_limit, real.interpretation_limit)
+    check("warn 的 ISO 觸發沒有「觀察名單」字樣", '觀察名單' not in iso_hit.interpretation_limit)
+    for o in (real, unc, iso_hit):
+        problems = check_outcome(o)
+        check(f"VEL_HIGH（{o.severity}／{o.evidence['threshold_mode']}）的輸出文字無診斷性斷言",
+              not problems, str(problems))
+
+    from validate.rule_defaults import DEFAULT_RULE_CONFIGS
+    p = DEFAULT_RULE_CONFIGS['VEL_HIGH'].params
+    check("回測用的預設設定與規則層預設一致（避免回測與上線的門檻不同）",
+          p.get('min_rel_change') == 0.25 and p.get('min_abs_change') == 0.10
+          and p.get('fallback_severity') == 'observe', str(p))
 
 
 def test_guardrail() -> None:
@@ -1697,6 +1778,92 @@ def _psql_env() -> dict:
     return env
 
 
+def test_ledger_import_logic() -> None:
+    print("\n[12c] 台帳匯入資料庫：欄位正規化、合併規則、覆蓋摘要（不需要資料庫的部分）")
+
+    from vibcore.ledger_import import (coverage, normalize_date, normalize_driver,
+                                       normalize_foundation, normalize_group, normalize_power,
+                                       plan_row)
+
+    check("群組：'2'、2、'2.0'（試算表把整數存成小數）都認得為 '2'",
+          normalize_group('2')[0] == '2' and normalize_group(2)[0] == '2'
+          and normalize_group('2.0')[0] == '2')
+    check("群組：空白＝沒填（不是錯）；0、5、'二' 是錯",
+          normalize_group('') == (None, None) and normalize_group('nan') == (None, None)
+          and all(normalize_group(x)[1] for x in ('0', '5', '二', '2.5')))
+    check("基礎剛性：rigid／剛性／Rigid 都認得；亂填是錯",
+          normalize_foundation('Rigid')[0] == 'rigid' and normalize_foundation('柔性')[0] == 'flexible'
+          and normalize_foundation('hard')[1] is not None)
+    check("驅動型式：外接／整合／external 都認得",
+          normalize_driver('外接')[0] == 'external' and normalize_driver('整合')[0] == 'integrated'
+          and normalize_driver('x')[1] is not None)
+    check("日期：2026-04-02 認得；不是日期是錯；空白＝沒填",
+          normalize_date('2026-04-02') == ('2026-04-02', None) and normalize_date('昨天')[1]
+          and normalize_date('') == (None, None))
+    check("功率：正數才接受；0 與負數是錯", normalize_power(45.0)[0] == 45.0
+          and normalize_power(0)[1] and normalize_power(-3)[1])
+
+    # ── 合併規則 ──
+    cur = {'rated_power_kw': 45, 'iso_machine_group': None, 'iso_foundation': None,
+           'iso_driver_type': None, 'is_standby': False, 'last_maintenance_at': None,
+           'machine_type': None, 'iso_class_source': 'unset'}
+    full = plan_row('A_M1', {'iso_machine_group': '2.0', 'iso_foundation': '剛性',
+                             'iso_driver_type': '外接', 'is_standby': True,
+                             'rated_power_kw': 45.0}, cur)
+    check("群組與基礎剛性都給了 → 分類來源設為 manual_override（否則分類不會生效）",
+          full.new['iso_class_source'] == 'manual_override'
+          and full.changes['iso_class_source'] == ('unset', 'manual_override'), str(full.changes))
+    check("寫入值已正規化（'2.0'→'2'、剛性→rigid、外接→external）",
+          full.new['iso_machine_group'] == '2' and full.new['iso_foundation'] == 'rigid'
+          and full.new['iso_driver_type'] == 'external')
+    check("相同的值不算變更（額定功率 45 → 45.0 沒有變）", 'rated_power_kw' not in full.changes)
+
+    only_group = plan_row('A_M1', {'iso_machine_group': '2'}, cur)
+    check("只給群組、基礎剛性沒有 → 分類來源維持 unset（分類不齊就不會啟用）",
+          only_group.new['iso_class_source'] == 'unset')
+    cur_f = {**cur, 'iso_foundation': 'rigid'}
+    check("資料庫已有基礎剛性、台帳補群組 → 合併後齊備，分類來源設為 manual_override",
+          plan_row('A_M1', {'iso_machine_group': '2'}, cur_f).new['iso_class_source'] == 'manual_override')
+
+    cur_ok = {**cur, 'iso_machine_group': '2', 'iso_foundation': 'rigid',
+              'iso_class_source': 'manual_override', 'is_standby': True}
+    blank = plan_row('A_M1', {'iso_machine_group': '', 'iso_foundation': '', 'is_standby': None}, cur_ok)
+    check("台帳留空＝不動：不會把資料庫已有的群組、剛性、備機清掉",
+          not blank.changed and blank.new['iso_machine_group'] == '2' and blank.new['is_standby'] is True,
+          str(blank.changes))
+    flip = plan_row('A_M1', {'is_standby': False}, cur_ok)
+    check("明確填 FALSE 仍可把備機旗標改回來（只擋留空，不擋『確認不是備機』）",
+          flip.new['is_standby'] is False and 'is_standby' in flip.changes)
+    check("某欄不合法 → 整列標錯、不套用（群組 9）",
+          plan_row('A_M1', {'iso_machine_group': '9', 'is_standby': True}, cur).error is not None)
+    check("重複套用同一份台帳沒有變更（冪等）",
+          not plan_row('A_M1', {'iso_machine_group': '2', 'iso_foundation': 'rigid'}, cur_ok).changed)
+    new_dev = plan_row('N_M1', {'iso_machine_group': '4', 'iso_foundation': 'rigid',
+                                'rated_power_kw': 11.0}, None)
+    check("設備尚未存在（--create-missing）：以全空白為基準合併", new_dev.new['iso_machine_group'] == '4'
+          and new_dev.new['iso_class_source'] == 'manual_override')
+
+    # ── 覆蓋摘要 ──
+    cov = coverage({
+        'OK_M1': {'iso_machine_group': '2', 'iso_foundation': 'rigid', 'rated_power_kw': 45,
+                  'iso_class_source': 'manual_override', 'is_standby': True},
+        'SMALL_M1': {'iso_machine_group': '4', 'iso_foundation': 'rigid', 'rated_power_kw': 11,
+                     'iso_class_source': 'manual_override'},
+        'EDGE_M1': {'iso_machine_group': '4', 'iso_foundation': 'rigid', 'rated_power_kw': 15,
+                    'iso_class_source': 'manual_override'},
+        'HALF_M1': {'iso_machine_group': '2', 'iso_foundation': None, 'rated_power_kw': 30},
+        'UNSET_M1': {'iso_machine_group': '2', 'iso_foundation': 'rigid', 'rated_power_kw': 30,
+                     'iso_class_source': 'unset'},
+        'NONE_M1': {'rated_power_kw': None},
+    })
+    check("覆蓋摘要：ISO 會啟用／額定 ≤15 kW（含恰為 15）／分類不完整／來源未設／未分類各歸各類",
+          cov['iso_ready'] == ['OK_M1'] and cov['out_of_scope'] == ['EDGE_M1', 'SMALL_M1']
+          and cov['partial'] == ['HALF_M1', 'UNSET_M1'] and cov['unclassified'] == ['NONE_M1'],
+          str({k: v for k, v in cov.items()}))
+    check("額定功率沒填的單獨列出（無法檢查適用範圍）；備機另計",
+          cov['power_missing'] == ['NONE_M1'] and cov['standby'] == ['OK_M1'])
+
+
 def test_ledger_id_match() -> None:
     print("\n[12b] 台帳 device_id 與資料對不上：不能安靜失效")
 
@@ -1914,6 +2081,101 @@ def test_db(dbname: str) -> None:
           pd.notna(joined['scada_current'].iloc[0]),
           str(joined.iloc[0].to_dict()))
 
+    # ── 台帳匯入資料庫（vibcore.ledger_import）──────────────
+    from vibcore.io.ledger import read_ledger_csv
+    from vibcore.ledger_import import run_import
+    from vibcore.metrics.iso import evaluate_iso, resolve_class
+
+    for did in ('L1_M1', 'L1_M2', 'L2_M1', 'CH 01_M1'):
+        repo.upsert_device(conn, DeviceContext(      # 模擬每日排程第一次看到這些設備
+            device_id=did, device_name=did, building='A棟', floor='1F', system_name='冰水',
+            rated_rpm=1750.0, fmf_hz=29.2))
+    conn.commit()
+    ledger_rows = {
+        'L1_M1': {'rated_power_kw': 45.0, 'iso_machine_group': '2.0', 'iso_foundation': '剛性',
+                  'iso_driver_type': '外接', 'is_standby': True},
+        'L1_M2': {'rated_power_kw': 11.0, 'iso_machine_group': '4', 'iso_foundation': 'rigid'},
+        'L2_M1': {'iso_machine_group': '9', 'is_standby': True},          # 不合法 → 略過
+        'CH01_M1': {'iso_machine_group': '2', 'iso_foundation': 'rigid'},  # 近似 'CH 01_M1'
+        'GHOST_M1': {'is_standby': True},                                  # 完全找不到
+    }
+    dry = run_import(conn, ledger_rows, dry_run=True)
+    conn.commit()
+    check("預演（dry-run）不寫入：資料庫裡 L1_M1 仍是未分級",
+          repo.get_device(conn, 'L1_M1').iso_machine_group is None
+          and repo.get_device(conn, 'L1_M1').iso_class_source == 'unset')
+    check("預演也算得出會更新哪幾台", {p.device_id for p in dry.updated} == {'L1_M1', 'L1_M2'},
+          str([p.device_id for p in dry.updated]))
+
+    rep = run_import(conn, ledger_rows)
+    conn.commit()
+    d1 = repo.get_device(conn, 'L1_M1')
+    check("匯入後 L1_M1 的群組、剛性、驅動型式、備機都進了資料庫（已正規化）",
+          (d1.iso_machine_group, d1.iso_foundation, d1.iso_driver_type, d1.is_standby)
+          == ('2', 'rigid', 'external', True), str((d1.iso_machine_group, d1.iso_foundation)))
+    check("匯入後 iso_class_source 為 manual_override（沒有這步，分類填了也不生效）",
+          d1.iso_class_source == 'manual_override', d1.iso_class_source)
+    check("匯入後規則層真的認得這個分類：resolve_class 與 evaluate_iso(applicable)",
+          resolve_class(d1) == ('2', 'rigid') and evaluate_iso(
+              pd.DataFrame({'ts_hour': [pd.Timestamp('2026-08-01')], 'data_status': ['ok'],
+                            'vel_rms': [0.5]}), d1, None).applicable is True)
+    d2 = repo.get_device(conn, 'L1_M2')
+    check("額定 11 kW 的設備：分類寫進去了，但 ISO 判定因適用範圍而不啟用",
+          d2.iso_machine_group == '4' and float(d2.rated_power_kw) == 11.0 and evaluate_iso(
+              pd.DataFrame({'ts_hour': [pd.Timestamp('2026-08-01')], 'data_status': ['ok'],
+                            'vel_rms': [0.5]}), d2, None).applicable is False)
+    check("不合法的列整列略過：L2_M1 的備機旗標沒有被一起寫入",
+          repo.get_device(conn, 'L2_M1').is_standby is False
+          and [d for d, _ in rep.skipped] == ['L2_M1'], str(rep.skipped))
+    check("近似名稱（CH01_M1 ≈ CH 01_M1）只報告、不套用也不建立",
+          rep.near_miss == {'CH01_M1': 'CH 01_M1'}
+          and repo.get_device(conn, 'CH 01_M1').iso_machine_group is None
+          and repo.get_device(conn, 'CH01_M1') is None)
+    check("完全找不到的 id 不會憑空建立設備", repo.get_device(conn, 'GHOST_M1') is None
+          and rep.missing == ['GHOST_M1'])
+    check("覆蓋摘要：L1_M1 會啟用 ISO、L1_M2 是適用範圍外",
+          'L1_M1' in rep.cover['iso_ready'] and 'L1_M2' in rep.cover['out_of_scope'])
+
+    again = run_import(conn, ledger_rows)
+    conn.commit()
+    check("重跑同一份台帳沒有任何更新（冪等）", not again.updated and not again.created,
+          str([p.device_id for p in again.updated]))
+    # 每日排程之後再 upsert 一次（台帳欄位皆 None）：匯入的值要留著
+    repo.upsert_device(conn, DeviceContext(
+        device_id='L1_M1', device_name='L1_M1', building='A棟', floor='1F', system_name='冰水',
+        rated_rpm=1750.0, fmf_hz=29.2))
+    conn.commit()
+    d1b = repo.get_device(conn, 'L1_M1')
+    check("匯入之後每日排程 upsert 不會把台帳清掉",
+          (d1b.iso_machine_group, d1b.iso_foundation, d1b.is_standby, d1b.iso_class_source)
+          == ('2', 'rigid', True, 'manual_override'))
+    run_import(conn, {'L1_M1': {'iso_machine_group': '', 'iso_foundation': '', 'is_standby': None}})
+    conn.commit()
+    check("台帳留空不會把資料庫已有的值清掉", repo.get_device(conn, 'L1_M1').iso_machine_group == '2')
+
+    strict = run_import(conn, {'L1_M2': {'is_standby': True}, 'CH01_M1': {'is_standby': True}},
+                        strict=True)
+    conn.commit()
+    check("--strict：有問題（近似名稱）就整批不套用，連合法的那列也不動",
+          repo.get_device(conn, 'L1_M2').is_standby is False and strict.n_issues == 1)
+
+    made = run_import(conn, {'NEW_M1': {'iso_machine_group': '2', 'iso_foundation': 'rigid',
+                                       'rated_power_kw': 30.0},
+                             'CH01_M1': {'is_standby': True}}, create_missing=True)
+    conn.commit()
+    nd = repo.get_device(conn, 'NEW_M1')
+    check("--create-missing：資料庫沒有的設備才建立，且帶著台帳（device_name 暫用 id）",
+          nd is not None and nd.iso_class_source == 'manual_override' and nd.device_name == 'NEW_M1')
+    check("--create-missing 對近似名稱仍然拒絕（CH01_M1 不會在 'CH 01_M1' 旁多出幽靈設備）",
+          repo.get_device(conn, 'CH01_M1') is None and made.near_miss == {'CH01_M1': 'CH 01_M1'})
+    # 設備先由台帳建立、之後每日排程補上 metadata：台帳欄位要留著
+    repo.upsert_device(conn, DeviceContext(device_id='NEW_M1', device_name='新泵', building='B棟',
+                                           floor='2F', system_name='冷卻水', rated_rpm=1180.0))
+    conn.commit()
+    nd2 = repo.get_device(conn, 'NEW_M1')
+    check("先由台帳建立、之後排程補 metadata：兩邊都在（名稱來自排程、分類來自台帳）",
+          nd2.device_name == '新泵' and nd2.iso_machine_group == '2' and nd2.building == 'B棟')
+
     conn.close()
 
     # ── migration 006：從舊結構（tag_id 為主鍵）搬到多對多 ──────
@@ -1964,7 +2226,8 @@ def test_db(dbname: str) -> None:
         subprocess.run(["dropdb", "--if-exists", old_db], env=env, capture_output=True)
 
     for mig, label in (("db/migration_004_iso10816_3_and_median.sql", "migration_004"),
-                       ("db/migration_005_drop_kurtosis_channel.sql", "migration_005")):
+                       ("db/migration_005_drop_kurtosis_channel.sql", "migration_005"),
+                       ("db/migration_007_vel_high_fallback_observe.sql", "migration_007")):
         if not os.path.exists(mig):
             skip(f"{label} 冪等", f"找不到 {mig}")
             continue
@@ -1983,6 +2246,53 @@ def test_db(dbname: str) -> None:
     check("migration_005 後 IMPACT_RISE 的參數不含 kurt / require_both",
           r.returncode == 0 and 'kurt' not in r.stdout and 'require_both' not in r.stdout,
           r.stdout.strip() or r.stderr[:200])
+
+    # ── migration_007：VEL_HIGH 三個新參數 ──
+    def _vh_params() -> str:
+        q = subprocess.run(["psql", "-tAq", "-d", dbname, "-c",
+                            "set search_path to vib,public; "
+                            "select params::text from rule_config where rule_code='VEL_HIGH';"],
+                           env=env, capture_output=True, text=True)
+        return q.stdout.strip().splitlines()[-1] if q.stdout.strip() else q.stderr[:200]
+
+    seeded = json.loads(_vh_params())
+    check("新建庫的 VEL_HIGH seed 就帶著實用顯著性下限與退回嚴重度",
+          seeded.get('min_rel_change') == 0.25 and seeded.get('min_abs_change') == 0.10
+          and seeded.get('fallback_severity') == 'observe', str(seeded))
+    from validate.rule_defaults import DEFAULT_RULE_CONFIGS
+    check("schema seed 與回測預設（rule_defaults）的 VEL_HIGH 參數逐鍵一致",
+          seeded == DEFAULT_RULE_CONFIGS['VEL_HIGH'].params,
+          f"{seeded} vs {DEFAULT_RULE_CONFIGS['VEL_HIGH'].params}")
+
+    mig7 = "db/migration_007_vel_high_fallback_observe.sql"
+    if os.path.exists(mig7):
+        # 模擬舊庫：只有舊的三個鍵，且現場把 sigma 調成了 3.5
+        subprocess.run(["psql", "-q", "-d", dbname, "-c",
+                        "set search_path to vib,public; update rule_config set params = "
+                        "'{\"threshold_mode\":\"iso\",\"sigma\":3.5,\"consecutive_readings\":3}' "
+                        "where rule_code='VEL_HIGH';"], env=env, capture_output=True)
+        subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-d", dbname, "-f", mig7],
+                       env=env, capture_output=True, text=True)
+        once = json.loads(_vh_params())
+        subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-d", dbname, "-f", mig7],
+                       env=env, capture_output=True, text=True)
+        twice = json.loads(_vh_params())
+        check("migration_007 對舊庫補上三個新參數",
+              once.get('min_rel_change') == 0.25 and once.get('min_abs_change') == 0.10
+              and once.get('fallback_severity') == 'observe', str(once))
+        check("現場已調過的值不被覆蓋（sigma 3.5 仍是 3.5）", once.get('sigma') == 3.5, str(once))
+        check("重跑 migration_007 結果不變（冪等）", once == twice, f"{once} vs {twice}")
+        # 現場把 fallback 改回 warn 之後，重跑 migration 不能把它改回 observe
+        subprocess.run(["psql", "-q", "-d", dbname, "-c",
+                        "set search_path to vib,public; update rule_config set params = "
+                        "params || '{\"fallback_severity\":\"warn\"}' where rule_code='VEL_HIGH';"],
+                       env=env, capture_output=True)
+        subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-d", dbname, "-f", mig7],
+                       env=env, capture_output=True, text=True)
+        check("現場改成 warn 之後重跑 migration_007，不會被改回 observe",
+              json.loads(_vh_params()).get('fallback_severity') == 'warn')
+    else:
+        skip("migration_007 行為", f"找不到 {mig7}")
 
     subprocess.run(["dropdb", "--if-exists", dbname], env=env, capture_output=True)
 
@@ -2005,6 +2315,7 @@ def main() -> int:
         test_baseline_maintenance()
         test_axis_direction()
         test_backtest_instrumentation()
+        test_vel_high_policy()
         test_guardrail()
         test_systemic_gaps()
         test_step_change_features()
@@ -2013,6 +2324,7 @@ def main() -> int:
         test_operating_state()
         test_ledger()
         test_ledger_id_match()
+        test_ledger_import_logic()
         test_db(args.dbname)
     except AssertionError as e:
         print(f"\n❌ 驗收失敗：{e}")

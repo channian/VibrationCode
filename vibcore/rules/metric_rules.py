@@ -35,7 +35,7 @@ from vibcore.metrics import deviation as deviation_mod
 from vibcore.metrics import iso as iso_mod
 from vibcore.metrics import trend as trend_mod
 from vibcore.rules.engine import register
-from vibcore.types import RuleContext, RuleOutcome
+from vibcore.types import SEVERITY_OBSERVE, SEVERITY_WARN, RuleContext, RuleOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,13 @@ _METRIC_UNITS: dict[str, str] = {
 
 #: ISO Zone 的嚴重程度順序（A 最輕、D 最重）
 _ZONE_ORDER = ('A', 'B', 'C', 'D')
+
+#: VEL_HIGH 相對基準路徑（sigma / sigma_fallback）的預設參數，說明見 `vel_high`
+#: docstring。三者都可由 `rule_config.params` 覆寫；沒有外部標準可引用，
+#: 調整依據應是試跑期的誤報回饋。
+VEL_HIGH_MIN_REL_CHANGE = 0.25
+VEL_HIGH_MIN_ABS_CHANGE = 0.10        # mm/s
+VEL_HIGH_FALLBACK_SEVERITY = SEVERITY_OBSERVE
 
 #: 排序後三軸能量佔比的三個鍵名（見 `vibcore/pipeline/aggregate.py`
 #: 的 `_axis_energy_sorted`：方向無關，只看「主軸/次軸/弱軸」佔比）
@@ -400,6 +407,24 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
     設備完全失去 VEL_HIGH 監測，比退回相對基準判定更糟，也違反本系統
     「篩選優先於精確」的定位。
 
+    **相對基準路徑的兩道把關**（`sigma` 與 `sigma_fallback`；iso 路徑的門檻本身
+    就是絕對值，不需要）：
+
+    1. **實用顯著性下限**（`min_rel_change`、`min_abs_change`）：σ 是以基準期標準差
+       為尺度，小機器穩定運轉時標準差只有 0.01～0.02 mm/s，一點點變化就是十幾個 σ
+       （實測 11 週：額定 ≤ 15 kW 的 5 台泵，41 件中有一半增幅不到 +28%、絕對增幅
+       中位數 0.13 mm/s，σ 中位數 7.4、最大 70.6）。要求增幅**同時**達到相對與絕對
+       下限才算偏高。0.10 mm/s 與系統自己判斷「有沒有在轉」的 velRMS 門檻同量級——
+       比那更小的變化，連「這台機器是開是關」都分不清；25% 是常見的「顯著變化」
+       經驗值。**兩者都是無法引用外部標準的預設值**，改 `rule_config.params` 即可，
+       調整依據應是試跑期的誤報回饋，而不是爭論數字。
+    2. **退回 sigma 的結果只列觀察名單，不派工**（`fallback_severity`，預設
+       `'observe'`）：這個路徑的門檻是我們自訂的統計量，沒有外部標準可引用——正是
+       `SEVERITY_OBSERVE` 當初為「答不出門檻哪來的」而設的那一級。實測 11 週，
+       全部 41 件可行動的設備類告警都出自這條路徑，且多半能由轉速狀態轉換或鄰機
+       環境振動解釋；拿它派工，簽核鏈很快失去公信力。仍保留偵測（不是不判定），
+       待累積回饋、門檻站得住腳再改回 `'warn'`。
+
     只判「偏高」方向——不論哪種模式，低於門檻（含比基準低）都不是本規則
     要抓的現象。
     """
@@ -440,6 +465,22 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
     sigma_th = float(ctx.params.get('sigma', 3.0))
     sigma = stat.sigma_of(current)
 
+    min_rel = max(0.0, float(ctx.params.get('min_rel_change', VEL_HIGH_MIN_REL_CHANGE)))
+    min_abs = max(0.0, float(ctx.params.get('min_abs_change', VEL_HIGH_MIN_ABS_CHANGE)))
+    fallback_severity = str(ctx.params.get('fallback_severity',
+                                           VEL_HIGH_FALLBACK_SEVERITY)).lower()
+    if fallback_severity not in (SEVERITY_WARN, SEVERITY_OBSERVE):
+        logger.warning(f"VEL_HIGH：fallback_severity={fallback_severity!r} 不合法，"
+                       f"改用預設 {VEL_HIGH_FALLBACK_SEVERITY}")
+        fallback_severity = VEL_HIGH_FALLBACK_SEVERITY
+
+    def _material(v: float) -> bool:
+        """增幅是否同時達到相對與絕對下限（基準中位數 ≤ 0 時只看絕對）。"""
+        delta = v - stat.median
+        if delta < min_abs:
+            return False
+        return stat.median <= 0 or delta >= min_rel * stat.median
+
     machine_class = None
     bc_boundary = None
     iso_cap = None
@@ -465,10 +506,14 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
             iso_cap = 1.25 * bc_boundary
             iso_threshold = iso_mod.iso_alert_threshold(stat.median, key)
 
+    # 退回 sigma 的結果沒有外部標準可引用，預設只列觀察名單（見 docstring）；
+    # 使用者明確指定 threshold_mode='sigma' 則維持 warn——那是他自己選的對照組。
+    severity = fallback_severity if mode == 'sigma_fallback' else SEVERITY_WARN
+
     if mode == 'iso':
         triggered = iso_threshold is not None and current >= iso_threshold
     else:  # 'sigma' 或 'sigma_fallback'
-        triggered = sigma >= sigma_th
+        triggered = sigma >= sigma_th and _material(current)
 
     if not triggered:
         return RuleOutcome.no_trigger('VEL_HIGH', 'vel_high', 'oscillating')
@@ -484,7 +529,8 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
     if mode == 'iso':
         sustained = all(float(v) >= iso_threshold for v in tail)
     else:
-        sustained = all(stat.sigma_of(float(v)) >= sigma_th for v in tail)
+        sustained = all(stat.sigma_of(float(v)) >= sigma_th and _material(float(v))
+                        for v in tail)
     if not sustained:
         logger.debug(f"VEL_HIGH：point={ctx.point_id} 近 {consecutive} 筆未全部超標，不觸發")
         return RuleOutcome.no_trigger('VEL_HIGH', 'vel_high', 'oscillating')
@@ -507,19 +553,27 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
     else:
         note = f'（{fallback_reason}）' if fallback_reason else ''
         title = '速度整體值相對基準偏高'
+        gain = (f'，增幅 {current - stat.median:.3f} mm/s（{(current / stat.median - 1) * 100:+.0f}%）'
+                if stat.median > 0 else '')
         detail = (f'最近一次量測 {metric} = {current:.3f} mm/s，相對基準期中位數 '
-                   f'{stat.median:.3f} mm/s 高出 {sigma:.1f}σ（門檻 {sigma_th:.1f}σ）{note}。')
+                  f'{stat.median:.3f} mm/s 高出 {sigma:.1f}σ（門檻 {sigma_th:.1f}σ）{gain}{note}。')
         interpretation_limit = (
             '本判定僅反映整體振動速度相對該量測點自身歷史基準的統計偏離，不涉及特定成因判別，'
             '亦未與其他指標交叉比對；建議參考同一量測點的其他指標並視情況安排複測。'
         )
+        if severity == SEVERITY_OBSERVE:
+            interpretation_limit += (
+                '此量測點沒有可引用的外部標準門檻（不在 ISO 分級體系內），這是以自身歷史為尺度的'
+                '統計判定，因此只列入觀察名單，不建立待辦事項；運轉工況（轉速、負載）與鄰近機組'
+                '的振動都可能造成同樣的變化，本判定沒有排除這些因素。'
+            )
 
     return RuleOutcome(
         triggered=True,
         rule_code='VEL_HIGH',
         issue_type='vel_high',
         family='oscillating',
-        severity='warn',
+        severity=severity,
         title=title,
         detail=detail,
         interpretation_limit=interpretation_limit,
@@ -539,6 +593,9 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
             # 不在標準範圍內…）；ISO 模式時為 None。事後判讀回測結果時，
             # 靠它區分「台帳沒填」與「標準本來就不適用」。
             'iso_fallback_reason': fallback_reason,
+            # 相對基準路徑的實用顯著性下限；iso 路徑不使用（None）
+            'min_rel_change': None if mode == 'iso' else min_rel,
+            'min_abs_change': None if mode == 'iso' else min_abs,
             'sigma': round(sigma, 2),
             'sigma_threshold': sigma_th,
             'baseline_median': stat.median,

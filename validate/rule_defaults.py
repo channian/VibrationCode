@@ -54,8 +54,12 @@ DEFAULT_RULE_CONFIGS: dict[str, RuleConfigRow] = {
             # 0.90 / 1.15 / 1.58 / 2.23 mm/s，以基準 0.45 計），來源是國際
             # 標準的分級架構。iso 模式判 velRMS——Zone 邊界定義在速度 RMS
             # 上，比 velOA 會讓門檻鬆掉三分之一。
-            {'threshold_mode': 'iso', 'sigma': 3.0},
-            description='velOA 相對基準超過 N 個標準差'),
+            # min_rel_change／min_abs_change：相對基準路徑（sigma、sigma_fallback）的
+            # 實用顯著性下限；fallback_severity：退回 sigma 的結果只列觀察名單。
+            # 三者的理由見 metric_rules.vel_high；與 db/schema.sql 的 seed 一致。
+            {'threshold_mode': 'iso', 'sigma': 3.0, 'consecutive_readings': 3,
+             'min_rel_change': 0.25, 'min_abs_change': 0.10, 'fallback_severity': 'observe'},
+            description='velRMS 相對 ISO 錨定門檻偏高（不適用 ISO 時退回相對基準，只列觀察名單）'),
         RuleConfigRow(
             'IMPACT_RISE', '衝擊性指標上升', 'monotonic', 'impact_rise', 'observe',
             # 逐軸門檻與合成值同量級：實測 crest 是逐軸較大（ZP 3-5 三軸

@@ -481,11 +481,20 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      --   隨機械等級而異，來源是國際標準的分級架構而非我們自訂的統計量。
      --   注意 iso 模式判的是 velRMS——Zone 邊界就是定義在速度 RMS 上，
      --   拿去比 velOA（實測約為 velRMS 的 0.75 倍）會讓門檻悄悄鬆掉三分之一。
-     --   設備未分級時自動退回 sigma，並在 evidence 標記 sigma_fallback。
+     --   設備未分級、或額定功率 ≤ 15 kW（不在 ISO 20816-3 適用範圍）時自動退回
+     --   sigma，並在 evidence 標記 sigma_fallback 與退回原因 iso_fallback_reason。
      -- sigma 保留為對照組，供敏感度掃描並列比較。
      -- consecutive_readings：同 ISO_ZONE，見該處說明。
-     '{"threshold_mode":"iso","sigma":3.0,"consecutive_readings":3}',
-     'velRMS 相對 ISO 錨定門檻偏高（未分類時退回相對基準 σ 判定）'),
+     -- min_rel_change／min_abs_change：相對基準路徑（sigma、sigma_fallback）的
+     --   實用顯著性下限——增幅須同時達到 +25% 與 0.10 mm/s。σ 以基準期標準差為
+     --   尺度，小機器穩定運轉時只有 0.01～0.02 mm/s，一點點變化就是十幾個 σ。
+     --   兩個數字都沒有外部標準可引用，依試跑期的誤報回饋調整（見 migration_007）。
+     -- fallback_severity：退回 sigma 的結果用什麼嚴重度。預設 observe＝只列週報的
+     --   觀察名單、不建立 Finding、不進簽核與 SLA：這條路徑的門檻是我們自訂的統計量，
+     --   沒有外部標準可引用。實測 11 週全部 41 件可行動的設備類告警都出自這條路徑，
+     --   且多半能由轉速狀態轉換或鄰機環境振動解釋。累積回饋後可改回 warn。
+     '{"threshold_mode":"iso","sigma":3.0,"consecutive_readings":3,"min_rel_change":0.25,"min_abs_change":0.10,"fallback_severity":"observe"}',
+     'velRMS 相對 ISO 錨定門檻偏高（不適用 ISO 時退回相對基準，預設只列觀察名單）'),
     ('IMPACT_RISE',        '衝擊性指標上升',   'monotonic',   'impact_rise',      'observe',
      -- 判定用 median 通道（acc_*_median），不用 max：小時內 3600 個滾動窗
      --   取最大值本質上是極值統計量，隨樣本數單調上升，跨設備不可比。
