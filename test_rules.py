@@ -628,8 +628,10 @@ def test_rule_config_plumbing() -> None:
     utc = _dt.timezone.utc
     past = _dt.datetime(2026, 6, 2, tzinfo=utc)
     future = _dt.datetime.now(utc) + _dt.timedelta(days=1)
-    check("補跑過去的日期：now 是那一天結束，不是真實的現在（否則整段歷史都算離線）",
-          rule_now(past) == past)
+    check("補跑過去的日期：now 是那一天的最後一秒，不是真實的現在（否則整段歷史都算離線）",
+          rule_now(past) == past - _dt.timedelta(seconds=1))
+    check("且仍落在該日之內（週報期間是半開區間，落在隔天零時會被算進隔天）",
+          rule_now(past).date() == (past - _dt.timedelta(days=1)).date())
     check("跑今天的資料：窗口結束在明天，now 是真實的現在",
           abs((rule_now(future) - _dt.datetime.now(utc)).total_seconds()) < 5)
     from vibcore.pipeline.daily import run_window_end
@@ -2392,11 +2394,52 @@ def test_db(dbname: str) -> None:
     check("（準備）process_point 跑到了規則判定", 'cfgs' in caught, str(pr.error))
     check("process_point 把含停用規則的設定交給引擎（STEP_CHANGE 的 is_active 是 False）",
           caught['cfgs'].get('STEP_CHANGE', {}).get('is_active') is False, str(sorted(caught['cfgs'])))
-    check("補跑過去的日期：規則的 now 是該日資料窗口結束（2026-05-03），不是真實的現在",
-          caught['now'] == dt.datetime(2026, 5, 3, tzinfo=dt.timezone.utc), str(caught['now']))
+    check("補跑過去的日期：規則的 now 是該日（2026-05-02）的最後一秒，不是真實的現在",
+          caught['now'] == dt.datetime(2026, 5, 2, 23, 59, 59, tzinfo=dt.timezone.utc), str(caught['now']))
     with conn.cursor() as cur:
         cur.execute("UPDATE rule_config SET is_active = TRUE WHERE rule_code = 'STEP_CHANGE'")
+        cur.execute("SELECT count(*) AS n FROM ingestion_log WHERE point_id = %s", (pr.point_id,))
+        n_single = cur.fetchone()['n']
     conn.commit()
+    check("單日檔案：匯入紀錄只有 run_date 那一天（日常行為與以前相同）", n_single == 1, str(n_single))
+
+    # ── 一次載入多天的歷史：每個有資料的日期都要有匯入紀錄 ──
+    # ingestion_log 的語意是「資料日期」。只記 run_date 的話，第一次上線載入的歷史、或上游補送的
+    # 前幾天，週報的匯入稽核會把那幾天判成「排程當天沒有執行」，第一份報告就跳出警示。
+    multi_raw = syn[pd.to_datetime(syn['Time']).dt.strftime('%Y-%m-%d').isin(
+        ['2026-05-04', '2026-05-05', '2026-05-07'])]          # 05-06 刻意缺：真的沒資料進來
+    with _tf.TemporaryDirectory() as _d:
+        multi_raw.to_csv(os.path.join(_d, 'syn.csv'), index=False, encoding='utf-8-sig')
+        multi = load_analytic_dir(_d)['SYN-1']
+    pr2 = daily_mod.process_point(conn, {'Name': 'SYN-2', 'Building': 'F7', 'Floor': '6F',
+                                         'System': '空調', 'RPM': 1710, 'FMF': 28.5},
+                                  multi, dt.date(2026, 5, 7))
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT ingest_date, status, row_count FROM ingestion_log "
+                    "WHERE point_id = %s ORDER BY ingest_date", (pr2.point_id,))
+        ing = cur.fetchall()
+    check("（準備）多天檔案處理成功", pr2.error is None, str(pr2.error))
+    check("多天檔案：有資料的三天各有一筆匯入紀錄，沒資料的 05-06 不補",
+          [r['ingest_date'] for r in ing] == [dt.date(2026, 5, 4), dt.date(2026, 5, 5), dt.date(2026, 5, 7)],
+          str([str(r['ingest_date']) for r in ing]))
+    # 設備整天沒運轉：資料完整，不是「檔案不完整」（否則備機每天都被標成匯入問題）
+    from vibcore.config import DataStatus as _DS
+    def _hours(*statuses):
+        return pd.DataFrame({'ts_hour': pd.date_range('2026-05-04', periods=len(statuses), freq='h'),
+                             'data_status': list(statuses)})
+    check("整天都沒運轉（備機）→ ok，不是 partial",
+          daily_mod._ingestion_status(_hours(*[_DS.NOT_RUNNING] * 24)) == 'ok')
+    check("有可分析的小時 → ok", daily_mod._ingestion_status(_hours(_DS.OK, _DS.NO_DATA)) == 'ok')
+    check("整天都是缺資料 → partial", daily_mod._ingestion_status(_hours(*[_DS.NO_DATA] * 24)) == 'partial')
+    check("只有資料不全的小時 → partial（樣本不足，檔案確實有缺）",
+          daily_mod._ingestion_status(_hours(_DS.PARTIAL, _DS.PARTIAL)) == 'partial')
+    check("沒有任何小時 → partial", daily_mod._ingestion_status(_hours()) == 'partial')
+
+    expect_rows = multi['datetime'].dt.date.value_counts().to_dict()
+    check("補記日期的筆數等於該日的資料列數、狀態合法",
+          all(r['row_count'] == expect_rows[r['ingest_date']] and r['status'] in ('ok', 'partial')
+              for r in ing if r['ingest_date'] != dt.date(2026, 5, 7)), str(ing))
 
     # ── 補跑歷史日期時，自動結案要用該批資料的時間，不是牆上時鐘 ──
     # 事項的 last_seen_at 是規則判定時的 now（歷史日期）；若拿真實的現在去比，

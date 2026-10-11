@@ -391,6 +391,11 @@ python -m vibcore.pipeline.daily --data-dir /path/to/當日Analytic資料
 python -m vibcore.pipeline.daily --data-dir /path/to/資料 --date 2026-08-25
 ```
 
+**第一次上線載入歷史資料**：基準期需要 14 天窗口內至少 168 小時可信資料，所以第一次不要只餵當天的檔。
+把最近 6～8 週的歷史檔放進資料夾，用 `--date <最新一天>` 跑一次即可——整份檔案都會聚合入庫、基準期自動建立，
+規則只判定最新一天的狀態。檔案涵蓋多天時，每個有資料的日期都會補一筆匯入紀錄（沒有資料列的日期不補），
+所以週報不會把補載的那幾天判成「匯入排程沒有執行」。
+
 ### 4.1 這支程式做了什麼
 
 1. 讀取資料夾內所有 Analytic CSV，依設備分組
@@ -442,6 +447,20 @@ curl -H "X-VIB-API-Key: $VIB_AGENT_API_KEY" \
 ```
 
 互動式文件在 `http://localhost:8000/docs`。
+
+---
+
+### 5.1 不接 Agent 也能產出週報
+
+週報主體本來就由資料庫產生，Agent 只補一段導讀。試跑期間（Agent 護欄尚未完成）直接用：
+
+```bash
+python -m vibcore.reporting.cli --days 7 --out output/weekly.html --save
+```
+
+`--save` 同時存入 `weekly_report` 並記稽核（動作 `render_report`，操作者 system；
+**不計入** Agent 的每日寄送額度）。補產歷史週報加 `--end-date 2026-08-20`。
+之後 Agent 對同一期間呼叫 `send_report` 會覆蓋這份。完整試跑流程見 `docs/TRIAL_RUN_PLAN.md`。
 
 ---
 
@@ -533,7 +552,7 @@ SELECT count(*) FROM pg_tables WHERE schemaname = 'vib';
 ```
 
 - **回傳 0** → 表真的沒建成功，重跑 `psql -d <資料庫名> -f db/schema.sql`
-- **回傳 20** → 表在，是**連線帳號沒有權限**。依 §一步驟 4 執行 GRANT
+- **回傳 21** → 表在，是**連線帳號沒有權限**。依 §一步驟 4 執行 GRANT
 
 `pg_tables` 是系統目錄不受權限過濾，所以能問出「事實」；而
 `information_schema.tables` 會依權限過濾，沒權限時即使表就在那裡也查不到。

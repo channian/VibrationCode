@@ -38,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
-from vibcore.config import AggregateConfig, DEFAULT_AGG, DEFAULT_TREND
+from vibcore.config import AggregateConfig, DEFAULT_AGG, DEFAULT_TREND, DataStatus
 from vibcore.db import repository as repo
 from vibcore.io.analytic_reader import load_analytic_dir
 from vibcore.metrics.baseline import detect_baseline
@@ -223,12 +223,14 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
             repo.upsert_daily(conn, point_id, daily)
 
         cov_ratio = result.coverage.get('analyzable_ratio', 0.0)
+        day_agg = _day_slice(agg, run_date)
         _record_ingestion(
             conn, point_id, run_date,
-            status='ok' if cov_ratio > 0 else 'partial',
+            status=_ingestion_status(day_agg if not day_agg.empty else agg),
             row_count=len(df),
             note=f"可分析比例 {cov_ratio:.1%}",
         )
+        _record_covered_dates(conn, point_id, df, agg, run_date)
 
         # ── 基準期：已有就沿用，沒有才嘗試建立 ──
         baseline = repo.get_baseline(conn, point_id)
@@ -275,7 +277,7 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
         # `now` 不能直接用牆上時鐘：補跑／重放歷史日期時，依 `now` 判定的規則
         # （SENSOR_OFFLINE 的「多久沒資料」、STANDBY_NO_RUNTIME 的「多久沒運轉」）會把
         # 整段歷史都算成離線，而且 Finding／觀察項目的首次出現時間會被壓成執行當天。
-        # 取兩者較早者：跑今天的資料就是現在，跑過去的日期就是那一天結束。
+        # 取兩者較早者：跑今天的資料就是現在，跑過去的日期就是那一天的最後一秒。
         ctx = RuleContext(
             device=device, point_id=point_id, position=position,
             agg=rule_agg, baseline=baseline, params={},
@@ -305,6 +307,57 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
     return result
 
 
+def _day_slice(agg: pd.DataFrame, d: date) -> pd.DataFrame:
+    """每小時聚合表中屬於某一天的列。"""
+    if agg.empty or 'ts_hour' not in agg.columns:
+        return agg.iloc[0:0]
+    return agg[agg['ts_hour'].dt.date == d]
+
+
+def _ingestion_status(agg_part: pd.DataFrame) -> str:
+    """
+    這段資料是不是完整收到了：有任何一個小時是 `ok`（可分析）或 `not_running`（有資料、設備沒轉）
+    就是 `ok`，否則 `partial`。
+
+    設備整天沒運轉（備機、停機檢修）時每個小時都是 `not_running`——資料是完整的，只是沒東西可分析。
+    以前用「可分析比例 > 0」判斷，會把每一台沒運轉的設備都標成「檔案不完整」，
+    週報的「系統面問題」整欄被備機洗滿，並叫人去檢查匯入排程。
+    """
+    if agg_part.empty or 'data_status' not in agg_part.columns:
+        return 'partial'
+    s = agg_part['data_status']
+    return 'ok' if ((s == DataStatus.OK) | (s == DataStatus.NOT_RUNNING)).any() else 'partial'
+
+
+def _record_covered_dates(conn, point_id: int, df, agg, run_date: date) -> int:
+    """
+    檔案涵蓋多天時，每一個有資料的日期都補一筆匯入紀錄（`run_date` 那天已另外記過）。
+
+    `ingestion_log.ingest_date` 的語意是「資料日期」（見 schema 的欄位說明）。只記 `run_date` 的話，
+    第一次上線一次載入的歷史資料、或上游補送的前幾天資料，週報的匯入稽核會把那幾天判成
+    「匯入排程當天很可能完全沒有執行」，在第一份報告就跳出嚇人的警示。沒有任何資料列的日期
+    **不補**——那是真的沒有資料進來，稽核照實標出。
+
+    回傳補記的天數。單日檔案（日常情況）回傳 0，行為與以前完全相同。
+    """
+    if df.empty or 'datetime' not in df.columns:
+        return 0
+    rows_by_date = df['datetime'].dt.date.value_counts()
+    if len(rows_by_date) <= 1:
+        return 0
+    n = 0
+    for d, n_rows in sorted(rows_by_date.items()):
+        if d == run_date:
+            continue
+        day = _day_slice(agg, d)
+        ratio = float((day['data_status'] == DataStatus.OK).mean()) if len(day) else 0.0
+        _record_ingestion(conn, point_id, d, status=_ingestion_status(day),
+                          row_count=int(n_rows),
+                          note=f"可分析比例 {ratio:.1%}（隨 {run_date} 的檔案補記）")
+        n += 1
+    return n
+
+
 # ──────────────────────────────────────────────────────────
 # Observation（observe 級判定，不進簽核鏈）
 # ──────────────────────────────────────────────────────────
@@ -317,12 +370,16 @@ def run_window_end(run_date: date) -> datetime:
 
 def rule_now(window_end: datetime) -> datetime:
     """
-    規則判定用的「現在」：牆上時鐘與該批資料窗口結束時間取較早者。
+    規則判定用的「現在」：牆上時鐘與該批資料窗口結束前一秒取較早者。
 
-    跑今天的資料，窗口結束在明天零時，所以是現在；補跑／重放過去的日期，是那一天結束。
+    跑今天的資料，窗口結束在明天零時，所以是現在；補跑／重放過去的日期，是那一天的最後一秒。
     見 `process_point` 的說明：依 `now` 判定的規則在補跑時不能拿真實的現在。
+
+    取「前一秒」而不是窗口結束本身：事項與觀察項目的 `first_seen_at`／`last_seen_at` 就是這個值，
+    而週報的期間是半開區間 `[起日, 迄日隔天零時)`。剛好落在隔天零時會被算進**隔天**，
+    補跑到某天的資料，那天的新事項與觀察名單就會缺席該期報告。
     """
-    return min(datetime.now(timezone.utc), window_end)
+    return min(datetime.now(timezone.utc), window_end - timedelta(seconds=1))
 
 
 def _outcome_to_observation(outcome, ctx) -> repo.Observation:

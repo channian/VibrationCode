@@ -2,7 +2,7 @@
 
 上線前的優先項目：**用歷史資料回測規則集，看會噴幾件 Finding，門檻該怎麼調。**
 
-系統會依 `db/schema.sql` 的 13 條規則自動建立 Finding 送進四階段簽核流程。
+系統會依 `db/schema.sql` 的 14 條規則自動建立 Finding 送進四階段簽核流程。
 如果規則太敏感，每週噴出幾百件，就會沒人願意用。這個框架回答的問題就是
 「這套規則跑過去 N 個月的資料，量級合不合理」——上線前先看過這份報告，
 再決定門檻要不要調。
@@ -176,6 +176,45 @@ VEL_HIGH**：帶了台帳、ISO 錨定的點沒觸發時，剩下的 VEL_HIGH �
 一樣。台帳的 `device_id` 與資料對不上（例如 `CH01_M1` 對 `CH 01_M1`）時，`offline`、`iso_readiness`
 與 `alarm_attribution --ledger` 都會警告該筆台帳沒有生效。
 
+## 現場回饋表（試跑用）
+
+回測告訴你規則「觸發了什麼」，不告訴你「觸發得對不對」。Dashboard 做出來之前，用試算表收集判定，
+再算每條規則的雜訊率——這是調整門檻、決定哪些觀察項可以升為派工的依據（流程見 `docs/TRIAL_RUN_PLAN.md`）。
+
+```bash
+# 試跑前預演：從回測的事件清單抽樣（每條規則最多 8 筆、同一設備同一規則最多 2 筆）
+python -m validate.review_sheet export --episodes output/episodes_detail.csv ^
+    --ledger 台帳.csv --out output/review_rehearsal.csv
+
+# 試跑期間每週：從資料庫匯出本週的 Finding 與觀察名單
+python -m validate.review_sheet export --db --days 7 --out output/review_2026-W41.csv
+
+# 每兩週：把填好的表（可多份）合併計分
+python -m validate.review_sheet score --sheets output/review_*.csv --csv output/review_score.csv
+```
+
+匯出時會一併產生 `_填寫說明.txt`。判讀人員只填四欄：
+
+| 欄 | 內容 |
+|---|---|
+| `判定` | **真實**（現場確認有此現象且該處理）／**已知**（真實，但已經知道、不需新動作）／**雜訊**（不該出現）／**不確定** |
+| `原因` | 標準詞：轉速負載、鄰機、備機停機、維修換件、感測器、通訊中斷、真實劣化、其他（可加自由文字） |
+| `處置` | 做了什麼 |
+| `備註`、`填寫人` | 自由填寫 |
+
+`score` 輸出每條規則的：看過件數、真實／已知／雜訊／不確定的占比、**雜訊率與 80% Wilson 信賴區間**、
+雜訊的原因分布、啟發式建議。建議只是建議：
+
+- 已判 < 10 件 → 「樣本不足」，不給調整建議（小樣本的比例沒有資訊量）
+- 雜訊率 ≥ 50% → 維持觀察名單或調門檻（已派工的規則則建議降為觀察）
+- 「真實＋已知」≥ 50% 且雜訊率 < 25% → 觀察級的規則可評估升為 `warn`；先確認「真實」不全是「已知」
+- 其餘 → 看原因欄；雜訊集中在某一類（鄰機、轉速）就針對那一類處理
+
+同一個 `item_id` 被多人填時取最後一筆（重複計算會讓雜訊率看起來比實際更有把握）；
+`判定` 欄認不得的文字會被列出，不會悄悄忽略。
+
+---
+
 ## 報告怎麼看
 
 跑完後，`output/validation/`（或你指定的 `--out-dir`）底下會有：
@@ -191,11 +230,11 @@ VEL_HIGH**：帶了台帳、ISO 錨定的點沒觸發時，剩下的 VEL_HIGH �
 | `threshold_sensitivity.csv` | 門檻敏感度掃描（預設對 `VEL_HIGH.sigma`／`IMPACT_RISE.crest_sigma`／`STEP_CHANGE.mahalanobis_sigma` 各掃一輪） |
 | `summary.txt` / `summary.html` | 摘要，含指標／規則層實作來源、涵蓋率、觸發統計（分「設備狀態類」／「資料可用性類」兩區塊）、分開的密度數字、掃描結果的重點整理 |
 
-> **13 條規則分成兩類**（見 `vibcore.rules.engine.RULE_CATEGORY`）：
+> **14 條規則分成兩類**（見 `vibcore.rules.engine.RULE_CATEGORY`）：
 > `data_availability`（資料可用性，處置者是 IT／儀電：`SENSOR_OFFLINE`／
 > `DATA_QUALITY`／`SENSOR_SATURATION`／`ISO_CLASS_SUSPECT`／
 > `ORIENTATION_CHANGE`）與 `equipment`（設備狀態，處置者是設備工程師：
-> 其餘 8 條）。實測資料裡前者常佔七成以上，混算成單一「觸發密度」會讓
+> 其餘 9 條）。實測資料裡前者常佔七成以上，混算成單一「觸發密度」會讓
 > 數字被資料可用性問題撐大，誤導門檻校準與人力配置——所以報表把兩者
 > 拆開，`trigger_density.csv` 的排行榜也改依 `equipment_per_week` 排序。
 

@@ -113,6 +113,14 @@ def resolve_period(days: int, end_date: date | None = None) -> tuple[date, date]
     return period_start, end_date
 
 
+def report_period_label(report_type: str, period_end: date) -> str:
+    """`weekly_report` 的期間鍵：週報為 ISO 週次（`2026-W41`），日報為日期。"""
+    if report_type == "weekly":
+        iso_cal = period_end.isocalendar()
+        return f"{iso_cal[0]}-W{iso_cal[1]:02d}"
+    return period_end.isoformat()
+
+
 def _period_utc_bounds(period_start: date, period_end: date) -> tuple[datetime, datetime]:
     """
     把 `resolve_period()` 算出的日曆日窗口，轉成查詢用的 `[start, end)` UTC
@@ -651,11 +659,7 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         building=payload.building, floor=payload.floor, system_name=payload.system_name,
     )
 
-    if payload.report_type == "weekly":
-        iso_cal = period_end.isocalendar()
-        period_label = f"{iso_cal[0]}-W{iso_cal[1]:02d}"
-    else:
-        period_label = period_end.isoformat()
+    period_label = report_period_label(payload.report_type, period_end)
 
     agent_payload = {
         "verdict": payload.verdict,

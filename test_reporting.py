@@ -30,6 +30,7 @@ import argparse
 import datetime as dt
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -370,6 +371,83 @@ def test_api(conn) -> None:
                                             to="boss@example.com")))
 
 
+def test_cli(conn) -> None:
+    """不經 Agent 的報告入口：只靠資料庫就能產出完整報告，且不動 Agent 的每日額度。"""
+    from vibcore.api import queries, service
+    from vibcore.api.schemas import SendReportRequest
+    from vibcore.reporting import cli
+
+    print("\n[4] 不經 Agent 產生報告（試跑用）")
+
+    def n_rows(table: str) -> int:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) AS n FROM {table}")
+            return cur.fetchone()["n"]
+
+    before_reports, before_audit = n_rows("weekly_report"), n_rows("audit_log")
+    rep = cli.build_report(conn, days=7)
+    html = rep["html"]
+    check("build_report 只讀不寫（weekly_report、audit_log 筆數不變）",
+          (n_rows("weekly_report"), n_rows("audit_log")) == (before_reports, before_audit))
+    check("沒有 Agent 也產出完整報告：事項、觀察名單、涵蓋率都在",
+          "速度位準超出 ISO 門檻" in html and "衝擊性指標上升" in html and "資料涵蓋率" in html
+          and len(html) > 5000, f"{len(html)} bytes")
+    check("總評由資料庫推算（有未結案 err 事項 → err）", rep["verdict"] == "err", rep["verdict"])
+    check("標題列用系統產生的摘要（數字來自資料庫），不是模型文字",
+          rep["headline"].startswith("本週新增") and "件事項" in rep["headline"], rep["headline"])
+    today = dt.date.today()
+    check("期間鍵與 send_report 同一套規則（ISO 週次）",
+          rep["period_label"] == service.report_period_label("weekly", today)
+          and re.fullmatch(r"\d{4}-W\d{2}", rep["period_label"]) is not None, rep["period_label"])
+    check("日報的期間鍵是日期",
+          cli.build_report(conn, days=1, report_type="daily")["period_label"] == today.isoformat())
+
+    cli.save_report(conn, rep)
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT agent_payload, verdict, length(html) AS n FROM weekly_report "
+                    "WHERE report_type = 'weekly' AND period_label = %s", (rep["period_label"],))
+        saved = cur.fetchall()
+        cur.execute("SELECT actor, action FROM audit_log WHERE action = 'render_report'")
+        audit = cur.fetchall()
+    check("--save 寫入一筆 weekly_report，來源標為 system",
+          len(saved) == 1 and saved[0]["agent_payload"]["source"] == "system"
+          and saved[0]["verdict"] == "err" and saved[0]["n"] > 5000, str(saved))
+    check("稽核動作是 render_report、操作者 system",
+          audit == [{"actor": "system", "action": "render_report"}], str(audit))
+    check("系統自己出報告不吃 Agent 的每日寄送額度", queries.count_send_report_today(conn) == 0)
+
+    cli.save_report(conn, cli.build_report(conn, days=7))
+    conn.commit()
+    check("同一期間重跑是覆蓋，不是多一筆", n_rows("weekly_report") == before_reports + 1)
+
+    res = service.send_report(conn, SendReportRequest(
+        report_type="weekly", days=7, verdict="err", headline="Agent 導讀標題。", actions=[]),
+        daily_limit=10)
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT agent_payload FROM weekly_report WHERE report_id = %s", (res["report_id"],))
+        after_agent = cur.fetchone()["agent_payload"]
+    check("之後 Agent 送出同一期間：覆蓋系統版，仍是同一筆",
+          n_rows("weekly_report") == before_reports + 1 and "source" not in after_agent
+          and after_agent["headline"] == "Agent 導讀標題。", str(after_agent))
+
+    import tempfile
+    out = os.path.join(tempfile.mkdtemp(), "sub", "w.html")
+    env_before = os.environ.get("VIB_DB_NAME")
+    os.environ["VIB_DB_NAME"] = conn.get_dsn_parameters()["dbname"]
+    try:
+        rc = cli.main(["--days", "7", "--out", out])
+    finally:
+        if env_before is None:
+            os.environ.pop("VIB_DB_NAME", None)
+        else:
+            os.environ["VIB_DB_NAME"] = env_before
+    check("命令列入口：寫出 HTML 檔（目錄不存在會建立）",
+          rc == 0 and os.path.getsize(out) > 5000)
+    check("命令列入口沒帶 --save 時不寫資料庫", n_rows("weekly_report") == before_reports + 1)
+
+
 def _raises(exc, fn) -> bool:
     try:
         fn()
@@ -393,11 +471,11 @@ def main() -> int:
     try:
         build_test_db(args.dbname)
     except FileNotFoundError:
-        # 本檔 46 項驗收全部要走資料庫（週報是從 SQL 組出來的），沒有可以
+        # 本檔的驗收全部要走資料庫（週報是從 SQL 組出來的），沒有可以
         # 退而求其次只跑一部分的路徑。所以這裡不是「略過」，是真的跑不了
         # ——但要講清楚這是環境缺件，不是程式有問題。
         print("找不到 psql / createdb：這是環境缺件，不是驗收失敗。\n"
-              "  本檔的 46 項驗收全部需要資料庫（週報內容是從 SQL 組出來的），\n"
+              "  本檔的驗收全部需要資料庫（週報內容是從 SQL 組出來的），\n"
               "  沒有用戶端就一項都跑不了。\n"
               "\n"
               "  安裝用戶端即可，不需要在本機跑資料庫伺服器：\n"
@@ -420,6 +498,7 @@ def main() -> int:
     try:
         test_scope(conn)
         test_render(conn)
+        test_cli(conn)
         test_api(conn)
     except AssertionError as e:
         print(f"\n❌ 驗收失敗：{e}")
