@@ -40,6 +40,7 @@ import pandas as pd
 
 from vibcore.config import AggregateConfig, DEFAULT_AGG, DEFAULT_TREND, DataStatus
 from vibcore.db import repository as repo
+from vibcore.db.connection import transaction
 from vibcore.io.analytic_reader import load_analytic_dir
 from vibcore.metrics.baseline import detect_baseline
 from vibcore.pipeline.aggregate import aggregate_hourly, coverage_report, rollup_daily
@@ -99,6 +100,10 @@ class DailyRunResult:
     observed_count: int = 0
     auto_resolved: int = 0
     escalated: int = 0
+    #: 寫入資料庫時失敗的項目（觀察項目、事項、自動結案…），每筆一段說明。
+    #: 單筆失敗只丟掉那一筆（見 `vibcore.db.connection.transaction`），其餘照常寫入；
+    #: 但必須數出來——失敗被吞掉而摘要看起來一切正常，是最危險的狀態。
+    persist_errors: list[str] = field(default_factory=list)
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
@@ -111,10 +116,13 @@ class DailyRunResult:
         return sum(1 for p in self.points if not p.ok)
 
     def summary(self) -> str:
-        return (f"{self.run_date}：量測點 {self.n_ok} 成功 / {self.n_failed} 失敗，"
+        text = (f"{self.run_date}：量測點 {self.n_ok} 成功 / {self.n_failed} 失敗，"
                 f"事項 upsert {self.findings_upserted}、"
                 f"觀察名單（不進 SLA）{self.observed_count}、"
                 f"自動結案 {self.auto_resolved}、標記惡化 {self.escalated}")
+        if self.persist_errors:
+            text += f"；⚠ 寫入失敗 {len(self.persist_errors)} 筆（原因見日誌）"
+        return text
 
 
 # ──────────────────────────────────────────────────────────
@@ -140,8 +148,11 @@ def _record_ingestion(conn, point_id: int, ingest_date: date, status: str,
         logger.debug("repository.record_ingestion 尚未就緒，僅記錄日誌")
         return
     try:
-        fn(conn, point_id=point_id, ingest_date=ingest_date, status=status,
-           source_file=source_file, row_count=row_count, note=note)
+        # 自己一個 SAVEPOINT：SQL 失敗後不退回的話，整個交易就毒化了，
+        # 「稽核失敗不得中斷主流程」只擋得住 Python 例外，擋不住這個。
+        with transaction(conn):
+            fn(conn, point_id=point_id, ingest_date=ingest_date, status=status,
+               source_file=source_file, row_count=row_count, note=note)
     except Exception as e:      # 稽核失敗不得中斷主流程
         logger.warning(f"匯入軌跡寫入失敗（{point_id}/{ingest_date}）：{e}")
 
@@ -200,102 +211,112 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
     result = PointResult(device_id=device_id, position=position)
 
     try:
-        device, point_id = _ensure_device_and_point(conn, device_meta, position)
+        # 設備與量測點先在自己的 SAVEPOINT 裡建好並保留：後面任何一步失敗時，
+        # 這個點還在，才能記下一筆「匯入失敗」，週報才分得出「失敗」和「沒資料」。
+        with transaction(conn):
+            device, point_id = _ensure_device_and_point(conn, device_meta, position)
         result.point_id = point_id
         result.ingested_rows = len(df)
 
-        agg = aggregate_hourly(df, agg_cfg)
-        if agg.empty:
-            result.error = '聚合後無資料'
-            _record_ingestion(conn, point_id, run_date, 'failed',
-                              row_count=len(df), note=result.error)
-            return result
+        # 資料寫入放在同一個 SAVEPOINT：中途任何 SQL 失敗就整段退回，這個量測點不會留下半套資料，
+        # 也不會毒化交易讓後面的量測點全部跟著失敗（PostgreSQL 的交易一旦出錯，之後每一句都被
+        # 拒絕，最後的 commit 還會安靜地變成 rollback，當天整批資料就不見了）。
+        with transaction(conn):
+            agg = aggregate_hourly(df, agg_cfg)
+            if agg.empty:
+                result.error = '聚合後無資料'
+                _record_ingestion(conn, point_id, run_date, 'failed',
+                                  row_count=len(df), note=result.error)
+                return result
 
-        repo.bulk_insert_agg(conn, point_id, agg)
-        result.agg_hours = len(agg)
-        result.coverage = coverage_report(agg)
+            repo.bulk_insert_agg(conn, point_id, agg)
+            result.agg_hours = len(agg)
+            result.coverage = coverage_report(agg)
 
-        # 日層 rollup。週報與長期趨勢讀的是 measurement_daily，這一步漏掉
-        # 的話那張表永遠是空的，而且不會有任何錯誤訊息——週報只會顯示
-        # 「查無資料」，看起來像設備沒運轉。
-        daily = rollup_daily(agg, agg_cfg)
-        if not daily.empty:
-            repo.upsert_daily(conn, point_id, daily)
+            # 日層 rollup。週報與長期趨勢讀的是 measurement_daily，這一步漏掉
+            # 的話那張表永遠是空的，而且不會有任何錯誤訊息——週報只會顯示
+            # 「查無資料」，看起來像設備沒運轉。
+            daily = rollup_daily(agg, agg_cfg)
+            if not daily.empty:
+                repo.upsert_daily(conn, point_id, daily)
 
-        cov_ratio = result.coverage.get('analyzable_ratio', 0.0)
-        day_agg = _day_slice(agg, run_date)
-        _record_ingestion(
-            conn, point_id, run_date,
-            status=_ingestion_status(day_agg if not day_agg.empty else agg),
-            row_count=len(df),
-            note=f"可分析比例 {cov_ratio:.1%}",
-        )
-        _record_covered_dates(conn, point_id, df, agg, run_date)
+            cov_ratio = result.coverage.get('analyzable_ratio', 0.0)
+            day_agg = _day_slice(agg, run_date)
+            _record_ingestion(
+                conn, point_id, run_date,
+                status=_ingestion_status(day_agg if not day_agg.empty else agg),
+                row_count=len(df),
+                note=f"可分析比例 {cov_ratio:.1%}",
+            )
+            _record_covered_dates(conn, point_id, df, agg, run_date)
 
-        # ── 基準期：已有就沿用，沒有才嘗試建立 ──
-        baseline = repo.get_baseline(conn, point_id)
+        # 基準期與規則判定另開一個 SAVEPOINT：這一段失敗時，上面已經寫好的聚合與匯入紀錄不該跟著丟掉
+        # （資料收進來了，只是判定出問題）。
+        with transaction(conn):
+            # ── 基準期：已有就沿用，沒有才嘗試建立 ──
+            baseline = repo.get_baseline(conn, point_id)
 
-        # 保養後既有基準失效（ISO 10816-3 §5.4.1）。若不做這件事，
-        # `not_before` 只在「第一次建立基準」時生效——設備大修後既有基準
-        # 會被無限沿用，而那份基準描述的是保養前的機器狀態。之後所有 σ
-        # 判定都對著一個已經不存在的狀態比較，且不會有任何錯誤訊息。
-        last_maint = getattr(device, 'last_maintenance_at', None)
-        if baseline is not None and last_maint is not None \
-                and baseline.start_date < last_maint.date():
-            logger.info(f"  {device_id}/{position}：基準期起點 {baseline.start_date} 早於"
-                        f"最後一次保養 {last_maint.date()}，捨棄並重建")
-            baseline = None
+            # 保養後既有基準失效（ISO 10816-3 §5.4.1）。若不做這件事，
+            # `not_before` 只在「第一次建立基準」時生效——設備大修後既有基準
+            # 會被無限沿用，而那份基準描述的是保養前的機器狀態。之後所有 σ
+            # 判定都對著一個已經不存在的狀態比較，且不會有任何錯誤訊息。
+            last_maint = getattr(device, 'last_maintenance_at', None)
+            if baseline is not None and last_maint is not None \
+                    and baseline.start_date < last_maint.date():
+                logger.info(f"  {device_id}/{position}：基準期起點 {baseline.start_date} 早於"
+                            f"最後一次保養 {last_maint.date()}，捨棄並重建")
+                baseline = None
 
-        if baseline is None:
-            history = repo.get_agg(conn, point_id,
-                                   datetime.combine(run_date, datetime.min.time(),
-                                                    tzinfo=timezone.utc) - timedelta(days=90),
-                                   datetime.combine(run_date, datetime.min.time(),
-                                                    tzinfo=timezone.utc) + timedelta(days=1))
-            if not history.empty:
-                # 基準期不得早於最後一次保養（ISO 10816-3 §5.4.1，
-                # 理由見 detect_baseline 的 not_before 說明）
-                baseline = detect_baseline(
-                    history, point_id=point_id,
-                    not_before=getattr(device, 'last_maintenance_at', None),
-                )
-                if baseline is not None:
-                    repo.save_baseline(conn, baseline)
-                    logger.info(f"  {device_id}/{position}：建立基準期 "
-                                f"{baseline.start_date}~{baseline.end_date}"
-                                f"（{baseline.n_hours} 小時）")
+            if baseline is None:
+                history = repo.get_agg(conn, point_id,
+                                       datetime.combine(run_date, datetime.min.time(),
+                                                        tzinfo=timezone.utc) - timedelta(days=90),
+                                       datetime.combine(run_date, datetime.min.time(),
+                                                        tzinfo=timezone.utc) + timedelta(days=1))
+                if not history.empty:
+                    # 基準期不得早於最後一次保養（ISO 10816-3 §5.4.1，
+                    # 理由見 detect_baseline 的 not_before 說明）
+                    baseline = detect_baseline(
+                        history, point_id=point_id,
+                        not_before=getattr(device, 'last_maintenance_at', None),
+                    )
+                    if baseline is not None:
+                        repo.save_baseline(conn, baseline)
+                        logger.info(f"  {device_id}/{position}：建立基準期 "
+                                    f"{baseline.start_date}~{baseline.end_date}"
+                                    f"（{baseline.n_hours} 小時）")
 
-        # ── 規則判定 ──
-        # 規則需要看趨勢，因此餵入的是歷史區間而非只有當日
-        window_start = (datetime.combine(run_date, datetime.min.time(), tzinfo=timezone.utc)
-                        - timedelta(days=DEFAULT_TREND.min_days * 2))
-        window_end = run_window_end(run_date)
-        rule_agg = repo.get_agg(conn, point_id, window_start, window_end)
-        if rule_agg.empty:
-            rule_agg = agg
+            # ── 規則判定 ──
+            # 規則需要看趨勢，因此餵入的是歷史區間而非只有當日
+            window_start = (datetime.combine(run_date, datetime.min.time(), tzinfo=timezone.utc)
+                            - timedelta(days=DEFAULT_TREND.min_days * 2))
+            window_end = run_window_end(run_date)
+            rule_agg = repo.get_agg(conn, point_id, window_start, window_end)
+            if rule_agg.empty:
+                rule_agg = agg
 
-        # `now` 不能直接用牆上時鐘：補跑／重放歷史日期時，依 `now` 判定的規則
-        # （SENSOR_OFFLINE 的「多久沒資料」、STANDBY_NO_RUNTIME 的「多久沒運轉」）會把
-        # 整段歷史都算成離線，而且 Finding／觀察項目的首次出現時間會被壓成執行當天。
-        # 取兩者較早者：跑今天的資料就是現在，跑過去的日期就是那一天的最後一秒。
-        ctx = RuleContext(
-            device=device, point_id=point_id, position=position,
-            agg=rule_agg, baseline=baseline, params={},
-            now=rule_now(window_end),
-            axis_energy_baseline=(baseline.stats.get('axis_energy_sorted')
-                                  if baseline and hasattr(baseline, 'stats') else None),
-        )
-        # active_only=False：停用的規則要查得到（is_active=False），引擎才跳得過它；
-        # 只給啟用中的，停用的規則會因為查不到設定而用程式碼預設值照跑。
-        rule_configs = repo.get_rule_configs(conn, active_only=False)
-        outcomes = evaluate_all(ctx, rule_configs)
-        # 依嚴重度分兩桶：actionable（err/warn）進 triggered、其餘
-        # （目前只有 observe）進 observed。分類只看 outcome.severity，
-        # 與後面 persist_findings 是否真的寫入 DB 無關。
-        result.triggered = [o.rule_code for o in outcomes if is_actionable(o.severity)]
-        result.observed = [o.rule_code for o in outcomes if not is_actionable(o.severity)]
-        result._outcomes = outcomes          # type: ignore[attr-defined]
-        result._ctx = ctx                    # type: ignore[attr-defined]
+            # `now` 不能直接用牆上時鐘：補跑／重放歷史日期時，依 `now` 判定的規則
+            # （SENSOR_OFFLINE 的「多久沒資料」、STANDBY_NO_RUNTIME 的「多久沒運轉」）會把
+            # 整段歷史都算成離線，而且 Finding／觀察項目的首次出現時間會被壓成執行當天。
+            # 取兩者較早者：跑今天的資料就是現在，跑過去的日期就是那一天的最後一秒。
+            ctx = RuleContext(
+                device=device, point_id=point_id, position=position,
+                agg=rule_agg, baseline=baseline, params={},
+                now=rule_now(window_end),
+                axis_energy_baseline=(baseline.stats.get('axis_energy_sorted')
+                                      if baseline and hasattr(baseline, 'stats') else None),
+            )
+            # active_only=False：停用的規則要查得到（is_active=False），引擎才跳得過它；
+            # 只給啟用中的，停用的規則會因為查不到設定而用程式碼預設值照跑。
+            rule_configs = repo.get_rule_configs(conn, active_only=False)
+            outcomes = evaluate_all(ctx, rule_configs)
+            # 依嚴重度分兩桶：actionable（err/warn）進 triggered、其餘
+            # （目前只有 observe）進 observed。分類只看 outcome.severity，
+            # 與後面 persist_findings 是否真的寫入 DB 無關。
+            result.triggered = [o.rule_code for o in outcomes if is_actionable(o.severity)]
+            result.observed = [o.rule_code for o in outcomes if not is_actionable(o.severity)]
+            result._outcomes = outcomes          # type: ignore[attr-defined]
+            result._ctx = ctx                    # type: ignore[attr-defined]
 
     except Exception as e:
         logger.error(f"{device_id}/{position} 處理失敗：{e}", exc_info=True)
@@ -458,7 +479,13 @@ def _is_worse(new_value: float | None, old_value: float | None,
     return (new_dist - old_dist) / old_dist * 100 >= ESCALATE_MIN_DELTA_PCT
 
 
-def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
+def _note_error(errors: list[str], message: str) -> None:
+    logger.error(message)
+    errors.append(message)
+
+
+def persist_findings(conn, results: list[PointResult],
+                     errors: list[str] | None = None) -> tuple[int, int, int]:
     """
     把規則判定結果寫入資料庫，並偵測惡化。
 
@@ -474,9 +501,15 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
     事項（見 db/schema.sql 該表的說明）。`PointResult.observed` 仍保留
     rule_code 清單供執行摘要使用，但落庫與否已與它無關。
 
+    每一筆寫入各自一個 SAVEPOINT。PostgreSQL 的交易一旦遇到 SQL 錯誤（外鍵、約束、缺表），之後每一句
+    都被拒絕，最後的 commit 還會安靜地變成 rollback——只靠 try/except 擋 Python 例外，一筆壞資料
+    （例如舊庫缺某條規則的設定列，外鍵違反）就會讓當天所有已寫入的東西一起消失，而排程的結束碼是 0。
+    現在失敗只丟掉那一筆，並把原因加進 `errors`（呼叫端據此在摘要與結束碼提醒）。
+
     Returns:
         (finding upsert 筆數, 標記惡化筆數, 實際寫入 observation 的筆數)
     """
+    errors = errors if errors is not None else []
     n_upsert = n_escalate = n_observed = 0
     existing = {f['finding_key']: f for f in repo.get_open_findings(conn)}
 
@@ -490,19 +523,21 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
             if not is_actionable(outcome.severity):
                 observation = _outcome_to_observation(outcome, ctx)
                 try:
-                    repo.upsert_observation(conn, observation)
+                    with transaction(conn):
+                        repo.upsert_observation(conn, observation)
                     n_observed += 1
                 except Exception as e:
-                    logger.error(f"Observation upsert 失敗（{observation.observation_key}）：{e}")
+                    _note_error(errors, f"Observation upsert 失敗（{observation.observation_key}）：{e}")
                 continue
 
             finding = outcome_to_finding(outcome, ctx)
             prev = existing.get(finding.finding_key)
             try:
-                repo.upsert_finding(conn, finding)
+                with transaction(conn):
+                    repo.upsert_finding(conn, finding)
                 n_upsert += 1
             except Exception as e:
-                logger.error(f"Finding upsert 失敗（{finding.finding_key}）：{e}")
+                _note_error(errors, f"Finding upsert 失敗（{finding.finding_key}）：{e}")
                 continue
 
             # 惡化偵測：與上一次的數值比，而非與基準比
@@ -510,20 +545,22 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
                                   prev.get('current_value'),
                                   finding.baseline_value):
                 try:
-                    repo.mark_escalated(
-                        conn, finding.finding_key,
-                        note=f"數值由 {prev.get('current_value')} 變為 "
-                             f"{finding.current_value}，較上次更偏離基準",
-                    )
+                    with transaction(conn):
+                        repo.mark_escalated(
+                            conn, finding.finding_key,
+                            note=f"數值由 {prev.get('current_value')} 變為 "
+                                 f"{finding.current_value}，較上次更偏離基準",
+                        )
                     n_escalate += 1
                 except Exception as e:
-                    logger.warning(f"標記惡化失敗（{finding.finding_key}）：{e}")
+                    _note_error(errors, f"標記惡化失敗（{finding.finding_key}）：{e}")
 
     return n_upsert, n_escalate, n_observed
 
 
 def auto_resolve_quiet(conn, quiet_days: int = DEFAULT_QUIET_DAYS,
-                       now: datetime | None = None) -> int:
+                       now: datetime | None = None,
+                       errors: list[str] | None = None) -> int:
     """
     自動結案：連續 `quiet_days` 天未再觸發的未結案事項。
 
@@ -550,20 +587,43 @@ def auto_resolve_quiet(conn, quiet_days: int = DEFAULT_QUIET_DAYS,
         if last_seen >= cutoff:
             continue
         try:
-            repo.auto_resolve(
-                conn, row['finding_key'],
-                note=f"連續 {quiet_days} 天未再觸發（最後一次 "
-                     f"{last_seen.date()}），由系統自動結案",
-            )
+            with transaction(conn):
+                repo.auto_resolve(
+                    conn, row['finding_key'],
+                    note=f"連續 {quiet_days} 天未再觸發（最後一次 "
+                         f"{last_seen.date()}），由系統自動結案",
+                )
             n += 1
         except Exception as e:
-            logger.warning(f"自動結案失敗（{row['finding_key']}）：{e}")
+            msg = f"自動結案失敗（{row['finding_key']}）：{e}"
+            logger.warning(msg)
+            if errors is not None:
+                errors.append(msg)
     return n
 
 
 # ──────────────────────────────────────────────────────────
 # 入口
 # ──────────────────────────────────────────────────────────
+
+def pending_migrations(conn) -> list[str]:
+    """
+    資料庫結構／種子資料還沒跟上程式的地方（判斷方式見 `vibcore.check.migration_status`），只讀。
+
+    舊庫缺 migration 時，排程不會報錯停下來，而是安靜地做錯事：缺 `observation` 表時觀察項目寫不進去，
+    缺某條規則的設定列時該規則的觀察項目因外鍵而寫不進去，觀察級規則的嚴重度停在 warn 時它們會被當成
+    要派工的事項。所以每次排程開頭先看一眼，缺什麼就大聲講。
+    """
+    from vibcore.check import migration_status
+    try:
+        with transaction(conn), conn.cursor() as cur:
+            return [f"{key}：{summary}（db/{fname}）"
+                    for key, fname, summary, ok in migration_status(cur) if ok is False]
+    except Exception as e:                      # 檢查本身壞掉不該擋住排程
+        logger.warning(f"無法檢查資料庫結構版本：{e}")
+        return []
+
+
 
 def run_daily(conn, data_dir: str, run_date: date | None = None,
               pattern: str = '*.csv',
@@ -587,6 +647,10 @@ def run_daily(conn, data_dir: str, run_date: date | None = None,
     result = DailyRunResult(run_date=run_date, started_at=datetime.now(timezone.utc))
 
     logger.info(f"每日排程開始：{run_date}，資料來源 {data_dir}")
+    pending = pending_migrations(conn)
+    if pending:
+        logger.error("資料庫有 migration 尚未套用，判定與寫入可能不正確——請先執行 "
+                     "`python -m vibcore.check` 並依指示補套用：\n  " + "\n  ".join(pending))
 
     vib_data = load_analytic_dir(data_dir, pattern)
     if not vib_data:
@@ -603,10 +667,11 @@ def run_daily(conn, data_dir: str, run_date: date | None = None,
         result.points.append(process_point(conn, meta, df, run_date, agg_cfg=agg_cfg))
 
     result.findings_upserted, result.escalated, result.observed_count = (
-        persist_findings(conn, result.points)
+        persist_findings(conn, result.points, errors=result.persist_errors)
     )
     result.auto_resolved = auto_resolve_quiet(conn, quiet_days,
-                                              now=rule_now(run_window_end(run_date)))
+                                              now=rule_now(run_window_end(run_date)),
+                                              errors=result.persist_errors)
     result.finished_at = datetime.now(timezone.utc)
 
     logger.info(result.summary())
@@ -642,7 +707,8 @@ def main() -> int:
                            pattern=args.pattern, quiet_days=args.quiet_days)
 
     print('\n  ' + result.summary())
-    return 1 if result.n_failed and not result.n_ok else 0
+    # 全部量測點都失敗、或有任何一筆寫入失敗，結束碼就不是 0——排程工具才有辦法提醒。
+    return 1 if (result.n_failed and not result.n_ok) or result.persist_errors else 0
 
 
 if __name__ == '__main__':

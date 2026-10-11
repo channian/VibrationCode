@@ -26,6 +26,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -2631,7 +2632,18 @@ def test_db(dbname: str) -> None:
             INSERT INTO scada_reading VALUES ('OLD|TAG_I', '2026-08-01 00:00+08', 41.5);
         """)
         check("（準備）舊結構的測試資料建得起來", r0.returncode == 0, r0.stderr[:200])
+        from vibcore import check as _chk
+        _c6 = _connect_db(env, old_db)
+        with _c6.cursor() as _cur:
+            before6 = {k: ok for k, _, _, ok in _chk.migration_status(_cur)}
+        check("舊的 SCADA 結構 → 自檢指出 006 尚未套用，其餘照常",
+              before6['006'] is False and all(v is True for k, v in before6.items() if k != '006'),
+              str(before6))
         runs = [_psql("-f", mig6) for _ in range(2)]
+        with _c6.cursor() as _cur:
+            after6 = {k: ok for k, _, _, ok in _chk.migration_status(_cur)}
+        _c6.close()
+        check("套用 migration_006 後 → 自檢回報 006 已套用", after6['006'] is True, str(after6))
         check("migration_006 由舊結構套用成功，且可重複套用（冪等）",
               all(r.returncode == 0 for r in runs),
               '；'.join(r.stderr[:200] for r in runs if r.returncode != 0))
@@ -2718,7 +2730,248 @@ def test_db(dbname: str) -> None:
     else:
         skip("migration_007 行為", f"找不到 {mig7}")
 
+    _test_migration_status_and_008(dbname, env)
+    _test_error_isolation(dbname, env)
+
     subprocess.run(["dropdb", "--if-exists", dbname], env=env, capture_output=True)
+
+
+def _connect_db(env: dict, name: str):
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    return psycopg2.connect(
+        host=env["PGHOST"], port=int(env["PGPORT"]), user=env["PGUSER"],
+        password=os.environ.get("VIB_DB_PASSWORD") or None, dbname=name,
+        options="-c search_path=vib,public", cursor_factory=RealDictCursor)
+
+
+def _test_migration_status_and_008(dbname: str, env: dict) -> None:
+    """
+    舊庫（由舊版 schema.sql 建庫、再逐支套 migration）與全新建庫的種子資料會分岔：缺 TEMP_RISE 一列、
+    觀察級規則的嚴重度仍是 warn。正式排程以 rule_config.severity 為上限，停在 warn 的規則會建立
+    Finding 派工，等於繞過「只進觀察名單」的政策；缺的那一列則讓該規則的觀察項目因外鍵而寫不進去。
+    這一節驗：自檢能指出缺哪支 migration，migration_008 能把舊庫對齊且不蓋掉現場的設定。
+    （從最早的 schema 依序套滿 001～008，與全新建庫逐項相同，另以手動對照實驗確認過。）
+    """
+    from vibcore import check as chk
+
+    print("\n[13b] 舊庫對齊：結構版本自檢與 migration_008")
+    mig8 = "db/migration_008_rule_config_seed_alignment.sql"
+    if not os.path.exists(mig8):
+        skip("migration_008 與結構版本自檢", f"找不到 {mig8}")
+        return
+
+    def run_sql(name, *a):
+        return subprocess.run(["psql", "-q", "-v", "ON_ERROR_STOP=1", "-d", name, *a],
+                              env=env, capture_output=True, text=True)
+
+    # ── 規範狀態：另建一個全新的庫，不受前面測試對本庫的改動影響 ──
+    canon_db = dbname.replace('_test', '') + "_canon_test"
+    subprocess.run(["dropdb", "--if-exists", canon_db], env=env, capture_output=True)
+    subprocess.run(["createdb", canon_db], env=env, capture_output=True)
+    r = run_sql(canon_db, "-f", "db/schema.sql")
+    check("（準備）規範庫建得起來", r.returncode == 0, r.stderr[:200])
+    cc = _connect_db(env, canon_db)
+    with cc.cursor() as cur:
+        cur.execute("SELECT rule_code, severity, params, is_active, description FROM rule_config")
+        canon = {x['rule_code']: dict(x) for x in cur.fetchall()}
+        cur.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'vib'")
+        canon_tables = {x['tablename'] for x in cur.fetchall()}
+        fresh_status = {k: ok for k, _, _, ok in chk.migration_status(cur)}
+        fresh_dev = chk.policy_deviations(cur)
+        # 找不到規則設定列時要回「無法判斷」，不是「未套用」或「已套用」
+        cur.execute("DELETE FROM rule_config WHERE rule_code IN ('IMPACT_RISE', 'VEL_HIGH')")
+        gone = {k: ok for k, _, _, ok in chk.migration_status(cur)}
+    cc.close()
+    subprocess.run(["dropdb", "--if-exists", canon_db], env=env, capture_output=True)
+
+    check("自檢的必要資料表清單與 schema.sql 一致（漏了 observation 時，缺這張表的庫會被誤判為正常）",
+          set(chk.EXPECTED_TABLES) == canon_tables,
+          str(sorted(canon_tables ^ set(chk.EXPECTED_TABLES))))
+    check("自檢的 14 條規則清單與 schema.sql 的種子一致", set(chk.EXPECTED_RULES) == set(canon),
+          str(sorted(set(canon) ^ set(chk.EXPECTED_RULES))))
+    check("觀察級政策的規則清單 ＝ schema.sql 種子裡嚴重度為 observe 的規則",
+          set(chk.OBSERVE_POLICY_RULES) == {c for c, x in canon.items() if x['severity'] == 'observe'})
+    check("全新建庫：每一項 migration 探針都回「已套用」",
+          fresh_status and all(v is True for v in fresh_status.values()), str(fresh_status))
+    check("全新建庫：沒有任何與派工政策不一致的設定",
+          fresh_dev == {'observe_but_dispatching': [], 'disabled': [], 'vel_high_fallback': 'observe'},
+          str(fresh_dev))
+    check("找不到 IMPACT_RISE／VEL_HIGH 設定列時，005／007 回「無法判斷」(None)，不亂報",
+          gone['005'] is None and gone['007'] is None, str(gone))
+
+    schema_sql = open("db/schema.sql", encoding="utf-8").read()
+    mig_sql = open(mig8, encoding="utf-8").read()
+    pat = re.compile(r"INSERT INTO rule_config \(rule_code.*?VALUES\n.*?;\n", re.S)
+    seed_a = pat.search(schema_sql).group(0)
+    seed_b = pat.search(mig_sql.replace("\nON CONFLICT (rule_code) DO NOTHING;", ";")).group(0)
+    check("migration_008 裡的種子與 schema.sql 逐字相同（只多了 ON CONFLICT）", seed_a == seed_b)
+
+    # ── 把本庫弄成「舊庫」的樣子，再套 migration_008 ──
+    five = [c for c in chk.OBSERVE_POLICY_RULES if c != 'TEMP_RISE']
+    oc = _connect_db(env, dbname)
+    with oc.cursor() as cur:
+        cur.execute("DELETE FROM observation WHERE rule_code = 'TEMP_RISE'")
+        cur.execute("DELETE FROM finding WHERE rule_code = 'TEMP_RISE'")
+        cur.execute("DELETE FROM rule_config WHERE rule_code = 'TEMP_RISE'")
+        cur.execute("UPDATE rule_config SET severity = 'warn' WHERE rule_code = ANY(%s)", (five,))
+        cur.execute("UPDATE rule_config SET params = '{}'::jsonb WHERE rule_code = 'ISO_CLASS_SUSPECT'")
+        cur.execute("UPDATE rule_config SET params = params - 'threshold_mode', description = %s "
+                    "WHERE rule_code = 'VEL_HIGH'",
+                    ('velRMS 相對 ISO 錨定門檻偏高（未分類時退回相對基準 σ 判定）',))
+        # 現場的刻意設定：migration_008 不該蓋掉
+        cur.execute("UPDATE rule_config SET params = '{\"crest_sigma\":3.1,\"crest_axis_sigma\":2.5}'::jsonb, "
+                    "is_active = FALSE WHERE rule_code = 'IMPACT_RISE'")
+        cur.execute("UPDATE rule_config SET severity = 'warn', params = params || '{\"hours\":36}'::jsonb "
+                    "WHERE rule_code = 'SENSOR_OFFLINE'")
+        old_status = {k: ok for k, _, _, ok in chk.migration_status(cur)}
+        old_dev = chk.policy_deviations(cur)
+    oc.commit()
+    check("自檢：缺 TEMP_RISE 這一列 → 只指出 migration_008 尚未套用，其餘都已套用",
+          old_status['008'] is False and all(v is True for k, v in old_status.items() if k != '008'),
+          str(old_status))
+    check("自檢：指出被設成會派工的觀察級規則，並列出停用的規則",
+          old_dev['observe_but_dispatching'] == sorted(five) and old_dev['disabled'] == ['IMPACT_RISE'],
+          str(old_dev))
+
+    runs = [run_sql(dbname, "-f", mig8) for _ in range(2)]
+    check("migration_008 可套用於舊庫，且可重複套用（冪等）", all(x.returncode == 0 for x in runs),
+          '；'.join(x.stderr[:200] for x in runs if x.returncode != 0))
+    with oc.cursor() as cur:
+        cur.execute("SELECT rule_code, severity, params, is_active, description FROM rule_config")
+        rows = {x['rule_code']: dict(x) for x in cur.fetchall()}
+        after_status = {k: ok for k, _, _, ok in chk.migration_status(cur)}
+        after_dev = chk.policy_deviations(cur)
+    oc.commit()
+    check("補回缺的 TEMP_RISE，內容與規範庫相同",
+          'TEMP_RISE' in rows and rows['TEMP_RISE']['severity'] == canon['TEMP_RISE']['severity']
+          and rows['TEMP_RISE']['params'] == canon['TEMP_RISE']['params'])
+    check("五條觀察級規則的嚴重度從 warn 回到 observe", all(rows[c]['severity'] == 'observe' for c in five),
+          str({c: rows[c]['severity'] for c in five}))
+    check("現場刻意的設定不被蓋掉：IMPACT_RISE 的自訂門檻與停用狀態、SENSOR_OFFLINE 的 warn 與 36 小時",
+          rows['IMPACT_RISE']['params'].get('crest_sigma') == 3.1 and rows['IMPACT_RISE']['is_active'] is False
+          and rows['SENSOR_OFFLINE']['severity'] == 'warn' and rows['SENSOR_OFFLINE']['params'].get('hours') == 36,
+          str({c: (rows[c]['severity'], rows[c]['params'], rows[c]['is_active'])
+               for c in ('IMPACT_RISE', 'SENSOR_OFFLINE')}))
+    check("ISO_CLASS_SUSPECT 的空參數補上預設；VEL_HIGH 補上 threshold_mode 與新的說明文字",
+          rows['ISO_CLASS_SUSPECT']['params'] == canon['ISO_CLASS_SUSPECT']['params']
+          and rows['VEL_HIGH']['params'].get('threshold_mode') == 'iso'
+          and rows['VEL_HIGH']['description'] == canon['VEL_HIGH']['description'])
+    check("套用後：每一項 migration 探針都回「已套用」，沒有與派工政策不一致的觀察級規則",
+          all(v is True for v in after_status.values()) and after_dev['observe_but_dispatching'] == [],
+          f"{after_status} {after_dev}")
+
+    # ── 其餘探針：改回舊樣子就要被抓到 ──
+    with oc.cursor() as cur:
+        cur.execute("UPDATE rule_config SET params = params || '{\"kurt_sigma\":2.5}'::jsonb "
+                    "WHERE rule_code = 'IMPACT_RISE'")
+        with_kurt = {k: ok for k, _, _, ok in chk.migration_status(cur)}
+        cur.execute("UPDATE rule_config SET params = params - 'kurt_sigma' WHERE rule_code = 'IMPACT_RISE'")
+        cur.execute("UPDATE rule_config SET params = params - 'min_abs_change' WHERE rule_code = 'VEL_HIGH'")
+        no_floor = {k: ok for k, _, _, ok in chk.migration_status(cur)}
+    oc.rollback()
+    check("IMPACT_RISE 帶回 kurtosis 通道 → 005 回未套用（migration_004 重跑的後果）",
+          with_kurt['005'] is False and with_kurt['007'] is True, str(with_kurt))
+    check("VEL_HIGH 少了實用顯著性下限 → 007 回未套用", no_floor['007'] is False and no_floor['005'] is True,
+          str(no_floor))
+    oc.close()
+
+
+def _test_error_isolation(dbname: str, env: dict) -> None:
+    """
+    每日排程用同一條連線、同一個交易處理所有量測點。PostgreSQL 在交易內遇到任何 SQL 錯誤
+    （外鍵、約束、缺表）後，整個交易進入「只能 rollback」的狀態：後面每一句都被拒絕，
+    最後的 commit 也變成 rollback，而且不會拋例外。Python 層級的 try/except 擋不住這件事——
+    結果是「單一設備失敗不影響其餘設備」只在 Python 例外時成立，SQL 錯誤會讓當天整批資料安靜地消失。
+    這一節用 SAVEPOINT 隔離：一筆寫入失敗只丟掉那一筆，其餘照常 commit，且失敗要被數出來。
+    """
+    from vibcore.db import repository as repo
+    from vibcore.io.analytic_reader import load_analytic_dir
+    from vibcore.pipeline import daily as daily_mod
+    from vibcore.types import RuleContext, RuleOutcome
+    from validate.synthetic import _dev_stable
+    import tempfile as _tf
+
+    print("\n[13c] 錯誤隔離：一筆 SQL 失敗不能讓當天整批資料消失")
+    conn = _connect_db(env, dbname)
+    repo.upsert_device(conn, DeviceContext(device_id='ISO1', device_name='隔離測試', building='A棟',
+                                           floor='1F', system_name='冰水'))
+    conn.commit()
+    dev = repo.get_device(conn, 'ISO1')
+
+    def outcome(code, issue, severity):
+        return RuleOutcome(triggered=True, rule_code=code, issue_type=issue, family='monotonic',
+                           severity=severity, title=f'{code} 測試', detail='d',
+                           interpretation_limit='測試用', target_type='device')
+
+    cx = RuleContext(device=dev, point_id=0, position='M1', agg=pd.DataFrame(), baseline=None,
+                     params={}, now=dt.datetime(2026, 6, 2, 23, 59, 59, tzinfo=dt.timezone.utc))
+    pr = daily_mod.PointResult(device_id='ISO1', position='M1')
+    pr._ctx = cx
+    # 第一筆的 rule_code 不存在（外鍵違反），後面兩筆是正常的
+    pr._outcomes = [outcome('NO_SUCH_RULE', 'bad_obs', 'observe'),
+                    outcome('IMPACT_RISE', 'good_obs', 'observe'),
+                    outcome('NO_SUCH_RULE', 'bad_finding', 'warn'),
+                    outcome('SENSOR_OFFLINE', 'good_finding', 'err')]
+    errors: list = []
+    n_up, n_esc, n_obs = daily_mod.persist_findings(conn, [pr], errors=errors)
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT issue_type FROM observation WHERE device_id = 'ISO1'")
+        obs_rows = [x['issue_type'] for x in cur.fetchall()]
+        cur.execute("SELECT issue_type FROM finding WHERE device_id = 'ISO1'")
+        fin_rows = [x['issue_type'] for x in cur.fetchall()]
+    check("壞的觀察項目之後，正常的觀察項目與事項照常寫入（交易沒有被毒化）",
+          obs_rows == ['good_obs'] and fin_rows == ['good_finding'] and (n_up, n_obs) == (1, 1),
+          f"obs={obs_rows} finding={fin_rows} n_up={n_up} n_obs={n_obs}")
+    check("兩筆失敗都被數出來，帶出是哪一筆（排程摘要與結束碼據此提醒）",
+          len(errors) == 2 and any('bad_obs' in e for e in errors) and any('bad_finding' in e for e in errors),
+          str(errors))
+
+    # ── 單一量測點處理到一半 SQL 失敗：該點整個退回，其餘量測點照常 ──
+    def one_day(name):
+        syn = _dev_stable(np.random.default_rng(3)).assign(Name=name)
+        raw = syn[pd.to_datetime(syn['Time']).dt.strftime('%Y-%m-%d') == '2026-05-02']
+        with _tf.TemporaryDirectory() as d:
+            raw.to_csv(os.path.join(d, 'x.csv'), index=False, encoding='utf-8-sig')
+            return load_analytic_dir(d)[name]
+
+    meta = lambda n: {'Name': n, 'Building': 'F7', 'Floor': '6F', 'System': '空調', 'RPM': 1710, 'FMF': 28.5}
+    real_upsert_daily = repo.upsert_daily
+
+    def exploding_upsert_daily(c, *a, **k):          # 在已寫入設備、量測點與聚合之後才失敗
+        with c.cursor() as cur:
+            cur.execute("SELECT 1/0")
+    repo.upsert_daily = exploding_upsert_daily
+    try:
+        bad = daily_mod.process_point(conn, meta('ISO-BAD'), one_day('ISO-BAD'), dt.date(2026, 5, 2))
+    finally:
+        repo.upsert_daily = real_upsert_daily
+    good = daily_mod.process_point(conn, meta('ISO-OK'), one_day('ISO-OK'), dt.date(2026, 5, 2))
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT device_id FROM device WHERE device_id IN ('ISO-BAD', 'ISO-OK') ORDER BY 1")
+        left = [x['device_id'] for x in cur.fetchall()]
+        cur.execute("SELECT count(*) AS n FROM measurement_agg a JOIN measure_point p USING (point_id) "
+                    "WHERE p.device_id = 'ISO-OK'")
+        n_agg_ok = cur.fetchone()['n']
+        cur.execute("SELECT count(*) AS n FROM measurement_agg a JOIN measure_point p USING (point_id) "
+                    "WHERE p.device_id = 'ISO-BAD'")
+        n_agg_bad = cur.fetchone()['n']
+        cur.execute("SELECT i.status FROM ingestion_log i JOIN measure_point p USING (point_id) "
+                    "WHERE p.device_id = 'ISO-BAD'")
+        bad_ingest = [x['status'] for x in cur.fetchall()]
+    res = daily_mod.DailyRunResult(run_date=dt.date(2026, 6, 2), persist_errors=list(errors))
+    check("排程摘要把寫入失敗數出來（不能讓摘要看起來一切正常）",
+          '寫入失敗 2 筆' in res.summary() and '寫入失敗' not in
+          daily_mod.DailyRunResult(run_date=dt.date(2026, 6, 2)).summary(), res.summary())
+    check("處理到一半 SQL 失敗的量測點被標為失敗，並帶出原因", bad.error is not None, str(bad.error))
+    check("失敗點的資料寫入整段退回（沒有留下半套聚合），但設備與量測點還在，並記一筆「匯入失敗」",
+          left == ['ISO-BAD', 'ISO-OK'] and n_agg_bad == 0 and bad_ingest == ['failed'],
+          f"devices={left} agg_bad={n_agg_bad} ingest={bad_ingest}")
+    check("失敗點之後的量測點照常處理並 commit（聚合都在）", good.ok and n_agg_ok > 0,
+          f"{good.error} agg_ok={n_agg_ok}")
+    conn.close()
 
 
 def main() -> int:

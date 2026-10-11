@@ -18,6 +18,7 @@ connection.py — PostgreSQL 連線與交易管理
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from contextlib import contextmanager
@@ -111,6 +112,11 @@ def get_connection(config: DBConfig | None = None) -> Iterator[psycopg2.extensio
         conn.close()
 
 
+#: SAVEPOINT 名稱的流水號。每次呼叫都用不同名稱：同名的 savepoint 巢狀時，內層失敗後的
+#: `ROLLBACK TO` 會指向內層（PostgreSQL 取最近一個同名者），外層的 rollback 就退不回外層的起點。
+_savepoint_seq = itertools.count(1)
+
+
 @contextmanager
 def transaction(conn: psycopg2.extensions.connection) -> Iterator[psycopg2.extensions.connection]:
     """
@@ -119,16 +125,21 @@ def transaction(conn: psycopg2.extensions.connection) -> Iterator[psycopg2.exten
 
     例如：批次匯入時想「這個 point 的資料寫失敗就跳過，其餘 point 繼續」，
     若不用 SAVEPOINT，一次 execute 失敗會讓整個外層交易進入
-    「aborted，只能 rollback」的狀態，後面所有操作都會被 PostgreSQL 拒絕。
+    「aborted，只能 rollback」的狀態，後面所有操作都會被 PostgreSQL 拒絕——
+    而且最後的 commit 不會拋例外，只是安靜地變成 rollback，整批資料就這樣不見了。
+
+    區塊內拋出例外時退回到 SAVEPOINT 起點（連線恢復可用）再把例外原樣拋出。
     """
-    savepoint = f"sp_{id(conn):x}_{os.getpid()}"
+    savepoint = f"sp_{next(_savepoint_seq)}"
     with conn.cursor() as cur:
         cur.execute(f"SAVEPOINT {savepoint}")
     try:
         yield conn
-        with conn.cursor() as cur:
-            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
         with conn.cursor() as cur:
             cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise
+    else:
+        with conn.cursor() as cur:
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
