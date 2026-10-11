@@ -18,9 +18,10 @@ engine.py — 規則註冊與執行
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Callable
 
-from vibcore.types import Finding, RuleContext, RuleOutcome
+from vibcore.types import Finding, RuleContext, RuleOutcome, effective_severity
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,23 @@ def register(rule_code: str) -> Callable[[RuleFunc], RuleFunc]:
     return deco
 
 
+def _cfg_get(cfg, key: str, default=None):
+    """
+    讀規則設定的欄位，物件（`RuleConfigRow`）與字典（資料庫回傳的資料列）都吃。
+
+    **這個相容層是必要的，不是潔癖**：正式的每日排程傳進來的是
+    `repository.get_rule_configs()` 的字典，而這裡原本一律 `getattr(cfg, 'params', {})`——
+    對字典永遠拿到預設值，結果是資料庫裡的 `rule_config.params`、`is_active`、`severity`
+    全部被忽略，規則永遠用程式碼預設值跑、關掉的規則照跑。改門檻的 UPDATE 完全不會生效，
+    而且沒有任何錯誤訊息。回測傳的是物件，所以回測看不出來。
+    """
+    if cfg is None:
+        return default
+    if isinstance(cfg, Mapping):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
 def evaluate_all(ctx: RuleContext,
                  rule_configs: dict,
                  rule_codes: list[str] | None = None) -> list[RuleOutcome]:
@@ -135,11 +153,16 @@ def evaluate_all(ctx: RuleContext,
 
     Args:
         ctx: 該量測點的完整判定上下文
-        rule_configs: rule_code → 設定物件（需有 `is_active` 與 `params`）
+        rule_configs: rule_code → 設定（物件或字典皆可，需有 `is_active`、`params`、
+            `severity`）。要讓「停用」生效，必須傳**含停用規則**的設定
+            （`get_rule_configs(conn, active_only=False)`）；只傳啟用中的，停用的規則會因為
+            查不到設定而用預設值照跑。
         rule_codes: 只跑指定的規則；None 表示全部
 
     Returns:
-        有觸發的 RuleOutcome 清單（未觸發者不回傳）
+        有觸發的 RuleOutcome 清單（未觸發者不回傳）。每個結果的 `severity` 已套用
+        `rule_config.severity` 的上限（見 `types.effective_severity`），`params` 記著判定當下
+        用的參數。
     """
     codes = rule_codes if rule_codes is not None else list(REGISTRY)
     outcomes: list[RuleOutcome] = []
@@ -151,11 +174,12 @@ def evaluate_all(ctx: RuleContext,
             continue
 
         cfg = rule_configs.get(code)
-        if cfg is not None and not getattr(cfg, 'is_active', True):
+        if cfg is not None and not _cfg_get(cfg, 'is_active', True):
             continue
 
         # 每條規則拿到自己的參數；沒有設定時給空 dict 讓規則自行取預設
-        ctx.params = dict(getattr(cfg, 'params', {}) or {})
+        params = dict(_cfg_get(cfg, 'params', {}) or {})
+        ctx.params = params
 
         try:
             outcome = fn(ctx)
@@ -167,6 +191,14 @@ def evaluate_all(ctx: RuleContext,
 
         if outcome is None or not outcome.triggered:
             continue
+
+        # 設定是嚴重度上限（observe 的規則不會因為規則函式回傳 warn 就派工）；
+        # 並把判定當下的參數記在結果上，供 trigger_params 快照。
+        capped = effective_severity(outcome.severity, _cfg_get(cfg, 'severity'))
+        if capped != outcome.severity:
+            logger.debug(f"規則 {code} 的嚴重度 {outcome.severity} 依設定降為 {capped}")
+            outcome.severity = capped
+        outcome.params = params
 
         if not outcome.interpretation_limit:
             logger.warning(f"規則 {code} 觸發但未填 interpretation_limit——"
@@ -200,7 +232,7 @@ def outcome_to_finding(outcome: RuleOutcome, ctx: RuleContext) -> Finding:
         value_unit=outcome.value_unit,
         evidence=outcome.evidence,
         # 留存觸發當下的門檻，之後才有辦法回溯重算「若門檻是 X 會剩幾件」
-        trigger_params=dict(ctx.params or {}),
+        trigger_params=dict(outcome.params or ctx.params or {}),
         interpretation_limit=outcome.interpretation_limit,
         last_seen_at=ctx.now,
         first_seen_at=ctx.now,

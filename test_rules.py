@@ -501,6 +501,142 @@ def test_vel_high_policy() -> None:
           and p.get('fallback_severity') == 'observe', str(p))
 
 
+def test_rule_config_plumbing() -> None:
+    """正式排程傳進引擎的是資料庫的字典：params／is_active／severity 都必須真的生效。"""
+    print("\n[6c] 規則設定的傳遞：資料庫字典要能改變規則的參數、停用與嚴重度")
+
+    import datetime as _dt
+    from types import SimpleNamespace
+
+    from vibcore.pipeline.daily import rule_now
+    from vibcore.rules import engine
+    from vibcore.rules.engine import evaluate_all, outcome_to_finding
+    from vibcore.types import RuleOutcome, effective_severity
+
+    # ── 嚴重度上限 ──
+    table = [(('warn', 'observe'), 'observe'), (('observe', 'warn'), 'observe'),
+             (('err', 'warn'), 'warn'), (('warn', 'err'), 'warn'), (('err', 'err'), 'err'),
+             (('warn', 'warn'), 'warn'), ((None, 'observe'), 'observe'), (('warn', None), 'warn'),
+             (('bogus', 'observe'), 'observe'), ((None, None), 'warn')]
+    bad = [(k, effective_severity(*k), want) for k, want in table if effective_severity(*k) != want]
+    check("effective_severity：設定是上限，規則可再往下調；缺值用另一個", not bad, str(bad))
+
+    # ── 用兩條假規則檢查引擎本身 ──
+    seen = {}
+
+    def make(code, sev='warn'):
+        def fn(c):
+            seen[code] = dict(c.params)
+            return RuleOutcome(triggered=True, rule_code=code, issue_type=code.lower(),
+                               family='event', severity=sev, title='t', detail='d',
+                               interpretation_limit='x')
+        return fn
+
+    saved = dict(engine.REGISTRY)
+    try:
+        engine.REGISTRY.clear()
+        engine.REGISTRY['AAA'] = make('AAA')
+        engine.REGISTRY['BBB'] = make('BBB')
+        c0 = ctx([{'vel_rms': 1.0, 'vel_oa': 1.0}], {'vel_rms': (1, 1, .1, 100)})
+        db_rows = {                                    # 與 repository.get_rule_configs 同形：字典
+            'AAA': {'rule_code': 'AAA', 'is_active': True, 'severity': 'observe',
+                    'params': {'sigma': 7.5}},
+            'BBB': {'rule_code': 'BBB', 'is_active': True, 'severity': 'warn',
+                    'params': {'days': 14}},
+        }
+        outs = evaluate_all(c0, db_rows)
+        by = {o.rule_code: o for o in outs}
+        check("資料庫字典裡的 params 真的傳進規則（原本永遠是空的）",
+              seen['AAA'] == {'sigma': 7.5} and seen['BBB'] == {'days': 14}, str(seen))
+        check("設定的嚴重度當上限：規則回傳 warn、設定為 observe → observe；設定為 warn → warn（可升回）",
+              by['AAA'].severity == 'observe' and by['BBB'].severity == 'warn',
+              str({k: v.severity for k, v in by.items()}))
+        check("每個結果記著判定當下自己的參數（不是最後一條規則的）",
+              by['AAA'].params == {'sigma': 7.5} and by['BBB'].params == {'days': 14}
+              and c0.params == {'days': 14})
+        f = outcome_to_finding(by['AAA'], c0)
+        check("Finding 的 trigger_params 是觸發它的那條規則的參數",
+              f.trigger_params == {'sigma': 7.5}, str(f.trigger_params))
+
+        seen.clear()
+        off = dict(db_rows)
+        off['AAA'] = {**db_rows['AAA'], 'is_active': False}
+        evaluate_all(c0, off)
+        check("is_active=False 的規則不執行", 'AAA' not in seen and 'BBB' in seen, str(sorted(seen)))
+        seen.clear()
+        evaluate_all(c0, {'BBB': db_rows['BBB']})
+        check("設定裡沒有的規則照常以預設值執行（維持原行為，單元測試與新規則上線前都靠它）",
+              seen.get('AAA') == {} and 'BBB' in seen)
+        seen.clear()
+        obj_cfg = {'AAA': SimpleNamespace(is_active=True, params={'sigma': 2.0}, severity='observe')}
+        o2 = evaluate_all(c0, obj_cfg, rule_codes=['AAA'])
+        check("物件形式的設定（回測用的 RuleConfigRow）同樣有效",
+              seen['AAA'] == {'sigma': 2.0} and o2[0].severity == 'observe')
+    finally:
+        engine.REGISTRY.clear()
+        engine.REGISTRY.update(saved)
+
+    # ── 真實規則：資料庫字典改門檻要有效；observe 規則不派工 ──
+    stats = {'vel_rms': (0.664, 0.664, 0.0116, 300), 'vel_oa': (0.664, 0.664, 0.0116, 300)}
+    rows = [{'vel_rms': v, 'vel_oa': v} for v in (1.33, 1.38, 1.48)]
+    small = device(iso_machine_group='4', iso_foundation='rigid', rated_power_kw=11.0)
+    c1 = ctx(rows, stats, dev=small)
+    cfg_default = {'VEL_HIGH': {'is_active': True, 'severity': 'warn', 'params': {}}}
+    cfg_strict = {'VEL_HIGH': {'is_active': True, 'severity': 'warn', 'params': {'min_rel_change': 5.0}}}
+    hit = evaluate_all(c1, cfg_default, rule_codes=['VEL_HIGH'])
+    miss = evaluate_all(c1, cfg_strict, rule_codes=['VEL_HIGH'])
+    check("改 rule_config.params（min_rel_change 5.0）後 VEL_HIGH 不再觸發——改設定真的有效",
+          len(hit) == 1 and len(miss) == 0, f"{len(hit)}/{len(miss)}")
+    check("VEL_HIGH 退回 sigma 的結果仍是 observe（規則自己往下調，設定的 warn 不會把它拉回去）",
+          hit[0].severity == 'observe')
+    imp_stats = {'acc_crest_median': (2.6, 2.6, 0.3, 300)}
+    c2 = ctx([{'acc_crest_median': 4.0}], imp_stats)
+    as_observe = evaluate_all(c2, {'IMPACT_RISE': {'is_active': True, 'severity': 'observe', 'params': {}}},
+                              rule_codes=['IMPACT_RISE'])
+    as_warn = evaluate_all(c2, {'IMPACT_RISE': {'is_active': True, 'severity': 'warn', 'params': {}}},
+                           rule_codes=['IMPACT_RISE'])
+    check("IMPACT_RISE 設為 observe → 不派工；改設定為 warn 即升級（不必改程式）",
+          as_observe and as_observe[0].severity == 'observe'
+          and as_warn and as_warn[0].severity == 'warn',
+          str((as_observe and as_observe[0].severity, as_warn and as_warn[0].severity)))
+
+    # ── 回測與正式排程用同一個嚴重度算法 ──
+    from validate.backtest import _make_episode_row
+    from validate.rule_defaults import RuleConfigRow
+
+    class _P:
+        class point:
+            class device:
+                device_id, device_name = 'T', 'T'
+            point_id, position = 1, 'M1'
+
+    def ep(rule_sev, out_sev):
+        row = RuleConfigRow('VEL_HIGH', 'x', 'oscillating', 'vel_high', rule_sev)
+        o = None if out_sev is None else RuleOutcome(
+            triggered=True, rule_code='VEL_HIGH', issue_type='vel_high', family='oscillating',
+            severity=out_sev)
+        return _make_episode_row(_P, row, pd.Timestamp('2026-08-01'), pd.Timestamp('2026-08-02'), o)
+    e1, e2, e3 = ep('warn', 'observe'), ep('observe', 'warn'), ep('observe', None)
+    check("回測事件的嚴重度＝規則回傳與設定取較低者：warn／observe → observe、不算可行動",
+          e1['severity'] == 'observe' and e1['is_actionable'] is False)
+    check("設定 observe、規則回傳 warn → observe；沒有結果（理論上不會）退回設定值",
+          e2['severity'] == 'observe' and e3['severity'] == 'observe')
+    e4 = ep('warn', 'warn')
+    check("兩者都是 warn → warn、可行動", e4['severity'] == 'warn' and e4['is_actionable'] is True)
+
+    # ── 規則判定用的「現在」 ──
+    utc = _dt.timezone.utc
+    past = _dt.datetime(2026, 6, 2, tzinfo=utc)
+    future = _dt.datetime.now(utc) + _dt.timedelta(days=1)
+    check("補跑過去的日期：now 是那一天結束，不是真實的現在（否則整段歷史都算離線）",
+          rule_now(past) == past)
+    check("跑今天的資料：窗口結束在明天，now 是真實的現在",
+          abs((rule_now(future) - _dt.datetime.now(utc)).total_seconds()) < 5)
+    from vibcore.pipeline.daily import run_window_end
+    check("資料窗口結束 ＝ 該日隔日零時（UTC）",
+          run_window_end(_dt.date(2026, 6, 2)) == _dt.datetime(2026, 6, 3, tzinfo=utc))
+
+
 def test_guardrail() -> None:
     print("\n[7] 診斷性用語護欄")
 
@@ -1864,6 +2000,125 @@ def test_ledger_import_logic() -> None:
           cov['power_missing'] == ['NONE_M1'] and cov['standby'] == ['OK_M1'])
 
 
+def test_review_sheet() -> None:
+    print("\n[12d] 現場回饋試算表：匯出、判定欄正規化、雜訊率統計（validate.review_sheet）")
+
+    import tempfile
+
+    from validate.review_sheet import (MIN_DECIDED, SHEET_COLUMNS, build_summary, cause_tag,
+                                       from_episodes, normalize_verdict, read_sheets, score,
+                                       select_items, wilson_interval, write_sheet)
+
+    # ── 判定欄的各種寫法 ──
+    check("中英文判定都認得：真實／real／是 → real；雜訊／誤報／noise → noise",
+          normalize_verdict('真實') == 'real' and normalize_verdict(' Real ') == 'real'
+          and normalize_verdict('誤報') == 'noise' and normalize_verdict('NOISE') == 'noise'
+          and normalize_verdict('已知') == 'known' and normalize_verdict('不確定') == 'unsure')
+    check("空白＝未看；認不得的字＝invalid（不能悄悄算成某一類）",
+          normalize_verdict('') == 'unreviewed' and normalize_verdict(None) == 'unreviewed'
+          and normalize_verdict(float('nan')) == 'unreviewed' and normalize_verdict('大概吧') == 'invalid')
+    check("原因欄歸類：取最先出現的標準詞；沒有標準詞回 None",
+          cause_tag('鄰機帶動，CP 08 升速') == '鄰機' and cause_tag('轉速負載變了') == '轉速負載'
+          and cause_tag('不知道為什麼') is None and cause_tag('') is None)
+
+    # ── 信賴區間 ──
+    lo0, hi0 = wilson_interval(0, 0)
+    lo1, hi1 = wilson_interval(5, 10)
+    lo2, hi2 = wilson_interval(50, 100)
+    check("Wilson 區間：n=0 回 (0,1)；n 越大區間越窄；永遠在 0～1 內",
+          (lo0, hi0) == (0.0, 1.0) and (hi2 - lo2) < (hi1 - lo1)
+          and 0 <= lo1 < 0.5 < hi1 <= 1 and wilson_interval(0, 5)[0] < 1e-9
+          and wilson_interval(5, 5)[1] > 1 - 1e-9)
+
+    # ── 統計 ──
+    def sheet(rule, sev, verdicts, cause=''):
+        return pd.DataFrame([{'item_id': f'{rule}|{i}', 'rule_code': rule, 'severity': sev,
+                              '判定': v, '原因': cause} for i, v in enumerate(verdicts)])
+    allv = pd.concat([
+        sheet('NOISY', 'observe', ['雜訊'] * 12 + ['真實'] * 3, '鄰機'),
+        sheet('GOOD', 'observe', ['真實'] * 11 + ['雜訊']),
+        sheet('MIXED', 'warn', ['真實'] * 5 + ['雜訊'] * 5),
+        sheet('SMALL', 'observe', ['雜訊'] * 4),
+        sheet('UNK', 'observe', ['不確定'] * 6 + ['已知'] * 2 + [''] * 4 + ['亂寫']),
+    ], ignore_index=True)
+    r = score(allv).set_index('rule_code')
+    check("雜訊率＝雜訊÷(真實＋已知＋雜訊)：NOISY 12/15",
+          abs(r.loc['NOISY', 'noise_rate'] - 12 / 15) < 1e-9 and r.loc['NOISY', 'decided'] == 15)
+    check("不確定與未看不算進分母，且另外計數；寫不出來的字記為 invalid",
+          r.loc['UNK', 'decided'] == 2 and r.loc['UNK', 'unsure'] == 6
+          and r.loc['UNK', 'unreviewed'] == 4 and r.loc['UNK', 'invalid'] == 1, str(r.loc['UNK'].to_dict()))
+    check("雜訊偏多的觀察規則：建議維持觀察、不升級", '維持觀察名單' in r.loc['NOISY', 'suggestion'])
+    check("雜訊偏多的派工規則（warn）：建議不該派工", '不該派工' in r.loc['MIXED', 'suggestion']
+          or '真假參半' in r.loc['MIXED', 'suggestion'])
+    check("多數為真、雜訊低的觀察規則：建議評估升級，並提醒先分清楚『已知』",
+          '評估升為 warn' in r.loc['GOOD', 'suggestion'] and '已知' in r.loc['GOOD', 'suggestion'])
+    check(f"已判不到 {MIN_DECIDED} 件：只說樣本不足，不給調整建議",
+          '樣本不足' in r.loc['SMALL', 'suggestion'] and '樣本不足' in r.loc['UNK', 'suggestion'])
+    check("雜訊原因按標準詞彙總", r.loc['NOISY', 'top_noise_causes'] == '鄰機×12', r.loc['NOISY', 'top_noise_causes'])
+    dup = pd.concat([sheet('D', 'observe', ['雜訊'] * 10), sheet('D', 'observe', ['真實'] * 10)],
+                    ignore_index=True)
+    rd = score(dup).set_index('rule_code')
+    check("同一個 item_id 出現兩次（兩人都填）取最後一筆，不重複計算（否則雜訊率看起來比實際更有把握）",
+          rd.loc['D', 'items'] == 10 and rd.loc['D', 'real'] == 10)
+
+    # ── 匯出：抽樣、欄位、摘要 ──
+    check("摘要句帶出數值變化與持續天數",
+          build_summary('速度整體值偏高', 0.556, 1.142, 'mm/s', 12) == '速度整體值偏高：0.556 → 1.14 mm/s（+105%），持續 12 天',
+          build_summary('速度整體值偏高', 0.556, 1.142, 'mm/s', 12))
+    check("沒有數值的事件類只講規則名與天數",
+          build_summary('感測器離線', None, None, '', 3) == '感測器離線，持續 3 天')
+
+    recs = []
+    for dev, rule, day, n, b, c, sev in (
+            ('P1_M1', 'VEL_HIGH', 5, 12, 0.556, 1.142, 'observe'),
+            ('P1_M1', 'VEL_HIGH', 20, 7, 0.556, 0.901, 'observe'),
+            ('P1_M1', 'VEL_HIGH', 30, 1, 0.556, 0.662, 'observe'),
+            ('P2_M1', 'VEL_HIGH', 8, 2, 0.30, 0.40, 'observe'),
+            ('P3_M1', 'VEL_HIGH', 9, 1, 1.4, 1.56, 'observe'),
+            ('P1_M1', 'SENSOR_OFFLINE', 3, 4, None, 29, 'err')):
+        s0 = pd.Timestamp('2026-06-01 23:00') + pd.Timedelta(days=day)
+        recs.append(dict(device_id=dev, rule_code=rule, rule_name=rule, severity=sev, is_actionable=sev != 'observe',
+                         episode_start=s0.strftime('%Y/%m/%d %H:%M'),
+                         episode_end=(s0 + pd.Timedelta(days=n - 1)).strftime('%Y/%m/%d %H:%M'),
+                         duration_days=n, baseline_value=b, current_value=c,
+                         value_unit='mm/s' if rule == 'VEL_HIGH' else 'hr', category='equipment'))
+    with tempfile.TemporaryDirectory() as tmp:
+        epi = os.path.join(tmp, 'epi.csv')
+        pd.DataFrame(recs).to_csv(epi, index=False, encoding='utf-8-sig')
+        led = os.path.join(tmp, 'ledger.csv')
+        pd.DataFrame([dict(device_id='P1_M1', rated_power_kw=11, is_standby='TRUE')]).to_csv(
+            led, index=False, encoding='utf-8-sig')
+        full = from_episodes(epi, led, per_rule=8)
+        top2 = from_episodes(epi, None, per_rule=2)
+        out = os.path.join(tmp, 'sheet.csv')
+        write_sheet(top2, out)
+        guide_exists = os.path.exists(os.path.join(tmp, 'sheet_填寫說明.txt'))
+        back = read_sheets([out])
+
+    check("匯出的欄位固定且順序不變（回收時靠欄名）", list(full.columns) == SHEET_COLUMNS)
+    check("判定／原因／處置欄是空白，等人填", (full['判定'] == '').all() and (full['原因'] == '').all())
+    check("每條規則都被看到（VEL_HIGH 與 SENSOR_OFFLINE 各自出現）",
+          set(full['rule_code']) == {'VEL_HIGH', 'SENSOR_OFFLINE'})
+    check("同一台設備在同一條規則最多 2 筆（P1_M1 有 3 筆 VEL_HIGH，只列最長的 2 筆）",
+          (full[full['rule_code'] == 'VEL_HIGH']['device_id'] == 'P1_M1').sum() == 2
+          and set(full[(full['rule_code'] == 'VEL_HIGH') & (full['device_id'] == 'P1_M1')]['duration_days']) == {12, 7})
+    check("--per-rule 限制每條規則的筆數", (top2['rule_code'] == 'VEL_HIGH').sum() == 2)
+    check("脈絡欄帶出台帳備機與額定功率；沒給台帳就空白",
+          full[full['device_id'] == 'P1_M1']['context'].iloc[0] == '台帳標備機、11 kW'
+          and (top2['context'] == '').all())
+    check("item_id 穩定可回收（規則|設備|起日）", 'VEL_HIGH|P1_M1|2026-06-06' in set(full['item_id']),
+          str(sorted(full['item_id'])[:3]))
+    check("寫出的檔案附填寫說明，且能被讀回（欄名不變）", guide_exists and list(back.columns) == SHEET_COLUMNS)
+    check("select_items 對空表不拋錯", len(select_items(full.iloc[0:0].assign(delta_pct=0.0), 3)) == 0)
+
+    # 填寫 → 回收 → 統計 的完整一圈
+    filled = full.copy()
+    filled.loc[filled['rule_code'] == 'VEL_HIGH', '判定'] = ['雜訊', '真實', '已知', '雜訊'][:int((filled['rule_code'] == 'VEL_HIGH').sum())]
+    res = score(filled).set_index('rule_code')
+    check("一圈走完：VEL_HIGH 已判 4 件、SENSOR_OFFLINE 未看", res.loc['VEL_HIGH', 'decided'] == 4
+          and res.loc['SENSOR_OFFLINE', 'unreviewed'] == 1, str(res[['decided', 'unreviewed']].to_dict()))
+
+
 def test_ledger_id_match() -> None:
     print("\n[12b] 台帳 device_id 與資料對不上：不能安靜失效")
 
@@ -2080,6 +2335,124 @@ def test_db(dbname: str) -> None:
     check("get_scada 的輸出可直接餵給 attach_to_agg",
           pd.notna(joined['scada_current'].iloc[0]),
           str(joined.iloc[0].to_dict()))
+
+    # ── 規則設定從資料庫到引擎：停用、參數、嚴重度 ──
+    from vibcore.rules.engine import evaluate_all as _eval_all
+    with conn.cursor() as cur:
+        cur.execute("UPDATE rule_config SET is_active = FALSE WHERE rule_code = 'VEL_HIGH'")
+        cur.execute("UPDATE rule_config SET severity = 'warn' WHERE rule_code = 'IMPACT_RISE'")
+    conn.commit()
+    only_active = repo.get_rule_configs(conn)
+    every = repo.get_rule_configs(conn, active_only=False)
+    check("active_only=False 才查得到被停用的規則（引擎要看得到 is_active=False 才跳得過）",
+          'VEL_HIGH' not in only_active and every['VEL_HIGH']['is_active'] is False)
+    _stats = {'vel_rms': (0.664, 0.664, 0.0116, 300), 'vel_oa': (0.664, 0.664, 0.0116, 300),
+              'acc_crest_median': (2.6, 2.6, 0.3, 300)}
+    _c = ctx([{'vel_rms': v, 'vel_oa': v, 'acc_crest_median': 4.0} for v in (1.33, 1.38, 1.48)],
+             _stats, dev=device(iso_machine_group='4', iso_foundation='rigid', rated_power_kw=11.0))
+    _out = {o.rule_code: o for o in _eval_all(_c, every, rule_codes=['VEL_HIGH', 'IMPACT_RISE'])}
+    check("資料庫停用的 VEL_HIGH 不執行（原本用 active_only 查詢時，停用的規則因查不到設定而照跑）",
+          'VEL_HIGH' not in _out)
+    check("資料庫把 IMPACT_RISE 設為 warn → 觸發結果就是 warn（升級不必改程式）",
+          _out['IMPACT_RISE'].severity == 'warn', str(_out['IMPACT_RISE'].severity))
+    with conn.cursor() as cur:
+        cur.execute("UPDATE rule_config SET is_active = TRUE WHERE rule_code = 'VEL_HIGH'")
+        cur.execute("UPDATE rule_config SET severity = 'observe' WHERE rule_code = 'IMPACT_RISE'")
+    conn.commit()
+
+    # ── 正式排程這一條路：process_point 傳給引擎的設定與「現在」 ──
+    # 規則設定的傳遞問題只出現在這條路（回測傳的是物件，單元測試直接給參數），
+    # 所以必須走一次真的 process_point，用 spy 看它交給 evaluate_all 的是什麼。
+    from vibcore.pipeline import daily as daily_mod
+    from validate.synthetic import _dev_stable
+    from vibcore.io.analytic_reader import load_analytic_dir
+    import tempfile as _tf
+    syn = _dev_stable(np.random.default_rng(1)).assign(Name='SYN-1')
+    day2_raw = syn[pd.to_datetime(syn['Time']).dt.strftime('%Y-%m-%d') == '2026-05-02']
+    with _tf.TemporaryDirectory() as _d:
+        day2_raw.to_csv(os.path.join(_d, 'syn.csv'), index=False, encoding='utf-8-sig')
+        day2 = load_analytic_dir(_d)['SYN-1']
+    with conn.cursor() as cur:
+        cur.execute("UPDATE rule_config SET is_active = FALSE WHERE rule_code = 'STEP_CHANGE'")
+    conn.commit()
+    caught: dict = {}
+    real_eval = daily_mod.evaluate_all
+
+    def _spy(ctx_, cfgs, *a, **k):
+        caught['cfgs'], caught['now'] = cfgs, ctx_.now
+        return real_eval(ctx_, cfgs, *a, **k)
+    daily_mod.evaluate_all = _spy
+    try:
+        pr = daily_mod.process_point(conn, {'Name': 'SYN-1', 'Building': 'F7', 'Floor': '6F',
+                                            'System': '空調', 'RPM': 1710, 'FMF': 28.5},
+                                     day2, dt.date(2026, 5, 2))
+    finally:
+        daily_mod.evaluate_all = real_eval
+    conn.commit()
+    check("（準備）process_point 跑到了規則判定", 'cfgs' in caught, str(pr.error))
+    check("process_point 把含停用規則的設定交給引擎（STEP_CHANGE 的 is_active 是 False）",
+          caught['cfgs'].get('STEP_CHANGE', {}).get('is_active') is False, str(sorted(caught['cfgs'])))
+    check("補跑過去的日期：規則的 now 是該日資料窗口結束（2026-05-03），不是真實的現在",
+          caught['now'] == dt.datetime(2026, 5, 3, tzinfo=dt.timezone.utc), str(caught['now']))
+    with conn.cursor() as cur:
+        cur.execute("UPDATE rule_config SET is_active = TRUE WHERE rule_code = 'STEP_CHANGE'")
+    conn.commit()
+
+    # ── 補跑歷史日期時，自動結案要用該批資料的時間，不是牆上時鐘 ──
+    # 事項的 last_seen_at 是規則判定時的 now（歷史日期）；若拿真實的現在去比，
+    # 每件剛建立的事項都會當天被結案，隔天再觸發又重開，首次出現時間被洗掉。
+    from vibcore.types import Finding as _Finding
+    t_seen = dt.datetime(2026, 5, 25, 12, 0, tzinfo=dt.timezone.utc)
+    repo.upsert_device(conn, DeviceContext(device_id='BF', device_name='BF', building='A棟',
+                                           floor='1F', system_name='冰水'))
+    repo.upsert_finding(conn, _Finding(
+        finding_key='point:BF_M1:vel_high', device_id='BF', target_type='point', target='BF_M1',
+        issue_type='vel_high', family='oscillating', rule_code='VEL_HIGH', title='補跑測試',
+        severity='warn', peak_severity='warn', first_seen_at=t_seen, last_seen_at=t_seen))
+    conn.commit()
+    n_replay = daily_mod.auto_resolve_quiet(conn, 3, now=daily_mod.rule_now(
+        daily_mod.run_window_end(dt.date(2026, 5, 25))))
+    check("補跑 5/25：事項才剛出現，不自動結案（原本拿真實的現在比，當天就被結案）",
+          n_replay == 0, str(n_replay))
+    n_replay = daily_mod.auto_resolve_quiet(conn, 3, now=daily_mod.rule_now(
+        daily_mod.run_window_end(dt.date(2026, 5, 28))))
+    check("補跑到 5/28（已連續 3 天以上沒再觸發）才自動結案", n_replay == 1, str(n_replay))
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, first_seen_at FROM finding WHERE finding_key = %s",
+                    ('point:BF_M1:vel_high',))
+        fk = cur.fetchone()
+    check("結案後狀態為 auto_resolved，首次出現時間仍是 5/25",
+          fk['status'] == 'auto_resolved' and fk['first_seen_at'].date() == dt.date(2026, 5, 25),
+          str(fk))
+
+    # ── 現場回饋表：從資料庫匯出 Finding 與觀察名單 ──
+    from validate.review_sheet import from_db
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO finding (finding_key, device_id, target_type, target, issue_type, family,
+                                 rule_code, title, severity, peak_severity,
+                                 baseline_value, current_value, value_unit)
+            VALUES ('point:P1_M1:sensor_offline', 'P1', 'point', 'P1_M1', 'sensor_offline', 'event',
+                    'SENSOR_OFFLINE', '感測器離線', 'err', 'err', 24, 29, 'hr');
+            INSERT INTO observation (observation_key, device_id, target_type, target, issue_type, family,
+                                     rule_code, title, baseline_value, current_value, value_unit)
+            VALUES ('point:P1_M1:vel_high', 'P1', 'point', 'P1_M1', 'vel_high', 'oscillating',
+                    'VEL_HIGH', '速度整體值相對基準偏高', 0.556, 1.142, 'mm/s');
+        """)
+    conn.commit()
+    sheet_db = from_db(conn, days=7)
+    check("資料庫匯出：Finding 與觀察名單各一列，item_type 標明",
+          set(sheet_db['item_type']) == {'finding', 'observation'}
+          and set(sheet_db['item_id']) == {'point:P1_M1:sensor_offline', 'point:P1_M1:vel_high'},
+          str(sheet_db[['item_type', 'item_id']].values.tolist()))
+    vh_row = sheet_db[sheet_db['rule_code'] == 'VEL_HIGH'].iloc[0]
+    check("觀察名單列帶 observe 嚴重度與變化幅度（+105%）；判定欄空白",
+          vh_row['severity'] == 'observe' and abs(float(vh_row['delta_pct']) - 105.4) < 0.5
+          and vh_row['判定'] == '', str(vh_row.to_dict()))
+    check("匯出範圍：回看 0 天時，只剩未結案的 Finding（觀察名單超出範圍）",
+          set(from_db(conn, days=0)['item_type']) <= {'finding'})
+    conn.commit()
 
     # ── 台帳匯入資料庫（vibcore.ledger_import）──────────────
     from vibcore.io.ledger import read_ledger_csv
@@ -2316,6 +2689,7 @@ def main() -> int:
         test_axis_direction()
         test_backtest_instrumentation()
         test_vel_high_policy()
+        test_rule_config_plumbing()
         test_guardrail()
         test_systemic_gaps()
         test_step_change_features()
@@ -2325,6 +2699,7 @@ def main() -> int:
         test_ledger()
         test_ledger_id_match()
         test_ledger_import_logic()
+        test_review_sheet()
         test_db(args.dbname)
     except AssertionError as e:
         print(f"\n❌ 驗收失敗：{e}")

@@ -12,15 +12,15 @@
         │
         │  ① 每日排程            python -m vibcore.pipeline.daily
         ▼
-   每小時聚合（僅運轉樣本）→ PostgreSQL
+   每小時聚合（僅運轉樣本）→ PostgreSQL（device 表另由「設備台帳」維護，見 §二）
         │
-        │  ② 規則判定（同一支排程內完成）
+        │  ② 規則判定（同一支排程內完成；參數、啟停、嚴重度取自資料庫 rule_config）
         ▼
-   Finding（四階段簽核）
+   有外部標準可引用的 → Finding（四階段簽核）｜沒有的 → 觀察名單（observation，不進簽核）
         │
         ├─→ ③ Agent 呼叫 API 取得結構化上下文 → 撰寫週報 → send_report
         │
-        └─→ ④ Dashboard 檢視與簽核（尚未實作）
+        └─→ ④ Dashboard 檢視與簽核（尚未實作；試跑期間用試算表回饋，見 docs/TRIAL_RUN_PLAN.md）
 ```
 
 原始 CSV **留在檔案系統**，資料庫只放聚合後的精選欄位（120 個量測點約 0.23 GB/年）。
@@ -55,8 +55,13 @@ createdb vibration
 psql -d vibration -f db/schema.sql
 ```
 
-這會建立 **`vib` schema**、20 張資料表，並寫入預設資料：
-13 條判定規則、ISO 10816 四級門檻、3 個簽核階段的 SLA、5 種角色。
+這會建立 **`vib` schema**、21 張資料表，並寫入預設資料：
+14 條判定規則、8 組 ISO 門檻（機器群組 × 基礎剛性）、3 個簽核階段的 SLA、5 種角色。
+
+> 已經建過庫的環境不要重跑 `schema.sql`，改依序套用 `db/migration_00N_*.sql`
+>（都是冪等的，可重複執行）：004 ISO 10816-3 分類與中位數、005 移除峰度通道、
+> 006 SCADA tag 多對多、007 VEL_HIGH 實用顯著性下限與退回 sigma 的嚴重度。
+> 沒有 `psql` 的環境（例如 Windows）用 SQL 用戶端把整支檔案當成一份腳本執行即可。
 
 > **表放在 `vib` schema 而非 `public` 是刻意的**，用意是與資料庫裡其他系統
 > 的表區隔開。因此手動下 SQL 時要寫 `vib.device`，或先執行
@@ -168,11 +173,11 @@ python -m vibcore.check
   ✓ 連線成功（PostgreSQL 16.13 ...）
 
 【3】資料表
-  ✓ 20 張表齊全
+  ✓ 21 張表齊全
 
 【4】預設資料
-  ✓ 判定規則：13 筆
-  ✓ ISO 門檻等級：4 筆
+  ✓ 判定規則：14 筆
+  ✓ ISO 門檻等級：8 筆
   ✓ 簽核階段 SLA：3 筆
   ✓ 角色定義：5 筆
 
@@ -187,7 +192,7 @@ python -m vibcore.check
 
 任何一項顯示 `✗` 時，程式會直接印出常見原因與修正指令，不會讓你自己猜。
 
-**到這裡安裝就完成了。** 接下來依 §二 補台帳資料，然後進行 §三 的門檻校準。
+**到這裡安裝就完成了。** 接下來依 §二 匯入台帳，然後進行 §三 的門檻校準。
 
 ---
 
@@ -197,32 +202,49 @@ python -m vibcore.check
 > 或用你慣用的資料庫工具。所有表都在 `vib` schema 下，所以表名要寫成
 > `vib.device`（或先執行 `SET search_path TO vib;` 之後就能省略前綴）。
 
-### 2.1 設備台帳
+### 2.1 設備台帳（ISO 分級、備機、額定功率）
 
-**多數欄位不需要手動建立。** 每日排程會從 Analytic CSV 內建的 metadata
+**設備名稱、樓層等多數欄位不需要手動建立。** 每日排程會從 Analytic CSV 內建的 metadata
 （`Name` / `Building` / `Floor` / `System` / `RPM` / `FMF`）自動建立設備與量測點。
 
-但以下三項 CSV 裡沒有，需要人工補：
+但以下資料 CSV 裡**沒有**，只能由工程師填（這就是「台帳」）：
 
-| 欄位 | 影響 | 怎麼設 |
-|------|------|--------|
-| `is_standby` | 備機不判異常，改用試車規則監測 | 見下方 SQL |
-| `iso_machine_class` | 未設定時**不套用 ISO Zone 判定**，只做相對趨勢 | 依 ISO 10816 分級 |
-| `owner_user_id` | Finding 要指派給誰 | 需先建立使用者 |
+| 欄位 | 影響 | 沒填的後果 |
+|------|------|-----------|
+| `iso_machine_group`（1～4）＋ `iso_foundation`（rigid／flexible） | `ISO_ZONE`、ISO 錨定的 `VEL_HIGH`。**兩者缺一就不判定** | 設備停在「未分級」，只做相對基準與趨勢 |
+| `rated_power_kw` | 額定 ≤ 15 kW 的設備不在 ISO 20816-3 適用範圍，分類填了也不套用 | 無法擋掉範圍外的設備 |
+| `is_standby` | 備機改用 `STANDBY_NO_RUNTIME` 監測 | 備機規則完全不判定 |
+| `iso_driver_type`、`last_maintenance_at` | 稽核紀錄；基準期不得早於最後保養 | — |
 
-```sql
--- 標記備機
-UPDATE vib.device SET is_standby = TRUE WHERE device_id IN ('P-Backup-02');
+**這些沒填的後果都是安靜的**——沒有錯誤訊息，看起來只是「這段時間設備都很健康」。
+所以要主動確認（見下）。
 
--- 設定 ISO 等級（Class I~IV），並標明來源
-UPDATE vib.device
-   SET iso_machine_class = 'II', iso_class_source = 'manual_override'
- WHERE device_id = 'AHU-601';
+**流程**（台帳是 CSV，用試算表填，不必逐台寫 SQL）：
+
+```bash
+# 1. 先跑一次每日排程，讓設備與量測點依資料建立
+python -m vibcore.pipeline.daily --data-dir <資料夾>
+
+# 2. 產台帳範本（參考欄會預填：額定轉速、運轉時 velRMS 分佈…），交給工程師填
+python -m validate.iso_readiness --data-dir <資料夾> --emit-ledger ledger.csv
+
+# 3. 填完後先預演——看會改哪些設備、哪些 id 對不上
+python -m vibcore.ledger_import --csv ledger.csv --dry-run
+
+# 4. 套用
+python -m vibcore.ledger_import --csv ledger.csv
 ```
 
+匯入工具的規則：**留空＝不動**（不會把資料庫已有的值清掉）；群組與基礎剛性齊備時自動把
+`iso_class_source` 設為 `manual_override`（少了這步分類填了也不生效）；值不合法的列整列略過並說明；
+**台帳 `device_id` 與資料庫只差空白／底線／大小寫（`CH01_M1` 對 `CH 01_M1`）時只報告、不套用**
+——請改台帳。結束時會印覆蓋摘要，例如「ISO 判定會啟用 53 個量測點、額定 ≤ 15 kW（標準不適用，
+不是填錯）10 個量測點、標為備機 30 個」。重跑是安全的（冪等）。
+
+> `python -m vibcore.check` 也會提醒：有設備停在未分級、或沒有任何設備標為備機。
+
 > **ISO 等級沒設就不會有 Zone 判定。** 系統會誠實顯示「未分級」而不是猜一個。
-> 若填錯，`ISO_CLASS_SUSPECT` 規則會在基準期中位數已超過該等級 B/C 界時
-> 提醒複核。
+> 若填錯，`ISO_CLASS_SUSPECT` 規則會在基準期中位數已超過該等級 B/C 界時提醒複核。
 
 ### 2.2 使用者與角色
 
@@ -288,22 +310,24 @@ python -m validate.offline --data-dir <資料夾> --latest-cadence-only
 
 ### 3.0.1 確認 ISO 機械等級的填寫狀況
 
-`ISO_ZONE` 與 `VEL_HIGH` 的 ISO 模式都需要設備的機械等級
-（CSV 的 `ISO10816_code`，1=Class I…4=Class IV）。未填的設備會安靜地
-退回相對基準判定，不會報錯——所以要主動檢查：
+`ISO_ZONE` 與 `VEL_HIGH` 的 ISO 模式都需要設備的**機器群組與基礎剛性**（台帳，見 §二 2.1）。
+沒填的設備會安靜地退回相對基準判定，不會報錯——所以要主動檢查：
 
 ```bash
-python -m validate.iso_readiness --data-dir <資料夾>
-python -m validate.iso_readiness --data-dir <資料夾> --csv output/iso_readiness.csv
+python -m validate.iso_readiness --data-dir <資料夾> --device-meta ledger.csv
+python -m validate.iso_readiness --data-dir <資料夾> --device-meta ledger.csv --csv output/iso_readiness.csv
 ```
 
-它回答兩個問題：**多少台填了等級**，以及**已分級的設備離 ISO 告警門檻
+它回答兩個問題：**多少台填了分類**，以及**已分級的設備離 ISO 告警門檻
 還有多遠**（headroom = p95 ÷ 門檻，≥1 代表已越線）。
 
 判讀：
 
 - **多數未填** → 補台帳。在那之前 `ISO_ZONE` 觸發 0 次不代表設備健康，
   只代表它根本沒判定。
+- **額定功率 ≤ 15 kW 的設備**分類填了也不會判定 Zone——ISO 20816-3 只涵蓋大於 15 kW 的機器。
+  這些設備的 `VEL_HIGH` 會退回「相對基準」並**只列入週報的觀察名單，不派工**
+  （事件的 `iso_fallback_reason` 欄會寫原因）。這不是台帳沒填好。
 - **都填了、但 headroom 普遍很低（例如 0.4~0.5）** → 這些設備照 ISO 看
   確實健康，ISO 模式本來就不會觸發。這不是系統故障；此時本系統的價值
   在趨勢與觀察名單，而不是絕對位準告警。
@@ -328,15 +352,30 @@ python -m validate.iso_readiness --data-dir <資料夾> --csv output/iso_readine
 - 合成資料的實測顯示 `STEP_CHANGE` 在 σ=3.0 時明顯偏鬆（σ=3.5 觸發數降到
   約 1/4），但**這個數字必須用你的真實資料重跑才算數**
 
-### 3.3 調整門檻
+### 3.3 調整門檻、停用規則、升降級
 
 ```sql
+-- 改參數（只列要改的鍵會整個覆蓋 params，所以先 SELECT 看現值再改）
 UPDATE vib.rule_config
-   SET params = '{"mahalanobis_sigma": 3.5}'::jsonb
+   SET params = params || '{"mahalanobis_sigma": 3.5}'::jsonb
  WHERE rule_code = 'STEP_CHANGE';
+
+-- 停用一條規則（不會產生新的 Finding／觀察項目）
+UPDATE vib.rule_config SET is_active = FALSE WHERE rule_code = 'TEMP_RISE';
+
+-- 升降級：observe＝只列週報觀察名單（不進簽核與 SLA）；warn＝建立 Finding 派工
+UPDATE vib.rule_config SET severity = 'warn' WHERE rule_code = 'IMPACT_RISE';
 ```
 
-改完重跑一次回測確認效果。**規則門檻是設定不是寫死的**，之後隨時可調。
+**規則門檻是設定不是寫死的**，改了下一次每日排程就生效，不必改程式。改完重跑一次回測確認效果。
+
+`severity` 是**上限**：規則函式自己可以再往下調（例如 `VEL_HIGH` 退回相對基準時只列觀察名單，由
+`params.fallback_severity` 控制），設定不會把它拉回去；但設定為 `observe` 的規則，就算規則函式回傳
+`warn` 也只進觀察名單。
+
+> 2026-10 之前，正式排程**沒有**套用資料庫的 `params`、`is_active`、`severity`（引擎讀不到資料庫回傳的
+> 字典格式），規則一律用程式碼預設值，observe 規則也被當成 warn 派工。已修正並加上測試；若你的環境
+> 還在跑舊版，這一節的 UPDATE 都不會生效。
 
 ---
 
@@ -358,7 +397,7 @@ python -m vibcore.pipeline.daily --data-dir /path/to/資料 --date 2026-08-25
 2. 聚合為每小時（僅計運轉樣本），寫入資料庫
 3. 記錄匯入軌跡（成功與失敗都記）
 4. 沒有基準期的量測點，嘗試自動建立
-5. 執行 13 條規則，建立或更新 Finding
+5. 執行 14 條規則（參數、啟停、嚴重度取自資料庫 `rule_config`）：有外部標準可引用的建立或更新 Finding，其餘寫入觀察名單
 6. 數值較上次更偏離基準 → 標記惡化
 7. 連續 3 天未再觸發 → 自動結案
 
@@ -561,3 +600,4 @@ SELECT status, count(*), round(avg(EXTRACT(DAY FROM now() - stage_entered_at))) 
 | Dashboard | 需求書已備妥（`DASHBOARD_requirements.md`），尚未開發 |
 | 週報 Email 寄送 | SMTP 未設定；`send_report` 目前只落庫（**報告 HTML 已完整產出並存進 `weekly_report.html`**），寄送介面已預留 |
 | 設備 A/B 期間比較 | 需求已納入需求書，尚未實作 |
+| 現場回饋 | Dashboard 之前先用試算表：`python -m validate.review_sheet export／score`（見 `docs/TRIAL_RUN_PLAN.md`） |

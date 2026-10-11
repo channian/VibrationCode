@@ -220,6 +220,10 @@ class RuleOutcome:
     value_unit: str = ''
     evidence: dict = field(default_factory=dict)
     target_type: str = 'point'               # 'device' | 'point' | 'global'
+    # 判定當下這條規則實際用的參數。`evaluate_all` 逐條規則換 `ctx.params`，跑完後
+    # `ctx.params` 只剩最後一條規則的參數；Finding／Observation 的 `trigger_params`
+    # 快照必須是**觸發它的那條規則**的參數，所以由引擎在判定當下記在結果上。
+    params: dict = field(default_factory=dict)
 
     @staticmethod
     def no_trigger(rule_code: str, issue_type: str = '', family: str = 'none') -> 'RuleOutcome':
@@ -259,6 +263,33 @@ SEVERITY_OBSERVE = 'observe'
 
 #: 會建立 Finding 並進入簽核流程的嚴重度
 ACTIONABLE_SEVERITIES = (SEVERITY_ERR, SEVERITY_WARN)
+
+#: 嚴重度高低（數字越大越嚴重），供 `effective_severity` 比較。
+SEVERITY_RANK = {SEVERITY_OBSERVE: 0, SEVERITY_WARN: 1, SEVERITY_ERR: 2}
+
+
+def effective_severity(rule_severity: str | None, config_severity: str | None) -> str:
+    """
+    規則函式回傳的嚴重度與 `rule_config.severity` 取**較低者**：設定是上限，規則可以再往下調。
+
+    為什麼需要：`rule_config.severity` 是「這條規則觸發時的預設嚴重度」，維運人員靠它把
+    沒有外部標準可引用的規則放在 `observe`（只進觀察名單、不進簽核與 SLA），累積回饋後再升回
+    `warn`——改設定就生效，不必改程式。但規則函式本身回傳固定的 `warn`，如果引擎不套用設定，
+    這個旋鈕就是裝飾：整條「observe 分層」只在回測裡成立（回測直接讀設定），正式的每日排程
+    會把所有 observe 規則當成 warn 派工。取較低者的另一面：規則也能自己往下調（例如 VEL_HIGH
+    退回 sigma 時只列觀察名單），設定不會把它拉回去。
+
+    其中一個是 None 或不認得，就用另一個；兩個都沒有回 `warn`。
+    """
+    a = rule_severity if rule_severity in SEVERITY_RANK else None
+    b = config_severity if config_severity in SEVERITY_RANK else None
+    if a is None and b is None:
+        return SEVERITY_WARN
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if SEVERITY_RANK[a] <= SEVERITY_RANK[b] else b
 
 
 def is_actionable(severity: str) -> bool:

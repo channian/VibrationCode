@@ -218,6 +218,14 @@ def check_data() -> dict:
                 if unset:
                     _line(WARN, f"{unset} 台設備未設定 ISO 等級 → 不會套用 Zone 判定，"
                                 f"僅以相對趨勢監測")
+                    _line("·", "台帳在 CSV 裡的話，用這支匯入（先加 --dry-run 預演）："
+                               "python -m vibcore.ledger_import --csv <台帳.csv>")
+                cur.execute("SELECT count(*) AS n FROM device WHERE is_standby")
+                n_standby = cur.fetchone()["n"]
+                _line("·", f"標為備機：{n_standby} 台")
+                if n_standby == 0:
+                    _line(WARN, "沒有任何設備標為備機 → STANDBY_NO_RUNTIME 完全不會判定。"
+                                "若現場確有備機，請補台帳（這項安靜失效，不會有任何錯誤訊息）")
     return stats
 
 
@@ -227,8 +235,12 @@ def suggest_next(stats: dict) -> None:
         print("  尚未匯入任何資料。建議順序：")
         print("    1. 先用歷史資料跑離線回測校準門檻（重要，見 docs/USAGE.md §三）")
         print("       python -m validate.offline --data-dir <歷史資料夾>")
-        print("    2. 確認門檻合理後，執行每日排程")
+        print("    2. 確認門檻合理後，執行每日排程（第一次執行會依資料建立設備與量測點）")
         print("       python -m vibcore.pipeline.daily --data-dir <當日資料夾>")
+        print("    3. 匯入台帳（ISO 群組、基礎剛性、額定功率、是否備機）——不做這步，所有設備")
+        print("       停在「未分級」，ISO 判定與備機規則都不會運作，而且沒有任何錯誤訊息")
+        print("       python -m vibcore.ledger_import --csv <台帳.csv> --dry-run   # 先預演")
+        print("       python -m vibcore.ledger_import --csv <台帳.csv>")
     elif not stats.get("findings"):
         print("  已有設備資料但尚無事項。可能是資料還不足以判定，或確實無異常。")
         print("    · 查資料狀態分佈：見 docs/USAGE.md §七「每天都沒有任何 Finding」")

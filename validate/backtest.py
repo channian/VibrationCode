@@ -34,7 +34,7 @@ import pandas as pd
 
 from vibcore.config import DEFAULT_AGG, DEFAULT_TREND, AggregateConfig
 from vibcore.pipeline.aggregate import aggregate_hourly, coverage_report, summarize_gaps
-from vibcore.types import RuleContext, is_actionable
+from vibcore.types import RuleContext, effective_severity, is_actionable
 
 from validate.baseline_stub import compute_axis_energy_baseline, compute_baseline
 from validate.points import PointSeries
@@ -174,6 +174,7 @@ def _make_episode_row(pc: PointContext, rule_row: RuleConfigRow,
     會漂移，而校準門檻時要問的是「觸發的那一刻長什麼樣」。
     """
     duration_days = (end.normalize() - start.normalize()).days + 1
+    severity = effective_severity(getattr(first_outcome, 'severity', None), rule_row.severity)
     return {
         'device_id': pc.point.device.device_id,
         'device_name': pc.point.device.device_name,
@@ -183,11 +184,14 @@ def _make_episode_row(pc: PointContext, rule_row: RuleConfigRow,
         'rule_name': rule_row.rule_name,
         'family': rule_row.family,
         'issue_type': rule_row.issue_type,
-        'severity': rule_row.severity,
+        # 與正式排程同一個算法（`types.effective_severity`）：規則函式回傳的嚴重度與
+        # 設定的上限取較低者。原本直接用設定值，規則自己往下調的情形（例如 VEL_HIGH 退回
+        # sigma 只列觀察名單）在回測裡看不到，回測與上線會對不起來。
+        'severity': severity,
         # 是否會在正式系統建立 Finding、進入簽核鏈——直接在事件層算好，
         # 下游（report.py）就不必各自 import vibcore.types 重算一次判準，
         # 也不會有兩處判準漂移的風險。
-        'is_actionable': is_actionable(rule_row.severity),
+        'is_actionable': is_actionable(severity),
         'episode_start': start,
         'episode_end': end,
         'duration_days': duration_days,

@@ -267,20 +267,25 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
         # 規則需要看趨勢，因此餵入的是歷史區間而非只有當日
         window_start = (datetime.combine(run_date, datetime.min.time(), tzinfo=timezone.utc)
                         - timedelta(days=DEFAULT_TREND.min_days * 2))
-        window_end = datetime.combine(run_date, datetime.min.time(),
-                                      tzinfo=timezone.utc) + timedelta(days=1)
+        window_end = run_window_end(run_date)
         rule_agg = repo.get_agg(conn, point_id, window_start, window_end)
         if rule_agg.empty:
             rule_agg = agg
 
+        # `now` 不能直接用牆上時鐘：補跑／重放歷史日期時，依 `now` 判定的規則
+        # （SENSOR_OFFLINE 的「多久沒資料」、STANDBY_NO_RUNTIME 的「多久沒運轉」）會把
+        # 整段歷史都算成離線，而且 Finding／觀察項目的首次出現時間會被壓成執行當天。
+        # 取兩者較早者：跑今天的資料就是現在，跑過去的日期就是那一天結束。
         ctx = RuleContext(
             device=device, point_id=point_id, position=position,
             agg=rule_agg, baseline=baseline, params={},
-            now=datetime.now(timezone.utc),
+            now=rule_now(window_end),
             axis_energy_baseline=(baseline.stats.get('axis_energy_sorted')
                                   if baseline and hasattr(baseline, 'stats') else None),
         )
-        rule_configs = repo.get_rule_configs(conn)
+        # active_only=False：停用的規則要查得到（is_active=False），引擎才跳得過它；
+        # 只給啟用中的，停用的規則會因為查不到設定而用程式碼預設值照跑。
+        rule_configs = repo.get_rule_configs(conn, active_only=False)
         outcomes = evaluate_all(ctx, rule_configs)
         # 依嚴重度分兩桶：actionable（err/warn）進 triggered、其餘
         # （目前只有 observe）進 observed。分類只看 outcome.severity，
@@ -303,6 +308,22 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
 # ──────────────────────────────────────────────────────────
 # Observation（observe 級判定，不進簽核鏈）
 # ──────────────────────────────────────────────────────────
+
+def run_window_end(run_date: date) -> datetime:
+    """這批資料窗口的結束時間：`run_date` 隔日零時（UTC）。"""
+    return (datetime.combine(run_date, datetime.min.time(), tzinfo=timezone.utc)
+            + timedelta(days=1))
+
+
+def rule_now(window_end: datetime) -> datetime:
+    """
+    規則判定用的「現在」：牆上時鐘與該批資料窗口結束時間取較早者。
+
+    跑今天的資料，窗口結束在明天零時，所以是現在；補跑／重放過去的日期，是那一天結束。
+    見 `process_point` 的說明：依 `now` 判定的規則在補跑時不能拿真實的現在。
+    """
+    return min(datetime.now(timezone.utc), window_end)
+
 
 def _outcome_to_observation(outcome, ctx) -> repo.Observation:
     """
@@ -339,7 +360,7 @@ def _outcome_to_observation(outcome, ctx) -> repo.Observation:
         # 留存觸發當下的門檻，理由同 outcome_to_finding：門檻要靠實際
         # 誤報率迭代，沒有這份快照，日後評估「該不該升為 warn」就只能
         # 重跑整條管線。
-        trigger_params=dict(ctx.params or {}),
+        trigger_params=dict(outcome.params or ctx.params or {}),
         interpretation_limit=outcome.interpretation_limit,
         source='rule_engine',
     )
@@ -444,9 +465,15 @@ def persist_findings(conn, results: list[PointResult]) -> tuple[int, int, int]:
     return n_upsert, n_escalate, n_observed
 
 
-def auto_resolve_quiet(conn, quiet_days: int = DEFAULT_QUIET_DAYS) -> int:
+def auto_resolve_quiet(conn, quiet_days: int = DEFAULT_QUIET_DAYS,
+                       now: datetime | None = None) -> int:
     """
     自動結案：連續 `quiet_days` 天未再觸發的未結案事項。
+
+    `now` 是「現在」的基準，預設牆上時鐘。補跑／重放歷史日期時必須傳該批資料的結束時間
+    （見 `rule_now`）：`last_seen_at` 是規則判定時的 `now`（歷史日期），若拿牆上時鐘去比，
+    每件剛建立的事項都會被當成「已經安靜好幾天」而在同一次排程內結案，隔天再觸發又重開新案，
+    首次出現時間與簽核進度全部被洗掉。
 
     判準用 `last_seen_at`——該欄位只在規則再次觸發時更新，因此
     「距今超過 N 天沒更新」就等於「規則已連續 N 天沒再判定為異常」，
@@ -455,7 +482,7 @@ def auto_resolve_quiet(conn, quiet_days: int = DEFAULT_QUIET_DAYS) -> int:
     刻意不要求走完簽核鏈：問題本身消失時直接結案才是對的，卡住的簽核
     步驟不該讓一件已經好了的事永遠掛著。歷程紀錄保留供追溯。
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=quiet_days)
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=quiet_days)
     n = 0
     for row in repo.get_open_findings(conn):
         last_seen = row.get('last_seen_at')
@@ -521,7 +548,8 @@ def run_daily(conn, data_dir: str, run_date: date | None = None,
     result.findings_upserted, result.escalated, result.observed_count = (
         persist_findings(conn, result.points)
     )
-    result.auto_resolved = auto_resolve_quiet(conn, quiet_days)
+    result.auto_resolved = auto_resolve_quiet(conn, quiet_days,
+                                              now=rule_now(run_window_end(run_date)))
     result.finished_at = datetime.now(timezone.utc)
 
     logger.info(result.summary())
