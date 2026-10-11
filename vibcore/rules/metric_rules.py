@@ -391,8 +391,10 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
 
     **未分級設備的處理（重要）**：`'iso'` 模式仰賴
     `iso_mod.evaluate_iso()` 判斷 Zone 邊界是否可用；未分級設備
-    （`applicable is False`，對應 `iso_class_source == 'unset'`）沒有
-    Zone 邊界可查，此時**自動退回 `'sigma'` 模式**，並在 evidence 的
+    （`applicable is False`，對應 `iso_class_source == 'unset'`），以及
+    **台帳有填、但落在標準適用範圍外的設備**（額定功率 ≤ 15 kW，見
+    `iso_scope_reason`）都沒有 Zone 邊界可查，此時**自動退回 `'sigma'` 模式**，
+    原因記在 evidence 的 `iso_fallback_reason`，並在 evidence 的
     `threshold_mode` 欄位如實標記為 `'sigma_fallback'`（不是安靜地假裝
     照 iso 模式判定完畢）——若未分級時直接不判定，等於讓沒填 ISO 等級的
     設備完全失去 VEL_HIGH 監測，比退回相對基準判定更糟，也違反本系統
@@ -442,16 +444,20 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
     bc_boundary = None
     iso_cap = None
     iso_threshold = None
+    fallback_reason = None
     mode = requested_mode
 
     if requested_mode == 'iso':
         iso_result = iso_mod.evaluate_iso(ctx.agg, ctx.device, ctx.baseline)
         if not iso_result.applicable:
             # 未分類或範圍外：沒有 Zone 邊界可用，退回 sigma 而非不判定
-            # （見上方 docstring）。`note` 已說明是哪一種原因。
+            # （見上方 docstring）。`note` 已說明是哪一種原因——
+            # 「未分級」與「額定功率 ≤ 15 kW 不在標準範圍內」是兩回事（後者台帳
+            # 其實填了分類），原因要如實帶進事件，不能一律說成未分級。
             logger.debug(f"VEL_HIGH：point={ctx.point_id} 不適用 ISO 判定"
                          f"（{iso_result.note}），自動退回 sigma 模式")
             mode = 'sigma_fallback'
+            fallback_reason = iso_result.note or '未分級，僅以相對基準與趨勢監測'
         else:
             key = iso_mod.resolve_class(ctx.device)
             machine_class = iso_result.machine_class
@@ -499,7 +505,7 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
             '亦未與其他指標交叉比對，建議參考同一量測點的其他指標並視情況安排複測。'
         )
     else:
-        note = '（設備未分級，自動退回相對基準判定）' if mode == 'sigma_fallback' else ''
+        note = f'（{fallback_reason}）' if fallback_reason else ''
         title = '速度整體值相對基準偏高'
         detail = (f'最近一次量測 {metric} = {current:.3f} mm/s，相對基準期中位數 '
                    f'{stat.median:.3f} mm/s 高出 {sigma:.1f}σ（門檻 {sigma_th:.1f}σ）{note}。')
@@ -529,6 +535,10 @@ def vel_high(ctx: RuleContext) -> RuleOutcome:
             'bc_boundary_mm_s': bc_boundary,
             'iso_cap_mm_s': iso_cap,
             'machine_class': machine_class,
+            # 退回 sigma 的原因（未分級／群組或基礎剛性沒填完整／額定功率 ≤ 15 kW
+            # 不在標準範圍內…）；ISO 模式時為 None。事後判讀回測結果時，
+            # 靠它區分「台帳沒填」與「標準本來就不適用」。
+            'iso_fallback_reason': fallback_reason,
             'sigma': round(sigma, 2),
             'sigma_threshold': sigma_th,
             'baseline_median': stat.median,

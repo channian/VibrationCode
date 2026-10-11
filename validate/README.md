@@ -16,6 +16,8 @@
 > 剛性」兩項，而 Analytic CSV 兩項都沒有（`ISO10816_code` 的語意也未經
 > 確認，見 `docs/DATA_CONTRACT.md` §3.1b）。因此**預設所有設備都是未
 > 分類**，`ISO_ZONE` 不觸發、`VEL_HIGH` 走 `sigma_fallback`。
+> （台帳填了分類、但**額定功率 ≤ 15 kW** 的設備也一樣走 `sigma_fallback`——ISO 20816-3
+> 只涵蓋大於 15 kW 的機器。原因記在每件事件的 `iso_fallback_reason` 欄。）
 > 要跑 ISO 相關的回測，必須明確給定假設：
 >
 > ```bash
@@ -156,16 +158,23 @@ python -m validate.operating_state --data-dir data/ --tagmap out/tagmap.csv \
     --readings scada_csv/ --ledger out/ledger.csv \
     --since 2026-06-01 --until 2026-08-20 --csv out/operating_state.csv
 
-# 回測告警歸因：吃回測的 episodes_detail.csv 與上面兩支的輸出
+# 回測告警歸因：吃回測的 episodes_detail.csv 與上面兩支的輸出；給 --ledger 會逐點說明
+# VEL_HIGH 為什麼走 sigma_fallback（額定 ≤ 15 kW？沒填？id 寫法？）
 python -m validate.alarm_attribution --episodes out/validation/episodes_detail.csv \
     --operating-state out/operating_state.csv --speed-effect out/speed_effect.csv \
-    --csv out/alarm_attribution.csv
+    --ledger out/ledger.csv --csv out/alarm_attribution.csv
+
+# 某個告警事件發生時，轉速到底有沒有變？（只跑指定設備，很快；也會看出 SCADA 有沒有涵蓋那幾天）
+python -m validate.speed_effect --data-dir data/ --tagmap out/tagmap.csv --readings scada_csv/ \
+    --daily "CP 08_M2" --since 2026-08-05 --until 2026-08-22
 ```
 
-`alarm_attribution` 會先從 episodes **內容**判斷它是哪一版程式、有沒有帶台帳（IMPACT_RISE 的
-evidence 還有 `kurt` 通道＝移除 kurtosis 之前；VEL_HIGH 的 `machine_class` 全空＝沒帶台帳），
-不用靠資料夾名稱猜。台帳的 `device_id` 與資料對不上（例如 `CH01_M1` 對 `CH 01_M1`）時，
-`offline` 與 `iso_readiness` 都會警告該筆台帳沒有生效。
+`alarm_attribution` 會先從 episodes **內容**判斷它是哪一版程式、有沒有帶台帳，不用靠資料夾名稱猜：
+IMPACT_RISE 的 evidence 還有 `kurt` 通道＝移除 kurtosis 之前；有 `machine_class`、或出現只有帶台帳
+才會有的規則（`ISO_ZONE`／`ISO_CLASS_SUSPECT`／`STANDBY_NO_RUNTIME`）＝有帶台帳。**不能只看
+VEL_HIGH**：帶了台帳、ISO 錨定的點沒觸發時，剩下的 VEL_HIGH 會全是 `sigma_fallback`，看起來跟沒帶台帳
+一樣。台帳的 `device_id` 與資料對不上（例如 `CH01_M1` 對 `CH 01_M1`）時，`offline`、`iso_readiness`
+與 `alarm_attribution --ledger` 都會警告該筆台帳沒有生效。
 
 ## 報告怎麼看
 

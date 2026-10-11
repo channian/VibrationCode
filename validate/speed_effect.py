@@ -20,6 +20,15 @@ speed_effect.py — 轉速變了，振動速度（velRMS）有沒有跟著變？
         --tagmap out/tagmap.csv --readings out/scada.csv \\
         --since 2026-06-01 --until 2026-06-14 --csv out/speed_effect.csv
 
+要看「某個告警事件發生時，轉速到底有沒有變」，用逐日對照（只跑單一設備，很快）：
+
+    python -m validate.speed_effect --data-dir data/ --tagmap out/tagmap.csv \\
+        --readings scada/ --daily "CP 08_M2" --since 2026-08-05 --until 2026-08-22
+
+每天一列：運轉小時數與 velRMS 中位數，以及同一天 SCADA 頻率的最小／中位／最大。
+`SCADA h` 為 0 的日子代表那天根本沒有 SCADA 讀值（無從判斷，不是「轉速沒變」）；
+有讀值但「其中>0Hz」為 0，代表 SCADA 說那天是停機。
+
 **解讀前請先讀這幾點**：
 
 1. **這是相關，不是因果。** 頻率與 velRMS 若同時隨季節、負載緩慢上升，
@@ -385,6 +394,61 @@ def run(data_dir: str, tagmap_path: str, readings_path: str, pattern: str = '*.c
     return pd.DataFrame(rows), info
 
 
+def daily(data_dir: str, tagmap_path: str, readings_path: str, device_id: str,
+          pattern: str = '*.csv', since: str | None = None,
+          until: str | None = None) -> pd.DataFrame:
+    """
+    單一設備的逐日對照：當天運轉小時數與 velRMS 中位數、同一天 SCADA 頻率的
+    最小／中位／最大。
+
+    **用途**：`run()` 給的是整段期間的統計量，回答不了「8/14 那個告警發生時，
+    轉速到底有沒有變」。某天 velRMS 大幅上升，若同一天頻率沒動，就不是轉速造成的；
+    若那天 SCADA 根本沒有讀值，則是**無從判斷**，兩者不能混為一談（`scada_h`＝0）。
+
+    `scada_h` 是當天有 SCADA 讀值的小時數（含 0 Hz），`scada_run_h` 是其中頻率 > 0
+    的小時數；兩者要分開——**讀值是 0 Hz（SCADA 說停機）與根本沒有讀值是兩回事**，
+    前者是證據、後者是無從判斷。頻率的 min／中位／max 只取 > 0 的小時；不剔除
+    小時內轉速在跳的小時，因為這裡是看事件前後發生了什麼，剔除反而會把轉速在變的
+    時段藏起來。
+    """
+    cols = ['tag', 'day', 'vib_h', 'vel_median', 'scada_h', 'scada_run_h',
+            'freq_min', 'freq_median', 'freq_max']
+    mappings = [m for m in parse_tagmap(tagmap_path)
+                if m.variable_type == 'frequency' and m.is_active and m.device_id == device_id]
+    if not mappings:
+        return pd.DataFrame(columns=cols)
+    readings = parse_readings(readings_path)
+    readings, _ = match_readings(readings, mappings)
+    freq_h = hourly_frequency(readings)
+    if since:
+        freq_h = freq_h[freq_h['ts_hour'] >= pd.Timestamp(since)]
+    if until:
+        freq_h = freq_h[freq_h['ts_hour'] < pd.Timestamp(until) + pd.Timedelta(days=1)]
+    vib, _ = load_vibration(data_dir, pattern, since, until, devices={device_id})
+    vh = vib[vib['device_id'] == device_id] if not vib.empty else vib
+
+    out = []
+    for m in sorted(mappings, key=lambda x: x.tag_id):
+        fa = freq_h[freq_h['tag_id'] == m.tag_id]
+        fh = fa[fa['freq'] > 0]
+        dv = (vh.assign(day=vh['ts_hour'].dt.floor('D')).groupby('day')['vel']
+              .agg(vib_h='size', vel_median='median')) if not vh.empty else pd.DataFrame(
+                  columns=['vib_h', 'vel_median'])
+        da = (fa.assign(day=fa['ts_hour'].dt.floor('D')).groupby('day')['freq']
+              .agg(scada_h='size')) if not fa.empty else pd.DataFrame(columns=['scada_h'])
+        df_ = (fh.assign(day=fh['ts_hour'].dt.floor('D')).groupby('day')['freq']
+               .agg(scada_run_h='size', freq_min='min', freq_median='median', freq_max='max')
+               ) if not fh.empty else pd.DataFrame(
+                   columns=['scada_run_h', 'freq_min', 'freq_median', 'freq_max'])
+        t = dv.join(da, how='outer').join(df_, how='outer')
+        for c in ('vib_h', 'scada_h', 'scada_run_h'):
+            t[c] = t[c].fillna(0).astype(int)
+        t = t.reset_index().rename(columns={'index': 'day'})
+        t.insert(0, 'tag', m.tag_id)
+        out.append(t[cols])
+    return pd.concat(out, ignore_index=True).sort_values(['tag', 'day']).reset_index(drop=True)
+
+
 # ── 輸出 ──────────────────────────────────────────────
 
 _VERDICT_ORDER = ['material', 'moderate', 'minor', 'confounded', 'no_variation', 'insufficient']
@@ -466,6 +530,33 @@ def report(df: pd.DataFrame, info: dict) -> None:
     print('    變寬後要重量。是否分層請拿 material 的設備數量與工作量一起討論。')
 
 
+def report_daily(device_id: str, tbl: pd.DataFrame) -> None:
+    print('\n' + '=' * 78)
+    print(f'{device_id} 逐日對照（運轉中的小時；頻率為 SCADA 小時中位數，只計 > 0 Hz）')
+    print('=' * 78)
+    if tbl.empty:
+        print('對應表裡沒有這台設備的頻率 tag，或指定期間兩邊都沒有資料。')
+        return
+    for tag, g in tbl.groupby('tag'):
+        print(f'tag：{_short(tag)}')
+        print(f'  {"日期":10s} {"運轉h":>6s} {"velRMS":>8s} {"SCADA h":>8s} {"其中>0Hz":>8s} '
+              f'{"頻率 min":>9s} {"中位":>7s} {"max":>7s}')
+        for _, r in g.iterrows():
+            vel = f'{r["vel_median"]:8.3f}' if pd.notna(r['vel_median']) else f'{"-":>8s}'
+            if r['scada_run_h'] > 0:
+                fq = f'{r["freq_min"]:9.2f} {r["freq_median"]:7.2f} {r["freq_max"]:7.2f}'
+            elif r['scada_h'] > 0:
+                fq = '  （有讀值但全為 0 Hz ＝ SCADA 說停機）'
+            else:
+                fq = '  （當天沒有 SCADA 讀值，無從判斷）'
+            print(f'  {r["day"]:%Y-%m-%d} {int(r["vib_h"]):6d} {vel} {int(r["scada_h"]):8d} '
+                  f'{int(r["scada_run_h"]):8d} {fq}')
+        have = g[g['scada_h'] > 0]
+        if not have.empty:
+            print(f'  SCADA 讀值涵蓋 {have["day"].min():%Y-%m-%d} ~ {have["day"].max():%Y-%m-%d}'
+                  f'；沒有讀值的日子無從判斷轉速，不要當成「轉速沒變」。')
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description='velRMS 對轉速（SCADA 頻率）的相依性')
     ap.add_argument('--data-dir', required=True, help='Analytic CSV 資料夾')
@@ -476,11 +567,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--since', help='起日 YYYY-MM-DD（含）')
     ap.add_argument('--until', help='迄日 YYYY-MM-DD（含）')
     ap.add_argument('--csv', help='結果表輸出路徑')
+    ap.add_argument('--daily', nargs='+', metavar='DEVICE',
+                    help='只看這幾台設備的逐日對照（velRMS 與 SCADA 頻率），不跑整體分析')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format='%(levelname)s %(message)s')
+    if args.daily:
+        for dev in args.daily:
+            tbl = daily(args.data_dir, args.tagmap, args.readings, dev, args.pattern,
+                        args.since, args.until)
+            report_daily(dev, tbl)
+            if args.csv and not tbl.empty:
+                base, ext = os.path.splitext(args.csv)
+                tbl.to_csv(f'{base}_{dev.replace(" ", "_")}{ext or ".csv"}', index=False,
+                           encoding='utf-8-sig')
+        return 0
+
     df, info = run(args.data_dir, args.tagmap, args.readings, args.pattern,
                    args.since, args.until)
     report(df, info)

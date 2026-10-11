@@ -129,6 +129,9 @@ def build_point_context(point: PointSeries, agg_cfg: AggregateConfig = DEFAULT_A
 #:                    退回相對基準」，而兩者的意義完全不同
 #:   machine_class    ISO 分類（群組/基礎剛性），可驗證 --assume-iso 有沒有
 #:                    真的套用到這台
+#:   iso_fallback_reason  VEL_HIGH 退回 sigma 的原因：未分級、群組或基礎剛性沒
+#:                    填完整、還是額定功率 ≤ 15 kW 不在標準範圍內。後兩者台帳
+#:                    看起來「已填」，沒有這欄會被誤讀成台帳沒生效
 #:   trigger_source   IMPACT_RISE 是合成通道、逐軸通道、還是兩者都超標
 #:   primary_metric   實際採用的欄位名（median 或退回 max，見 _impact_channel）
 #:   consecutive_readings  持續性緩衝實際要求幾筆
@@ -136,7 +139,7 @@ def build_point_context(point: PointSeries, agg_cfg: AggregateConfig = DEFAULT_A
 #: 其餘 evidence 一律保留在 `evidence_json`，不逐一開欄——規則之間的
 #: evidence 結構差異很大，全開會變成一張到處是空白的寬表。
 _EVIDENCE_FLAT_KEYS = (
-    'threshold_mode', 'machine_class', 'trigger_source',
+    'threshold_mode', 'machine_class', 'iso_fallback_reason', 'trigger_source',
     'primary_metric', 'consecutive_readings', 'n_features',
 )
 

@@ -375,6 +375,28 @@ def test_backtest_instrumentation() -> None:
           _episode_evidence(out2)['threshold_mode'] == 'sigma_fallback',
           str(_episode_evidence(out2)['threshold_mode']))
 
+    # 台帳有填分類、但額定功率 ≤ 15 kW：不在 ISO 20816-3 適用範圍，同樣退回 sigma，
+    # 但原因跟「未分級」不同。實測（2026-06～08）台帳完整時 VEL_HIGH 剩下的 41 件
+    # 全是這一類；若仍說成「設備未分級」，會讓人去補一份其實早就填好的台帳。
+    small = vel_high(ctx(rows, stats, dev=device(iso_machine_group='4', iso_foundation='rigid',
+                                                 rated_power_kw=11.0)))
+    ev_small = _episode_evidence(small)
+    check("額定 11 kW、台帳已有分類 → 仍是 sigma_fallback（標準不適用）",
+          ev_small['threshold_mode'] == 'sigma_fallback' and ev_small['machine_class'] is None,
+          str((ev_small['threshold_mode'], ev_small['machine_class'])))
+    check("退回原因如實記錄為 15 kW 適用範圍，而不是「未分級」",
+          '15 kW' in (ev_small['iso_fallback_reason'] or '')
+          and '未分級' not in (ev_small['iso_fallback_reason'] or ''),
+          str(ev_small['iso_fallback_reason']))
+    check("事件說明文字也不說成「設備未分級」",
+          '未分級' not in small.detail and '15 kW' in small.detail, small.detail)
+    check("真正未分類的設備，退回原因才是「未分級」",
+          '未分級' in (_episode_evidence(out2)['iso_fallback_reason'] or ''),
+          str(_episode_evidence(out2)['iso_fallback_reason']))
+    check("ISO 模式的事件沒有退回原因", ev['iso_fallback_reason'] is None)
+    check("退回原因攤平成事件列的獨立欄位（不必解析 evidence_json）",
+          'iso_fallback_reason' in _EVIDENCE_FLAT_KEYS)
+
     # IMPACT_RISE：判讀走的是 median 通道還是退回 max
     imp = impact_rise(ctx([{'acc_crest_median': 3.4}], {'acc_crest_median': (2.6, 2.6, 0.3, 300)}))
     ev3 = _episode_evidence(imp)
@@ -1012,7 +1034,7 @@ def test_speed_effect() -> None:
     import tempfile
 
     from validate.speed_effect import (MAX_INHOUR_FREQ_RANGE, MIN_PAIRED_HOURS,
-                                       analyze_pair, floor_to_hour, hourly_frequency, run)
+                                       analyze_pair, daily, floor_to_hour, hourly_frequency, run)
     from vibcore.io.analytic_reader import parse_datetime
 
     rng = np.random.default_rng(7)
@@ -1076,8 +1098,69 @@ def test_speed_effect() -> None:
         ).to_csv(os.path.join(tmp, 'tagmap.csv'), index=False, encoding='utf-8-sig')
 
         res, info = run(vdir, os.path.join(tmp, 'tagmap.csv'), os.path.join(tmp, 'scada.csv'))
+        d_tbl = daily(vdir, os.path.join(tmp, 'tagmap.csv'), os.path.join(tmp, 'scada.csv'), 'PUMP A')
+        d_none = daily(vdir, os.path.join(tmp, 'tagmap.csv'), os.path.join(tmp, 'scada.csv'), '不存在的設備')
 
     v = {r['device_id']: r for _, r in res.iterrows()}
+
+    # ── 逐日對照：回答「那天轉速到底有沒有變」，也要講得出「那天根本沒有 SCADA」──
+    dd = d_tbl.set_index('day')
+    check("逐日對照：14 天各一列", len(dd) == 14, str(len(dd)))
+    check("SCADA 斷線的前 7 天 scada_h 為 0（無從判斷），其餘天數有讀值",
+          (dd['scada_h'].iloc[:7] == 0).all() and (dd['scada_h'].iloc[7:] >= 20).all(),
+          str(dd['scada_h'].tolist()))
+    check("斷線的日子頻率欄是空的，不是補上前一天的值",
+          dd['freq_median'].iloc[:7].isna().all() and dd['freq_median'].iloc[7:].notna().all())
+    check("有讀值的日子 min < max（PUMP A 的轉速每小時都在 42–58 Hz 之間跳）",
+          (dd['freq_min'].iloc[7:] < dd['freq_max'].iloc[7:]).all())
+    check("振動端每天都有運轉小時與 velRMS 中位數",
+          (dd['vib_h'] >= 20).all() and dd['vel_median'].notna().all())
+    check("對應表沒有的設備回傳空表，不拋錯", d_none.empty)
+
+    # 「SCADA 讀值是 0 Hz（說停機）」與「根本沒有讀值（無從判斷）」是兩回事：
+    # 台帳備機（如 CP 07）的頻率讀值多半是 0，不能在逐日表上被說成沒有資料。
+    with tempfile.TemporaryDirectory() as tmp3:
+        v3 = os.path.join(tmp3, 'vib')
+        os.makedirs(v3)
+        h3 = pd.date_range('2026-08-01', periods=3 * 24, freq='h')
+        write_rows = [('STOP S_M1', (h + pd.Timedelta(minutes=m + 3)).strftime('%Y/%m/%d %H:%M:%S'), 0.25)
+                      for h in h3 for m in range(0, 60, 10)]
+        df3 = pd.DataFrame(write_rows, columns=['Name', 'Time', 'velRMS'])
+        for i in range(3):
+            df3[f'pad{i}'] = 0.0
+        df3.to_csv(os.path.join(v3, 's.csv'), sep='\t', index=False, encoding='cp950')
+        sc = []
+        for h in h3:
+            day_i = (h - h3[0]).days
+            if day_i == 2:
+                continue                                    # 第 3 天完全沒有讀值
+            f0 = 45.0 if day_i == 0 else 0.0                # 第 1 天 45 Hz、第 2 天 0 Hz
+            for m in range(0, 60, 10):
+                sc.append(('T_S', (h + pd.Timedelta(minutes=m + 2)).strftime('%Y-%m-%d %H:%M:%S'), f0))
+        pd.DataFrame(sc, columns=['TAGNAME', 'DATETIME', 'VALUE']).to_csv(
+            os.path.join(tmp3, 'scada.csv'), index=False)
+        pd.DataFrame([('STOP S_M1', 'FACC|T_S', 'frequency', 'Hz', 'TRUE', '')],
+                     columns=['device_id', 'tag_id', 'variable_type', 'unit', 'is_active', 'note']
+                     ).to_csv(os.path.join(tmp3, 'tagmap.csv'), index=False, encoding='utf-8-sig')
+        d3 = daily(v3, os.path.join(tmp3, 'tagmap.csv'), os.path.join(tmp3, 'scada.csv'), 'STOP S_M1')
+    r3 = d3.set_index('day')
+    check("運轉日：有讀值、且 > 0 Hz 的小時數等於讀值小時數",
+          r3['scada_h'].iloc[0] == 24 and r3['scada_run_h'].iloc[0] == 24)
+    check("SCADA 說停機（全 0 Hz）：有讀值（24 小時）但 > 0 Hz 的小時為 0，頻率欄為空",
+          r3['scada_h'].iloc[1] == 24 and r3['scada_run_h'].iloc[1] == 0
+          and pd.isna(r3['freq_median'].iloc[1]), str(r3.iloc[1].to_dict()))
+    check("完全沒有讀值的日子：scada_h 為 0（與 0 Hz 區分）",
+          r3['scada_h'].iloc[2] == 0 and r3['scada_run_h'].iloc[2] == 0, str(r3.iloc[2].to_dict()))
+    check("停機日振動端仍有「運轉」小時（0.25 > 0.1 門檻）——正是 SCADA 與振動說法不一致的樣子",
+          (r3['vib_h'] == 24).all())
+    import contextlib
+    import io
+    buf3 = io.StringIO()
+    from validate.speed_effect import report_daily
+    with contextlib.redirect_stdout(buf3):
+        report_daily('STOP S_M1', d3)
+    check("逐日報告把「0 Hz 停機」與「沒有讀值」用不同文字講出來",
+          'SCADA 說停機' in buf3.getvalue() and '沒有 SCADA 讀值' in buf3.getvalue(), buf3.getvalue())
 
     check("速度與轉速正相關（vel ≈ 0.1×Δf）→ material 且 shift_σ 為正",
           v['PUMP A']['verdict'] == 'material' and v['PUMP A']['shift_sigma'] > 2.5,
@@ -1181,7 +1264,8 @@ def test_operating_state() -> None:
     import tempfile
 
     from validate.alarm_attribution import (attribute, axis_position, detect_provenance,
-                                            explained_by_speed, read_episodes)
+                                            explain_fallback, explained_by_speed, read_episodes,
+                                            report as attribution_report)
     from validate.operating_state import (classify_state, hourly_vibration_all, ledger_check,
                                           level_evidence, load_ledger, run, tri)
 
@@ -1357,6 +1441,16 @@ def test_operating_state() -> None:
     check("基準本來就在高轉速端、只是小幅超標 → 不算由轉速解釋",
           not explained_by_speed(0.6737, 0.7035, 0.497, 0.673))
     check("基準在低端、當前只動一點點 → 不算", not explained_by_speed(0.556, 0.62, 0.555, 1.034))
+    # 實測（2026-10-11）：只看「走到另一端」會把 CP 08_M1（高轉速水準 1.43，當前 1.80、
+    # 軸位置 2.4）與 CP 09_M1（0.845，當前 0.92、軸位置 2.3）也算成轉速造成的。
+    check("當前值遠超過高轉速水準 → 不算（CP 08_M1：1.16→1.80，高轉速水準只有 1.43）",
+          not explained_by_speed(1.159, 1.798, 1.162, 1.427))
+    check("略高於高轉速水準仍算（CP 04_M1：1.14，軸位置 1.22）",
+          explained_by_speed(0.556, 1.142, 0.555, 1.034))
+    check("超出一個軸長的一半是邊界：1.5 算、1.6 不算",
+          explained_by_speed(0.0, 1.5, 0.0, 1.0) and not explained_by_speed(0.0, 1.6, 0.0, 1.0))
+    check("方向相反（基準在高端、當前往下掉）同樣有下界：−0.5 算、−0.6 不算",
+          explained_by_speed(1.0, -0.5, 0.0, 1.0) and not explained_by_speed(1.0, -0.6, 0.0, 1.0))
 
     sg = seg.set_index(['device_id', 'rule_code', 'duration_days'])['segment']
     check("停機被撐過門檻的設備：VEL_HIGH 與其他規則的事件都歸 idle_looks_running",
@@ -1379,6 +1473,78 @@ def test_operating_state() -> None:
     check("TAB 分隔（從試算表複製貼上）的 episodes 也讀得進來，欄位數正確",
           len(epi_tab) == len(epi) and 'device_id' in epi_tab.columns and epi_tab.shape[1] == epi.shape[1],
           f"{epi_tab.shape} vs {epi.shape}")
+
+    # ── 有沒有帶台帳：不能只看 VEL_HIGH ──
+    # 帶了台帳的那一輪，ISO 錨定的點若沒觸發，剩下的 VEL_HIGH 全是 sigma_fallback、
+    # machine_class 全空，跟沒帶台帳長得一樣。實測（2026-10-11）就被誤報成「沒帶台帳」。
+    vh_rows = [dict(device_id='SMALL S_M1', rule_code='VEL_HIGH', threshold_mode='sigma_fallback',
+                    machine_class='', evidence_json='{"iso_fallback_reason": "額定功率 11.0 kW 未超過 15 kW"}'),
+               dict(device_id='SMALL S_M2', rule_code='VEL_HIGH', threshold_mode='sigma_fallback',
+                    machine_class='', evidence_json='{"iso_fallback_reason": "額定功率 11.0 kW 未超過 15 kW"}')]
+    ledger_run = pd.DataFrame(vh_rows + [
+        dict(device_id='BIG B_M1', rule_code='STANDBY_NO_RUNTIME', threshold_mode='', machine_class=''),
+        dict(device_id='BIG C_M1', rule_code='ISO_CLASS_SUSPECT', threshold_mode='', machine_class='2/rigid')])
+    p_led = detect_provenance(ledger_run)
+    p_no = detect_provenance(pd.DataFrame(vh_rows))
+    p_unk = detect_provenance(pd.DataFrame([dict(device_id='X', rule_code='TEMP_RISE')]))
+    check("VEL_HIGH 全是 sigma_fallback、但有 STANDBY_NO_RUNTIME／ISO_CLASS_SUSPECT → 判為有帶台帳（回歸）",
+          p_led['ledger'] == 'yes' and p_led['ledger_share'] == 0.0
+          and 'STANDBY_NO_RUNTIME' in p_led['ledger_signals'] and 'ISO_CLASS_SUSPECT' in p_led['ledger_signals'],
+          str(p_led))
+    check("只有 sigma_fallback 的 VEL_HIGH、沒有任何帶台帳的跡象 → likely_no（不說死）",
+          p_no['ledger'] == 'likely_no', str(p_no['ledger']))
+    check("沒有 VEL_HIGH 也沒有其他跡象 → unknown", p_unk['ledger'] == 'unknown')
+    check("舊版（kurt）那份 episodes 沒有帶台帳的跡象 → likely_no",
+          prov_old['ledger'] == 'likely_no' and prov_new['ledger'] == 'yes',
+          f"{prov_old['ledger']} / {prov_new['ledger']}")
+    check("evidence 裡的退回原因被統計出來（新版程式才有）",
+          p_led['fallback_reasons'] == {'額定功率 11.0 kW 未超過 15 kW': 2}, str(p_led['fallback_reasons']))
+
+    # ── 逐點說明 VEL_HIGH 為什麼走 sigma_fallback ──
+    overrides = {
+        'SMALL S_M1': dict(rated_power_kw=11.0, iso_machine_group='4', iso_foundation='rigid', is_standby=True),
+        'SMALL S_M2': dict(rated_power_kw=15.0, iso_machine_group='4', iso_foundation='rigid', is_standby=False),
+        'HALF H_M1': dict(rated_power_kw=30.0, iso_machine_group='2'),
+        'BIG B_M1': dict(rated_power_kw=45.0, iso_machine_group='2', iso_foundation='rigid'),
+    }
+    t0 = pd.Timestamp('2026-06-05')
+    fb_rows = [dict(device_id=d, rule_code='VEL_HIGH', threshold_mode='sigma_fallback',
+                    episode_start=t0, episode_end=t0, duration_days=2, baseline_value=1.0, current_value=1.2)
+               for d in ('SMALL S_M1', 'SMALL S_M2', 'HALF H_M1', 'BIG B_M1', 'GHOST G_M1')]
+    fb_rows.append(dict(device_id='ISO I_M1', rule_code='VEL_HIGH', threshold_mode='iso',
+                        episode_start=t0, episode_end=t0, duration_days=1, baseline_value=1.0, current_value=2.0))
+    fb_df = pd.DataFrame(fb_rows)
+    fb = explain_fallback(fb_df, overrides)
+    why = fb.set_index('device_id')['reason'].to_dict()
+    check("額定 11 kW／恰為 15 kW（標準寫「大於 15 kW」）→ out_of_scope_power，台帳有分類也一樣",
+          why['SMALL S_M1'] == 'out_of_scope_power' and why['SMALL S_M2'] == 'out_of_scope_power', str(why))
+    check("基礎剛性沒填 → unclassified；台帳沒有這個 id → not_in_ledger",
+          why['HALF H_M1'] == 'unclassified' and why['GHOST G_M1'] == 'not_in_ledger', str(why))
+    check("分類齊全、功率也在範圍內卻仍退回 → classified_but_fallback（那一輪沒套用台帳）",
+          why['BIG B_M1'] == 'classified_but_fallback', str(why))
+    check("ISO 模式的點不在 sigma_fallback 說明裡", 'ISO I_M1' not in why)
+
+    import contextlib
+    import io
+    # 全部有值的備機欄（真實台帳填完整時就是這樣）也要印得出「備機」標記。
+    fb_bool = explain_fallback(fb_df[fb_df['device_id'].isin(['SMALL S_M1', 'SMALL S_M2'])], overrides)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        attribution_report(fb_df.assign(machine_class=''), detect_provenance(fb_df.assign(machine_class='')),
+                           False, False, fb_bool, {'CH01_M1': 'CH 01_M1'})
+    out_txt = buf.getvalue()
+    check("報告逐點列出原因與備機標記",
+          'out_of_scope_power' in out_txt and 'SMALL S_M1(11kW·備機)' in out_txt
+          and 'SMALL S_M2(15kW)' in out_txt, out_txt[-600:])
+    check("台帳 id 寫法對不上時在報告裡明講沒生效", "CH01_M1" in out_txt and '沒有生效' in out_txt)
+
+    check("歸因結果記下轉速敏感點數／總點數（供「是否偏多」計算）",
+          seg.attrs.get('speed_points') == (2, 4), str(seg.attrs.get('speed_points')))
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        attribution_report(seg, prov_old, True, True)
+    check("給了 speed-effect 就印出「轉速敏感設備的告警是否偏多」",
+          '轉速敏感設備的告警是否偏多' in buf2.getvalue())
 
 
 def test_ledger() -> None:
