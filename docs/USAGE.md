@@ -262,16 +262,19 @@ INSERT INTO vib.user_role (user_id, role_code, scope_type, scope_value)
 VALUES (1, 'engineer', 'building', 'FAB7');
 ```
 
-### 2.3 電流資料（選用）
+### 2.3 電流／SCADA 資料（目前不需要匯入）
 
-有 SCADA 電流時，運轉判定會改用電流門檻（比 vRMS 準）。需建立對照：
+**試跑與日常排程只需要兩樣東西：振動 Analytic CSV 與設備台帳（§2.1）。不需要匯入 SCADA。**
 
-```sql
-INSERT INTO vib.tag_mapping (tag_id, device_id, variable_type, unit)
-VALUES ('CWP_CURR_01', 'CWP-203', '電流', 'A');
-```
-
-沒有電流資料也能運作，會退回以 `velRMS > 0.1 mm/s` 判定運轉。
+- **運轉判定目前是 `velRMS > 0.1 mm/s`。** 只有振動 CSV **自己**帶有電流欄位（欄名含 電流／current／安培／amp）時，
+  才會改用電流門檻。Analytic CSV 的 `Label` 欄存的是電流 TAG 名稱、不是讀值，系統不使用。
+- **資料庫雖然有 SCADA 的表**（`scada_tag`、`tag_mapping`、`scada_reading`）與讀寫函式，但目前
+  **沒有任何排程或指令會寫入，也沒有任何規則讀取**。現在把 SCADA 匯進去不會改變任何判定。
+- **SCADA 目前只用在 `validate/` 的離線分析工具**（`speed_effect`、`operating_state`、`alarm_attribution`），
+  它們直接讀 SCADA 匯出檔與 tag 對照表（`--readings`、`--tagmap`），不經資料庫。需要時才跑，
+  用來判斷觀察名單上的項目是不是轉速或備機造成的（見 `validate/README.md` 的〈SCADA 工況〉與〈運轉狀態與告警歸因〉）。
+- **以 SCADA 判運轉（決策紀錄 Q4 第二階段）尚未建置。** 沒有它的影響：備機被鄰機傳導的振動撐過 0.1 mm/s 時，
+  會被當成運轉中——這些機器的基準落在環境振動水準，`STANDBY_NO_RUNTIME` 對它們失效。這是已知限制，不影響試跑開始。
 
 ---
 
