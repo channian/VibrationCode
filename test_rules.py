@@ -2069,6 +2069,14 @@ def test_review_sheet() -> None:
           build_summary('速度整體值偏高', 0.556, 1.142, 'mm/s', 12))
     check("沒有數值的事件類只講規則名與天數",
           build_summary('感測器離線', None, None, '', 3) == '感測器離線，持續 3 天')
+    check("基準欄存的是門檻的規則，寫成「目前 X（門檻 Y）」，不是「Y → X（+n%）」",
+          build_summary('軸能量分佈偏移', 0.15, 0.1503, '', 61, 'AXIS_SHIFT')
+          == '軸能量分佈偏移：目前 0.1503（門檻 0.15），持續 61 天'
+          and build_summary('感測器離線', 24, 29, 'hr', 2, 'SENSOR_OFFLINE')
+          == '感測器離線：目前 29 hr（門檻 24），持續 2 天',
+          build_summary('感測器離線', 24, 29, 'hr', 2, 'SENSOR_OFFLINE'))
+    check("一般規則不受影響（有基準的仍寫「基準 → 目前」）",
+          build_summary('速度整體值偏高', 0.556, 1.142, 'mm/s', 12, 'VEL_HIGH').startswith('速度整體值偏高：0.556 → 1.14'))
 
     recs = []
     for dev, rule, day, n, b, c, sev in (

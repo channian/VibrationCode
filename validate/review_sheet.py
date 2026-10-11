@@ -187,11 +187,23 @@ def _num(x):
         return None
 
 
-def build_summary(rule_name: str, base, cur, unit: str, days) -> str:
+#: `baseline_value` 存的是「門檻」而不是基準值的規則：數值要讀成「目前 X（門檻 Y）」，
+#: 不是「由 Y 變成 X」。把 0.15 → 0.1503 寫成「+0%」會讓判讀人員不知道在看什麼。
+THRESHOLD_STYLE_RULES = frozenset({
+    'SENSOR_OFFLINE', 'DATA_QUALITY', 'SENSOR_SATURATION', 'STANDBY_NO_RUNTIME',
+    'ORIENTATION_CHANGE', 'ISO_CLASS_SUSPECT', 'AXIS_SHIFT', 'ISO_ZONE',
+})
+
+
+def build_summary(rule_name: str, base, cur, unit: str, days, rule_code: str | None = None) -> str:
     """給現場人員看的一句話：數值怎麼變、持續多久；沒有數值的事件類就只講規則名與天數。"""
     b, c = _num(base), _num(cur)
     d = _num(days)
     dur = f'，持續 {int(d)} 天' if d else ''
+    if rule_code in THRESHOLD_STYLE_RULES and c is not None:
+        # 這類規則的數值通常貼著門檻（0.1503 對 0.15），多留一位才看得出差別
+        thr = f'（門檻 {b:.4g}）' if b is not None else ''
+        return f'{rule_name}：目前 {c:.4g} {unit}{thr}{dur}'.replace(' （', '（')
     if b is not None and c is not None and b != 0:
         return f'{rule_name}：{b:.3g} → {c:.3g} {unit}（{(c / b - 1) * 100:+.0f}%）{dur}'.replace(' ,', ',')
     if c is not None:
@@ -246,7 +258,8 @@ def from_episodes(path: str, ledger: str | None = None, per_rule: int = 8) -> pd
     })
     out['delta_pct'] = np.where(out['baseline'].abs() > 0, (out['current'] / out['baseline'] - 1) * 100, np.nan)
     out['context'] = out['device_id'].map(ctx).fillna('') if ctx else ''
-    out['summary'] = [build_summary(r.rule_name, r.baseline, r.current, r.unit, r.duration_days)
+    out['summary'] = [build_summary(r.rule_name, r.baseline, r.current, r.unit, r.duration_days,
+                                    r.rule_code)
                       for r in out.itertuples()]
     return finish_sheet(select_items(out, per_rule))
 
@@ -284,7 +297,8 @@ def from_db(conn, days: int = 7) -> pd.DataFrame:
     })
     out['delta_pct'] = np.where(out['baseline'].abs() > 0, (out['current'] / out['baseline'] - 1) * 100, np.nan)
     out['context'] = ''
-    out['summary'] = [build_summary(r.rule_name, r.baseline, r.current, r.unit, r.duration_days)
+    out['summary'] = [build_summary(r.rule_name, r.baseline, r.current, r.unit, r.duration_days,
+                                    r.rule_code)
                       for r in out.itertuples()]
     return finish_sheet(out)
 
