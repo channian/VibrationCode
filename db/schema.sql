@@ -493,7 +493,7 @@ INSERT INTO rule_config (rule_code, rule_name, family, issue_type, severity, par
      --   kurt_axis_sigma / kurt_absolute / threshold_mode / require_both
      --   全數不再使用）。依據：本廠實測 kurtosis 與振動量值反向（三台
      --   accOA 1137.6/504.8/129.7 對應 accKURT 中位數 2.37/3.60/4.53），
-     --   改成純相對判定後觸發結果完全沒變（511 次 / 60 台，佔機隊 88%），
+     --   改成純相對判定後觸發結果完全沒變（33 週視窗：511 次 / 60 台，佔機隊 88%），
      --   且門檻掃描曲線平滑無斷崖——問題不在門檻訂多少，在指標本身。
      --   完整紀錄見 docs/DECISIONS_2026-09_expert_review.md 的 Q2。
      --   accKURT 欄位仍照常聚合入庫，STEP_CHANGE 的多變量特徵還在用。

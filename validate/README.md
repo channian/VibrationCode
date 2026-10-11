@@ -145,6 +145,28 @@ tag 寫成 `資料表名|tag名` 或只有 `tag名` 都對得上。`speed_effect
 限制（相關非因果、只涵蓋指定時段、M1/M2 共用頻率 tag 不是兩份獨立證據）
 見該檔開頭的說明與 `docs/DECISIONS_2026-09_expert_review.md` 的 Q3 一節。
 
+## 運轉狀態與告警歸因
+
+「這台有沒有在轉」目前只靠 `velRMS > 0.1`，備機會被相鄰機組的傳導振動撐過門檻。
+這兩支工具用 SCADA 與台帳核對，並把回測的告警歸到「停機被撐過門檻／轉速驅動／其他」：
+
+```bash
+# 台帳 × SCADA × 振動：誰說得對？（逐秒資料全掃，預設每 5 筆取 1 筆；約數分鐘到十餘分鐘）
+python -m validate.operating_state --data-dir data/ --tagmap out/tagmap.csv \
+    --readings scada_csv/ --ledger out/ledger.csv \
+    --since 2026-06-01 --until 2026-08-20 --csv out/operating_state.csv
+
+# 回測告警歸因：吃回測的 episodes_detail.csv 與上面兩支的輸出
+python -m validate.alarm_attribution --episodes out/validation/episodes_detail.csv \
+    --operating-state out/operating_state.csv --speed-effect out/speed_effect.csv \
+    --csv out/alarm_attribution.csv
+```
+
+`alarm_attribution` 會先從 episodes **內容**判斷它是哪一版程式、有沒有帶台帳（IMPACT_RISE 的
+evidence 還有 `kurt` 通道＝移除 kurtosis 之前；VEL_HIGH 的 `machine_class` 全空＝沒帶台帳），
+不用靠資料夾名稱猜。台帳的 `device_id` 與資料對不上（例如 `CH01_M1` 對 `CH 01_M1`）時，
+`offline` 與 `iso_readiness` 都會警告該筆台帳沒有生效。
+
 ## 報告怎麼看
 
 跑完後，`output/validation/`（或你指定的 `--out-dir`）底下會有：

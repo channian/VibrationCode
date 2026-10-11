@@ -836,14 +836,16 @@ def test_scada() -> None:
     def read_quiet(path):
         # 測試套件把 root 設成 ERROR；要接到 WARNING 得調這個 logger 自己的層級
         h, lg = _Capture(), logging.getLogger('vibcore.io.scada')
-        old_level = lg.level
+        old_level, old_prop = lg.level, lg.propagate
         lg.setLevel(logging.WARNING)
+        lg.propagate = False      # 預期中的警告只給測試看，不洗版
         lg.addHandler(h)
         try:
             return parse_readings(path), h.msgs
         finally:
             lg.removeHandler(h)
             lg.setLevel(old_level)
+            lg.propagate = old_prop
 
     with tempfile.TemporaryDirectory() as tmp:
         d = os.path.join(tmp, 'scada')
@@ -1173,6 +1175,212 @@ def test_speed_effect() -> None:
           analyze_pair(few)['verdict'] == 'insufficient')
 
 
+def test_operating_state() -> None:
+    print("\n[11b] 運轉狀態對照（validate.operating_state）與告警歸因（validate.alarm_attribution）")
+
+    import tempfile
+
+    from validate.alarm_attribution import (attribute, axis_position, detect_provenance,
+                                            explained_by_speed, read_episodes)
+    from validate.operating_state import (classify_state, hourly_vibration_all, ledger_check,
+                                          level_evidence, load_ledger, run, tri)
+
+    rng = np.random.default_rng(11)
+    hours = pd.date_range('2026-06-01', periods=10 * 24, freq='h')
+    H = len(hours)
+
+    def write_vib(path, name, vel_h):
+        rows = [(name, (h + pd.Timedelta(minutes=m + 3)).strftime('%Y/%m/%d %H:%M:%S'),
+                 max(0.0, v + rng.normal(0, 0.01)))
+                for h, v in zip(hours, vel_h) for m in range(0, 60, 10)]
+        df = pd.DataFrame(rows, columns=['Name', 'Time', 'velRMS'])
+        for i in range(3):
+            df[f'pad{i}'] = 0.0
+        df.to_csv(path, sep='\t', index=False, encoding='cp950')
+
+    def scada(tag, vals):
+        return [(tag, (h + pd.Timedelta(minutes=m + 2)).strftime('%Y-%m-%d %H:%M:%S'), v)
+                for h, v in zip(hours, vals) for m in range(0, 60, 10)]
+
+    on = rng.random(H) < 0.8
+    d_on = np.ones(H, bool)
+    d_on[::20] = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vdir = os.path.join(tmp, 'vib')
+        os.makedirs(vdir)
+        rows = []
+        spec = [   # (名稱, 振動序列, SCADA 序列 or None, 台帳 standby, kW, rpm)
+            ('RUN A_M1', np.where(on, 1.0, 0.02), np.where(on, 52.0, 0.0), 'FALSE', 30, 1760),
+            ('RUN A_M2', np.where(on, 1.1, 0.02), np.where(on, 52.0, 0.0), 'FALSE', 30, 1760),
+            ('IDLE B_M1', np.full(H, 0.15), np.zeros(H), 'TRUE', 30, 1760),          # 停機但被撐過 0.1
+            ('BYPASS C_M1', np.full(H, 1.0), np.zeros(H), 'FALSE', 30, 1760),        # 旁路？水準像在轉
+            ('CONFLICT D_M1', np.where(d_on, 1.0, 0.02), np.where(d_on, 50.0, 0.0), 'TRUE', 30, 1760),
+            ('PRIMARY E_M1', np.full(H, 0.12), np.zeros(H), 'FALSE', 30, 1760),
+            ('CONST F_M1', np.full(H, 0.8), np.full(H, 60.0), 'FALSE', 45, 1180),    # 定頻 tag 無資訊
+            ('QUIET G_M1', np.full(H, 0.03), np.zeros(H), 'TRUE', 45, 1180),
+            ('LONE I_M1', np.full(H, 0.15), np.zeros(H), 'TRUE', 99, 900),           # 無同型可比，台帳標備機
+            ('LONE J_M1', np.full(H, 0.15), np.zeros(H), 'FALSE', 98, 900),          # 無同型可比，台帳非備機
+        ]
+        ledger_rows = []
+        for i, (name, v, f, sb, kw, rpm) in enumerate(spec):
+            write_vib(os.path.join(vdir, f'{i}.csv'), name, v)
+            rows += scada(f'T{i}', f)
+            ledger_rows.append((name, rpm, kw, sb))
+        write_vib(os.path.join(vdir, 'h.csv'), 'NAME MISMATCH H_M1', np.where(on, 1.0, 0.02))
+        rows += scada('TH', np.where(on, 52.0, 0.0))
+        ledger_rows.append(('NAMEMISMATCH H_M1', 1760, 30, 'FALSE'))      # 台帳寫法少一個空白
+
+        os.makedirs(os.path.join(tmp, 'scada'))
+        pd.DataFrame(rows, columns=['TAGNAME', 'DATETIME', 'VALUE']).to_csv(
+            os.path.join(tmp, 'scada', 'all.csv'), index=False)
+        tm = [(name, f'F|T{i}') for i, (name, *_r) in enumerate(spec)] + [('NAME MISMATCH H_M1', 'F|TH')]
+        pd.DataFrame([(d, t, 'frequency', 'Hz', 'TRUE', '') for d, t in tm],
+                     columns=['device_id', 'tag_id', 'variable_type', 'unit', 'is_active', 'note']
+                     ).to_csv(os.path.join(tmp, 'tagmap.csv'), index=False, encoding='utf-8-sig')
+        pd.DataFrame(ledger_rows, columns=['device_id', 'rated_rpm', 'rated_power_kw', 'is_standby']
+                     ).to_csv(os.path.join(tmp, 'ledger.csv'), index=False, encoding='utf-8-sig')
+
+        table, info = run(vdir, os.path.join(tmp, 'tagmap.csv'), os.path.join(tmp, 'scada'),
+                          os.path.join(tmp, 'ledger.csv'), stride=1)
+        ledger_df = load_ledger(os.path.join(tmp, 'ledger.csv'))
+
+        # ── 為 alarm_attribution 準備 episodes ──
+        old_ev = ('{"primary_metric": "acc_kurt_median", "channels": {"crest": {}, "kurt": {"exceeded": true}, '
+                  '"crest_axis": {}, "kurt_axis": {}}, "require_both": false}')
+        new_ev = '{"primary_metric": "acc_crest_median", "channels": {"crest": {}, "crest_axis": {}}}'
+
+        def episodes(ev, mc):
+            recs = []
+            for dev, rule, day, n, b, c in (
+                    ('IDLE B_M1', 'VEL_HIGH', 5, 12, 0.102, 0.115),
+                    ('IDLE B_M1', 'IMPACT_RISE', 8, 1, 3.4, 4.3),
+                    ('SPEED P_M1', 'VEL_HIGH', 5, 12, 0.556, 1.142),
+                    ('SPEED P_M1', 'VEL_HIGH', 18, 1, 0.556, 0.62),
+                    ('SPEED Q_M1', 'VEL_HIGH', 8, 1, 0.6737, 0.7035),
+                    ('NORMAL N_M1', 'VEL_HIGH', 1, 3, 0.8, 0.95),
+                    ('CONFOUNDED K_M1', 'VEL_HIGH', 1, 2, 0.5, 0.9)):
+                s0 = pd.Timestamp('2026-06-01 23:00') + pd.Timedelta(days=day)
+                recs.append(dict(device_id=dev, rule_code=rule, severity='warn', is_actionable=True,
+                                 episode_start=s0.strftime('%Y/%m/%d %H:%M'),
+                                 episode_end=(s0 + pd.Timedelta(days=n - 1)).strftime('%Y/%m/%d %H:%M'),
+                                 duration_days=n, threshold_mode='sigma_fallback' if mc == '' else 'iso',
+                                 machine_class=mc, baseline_value=b, current_value=c,
+                                 evidence_json=ev if rule == 'IMPACT_RISE' else ''))
+            return pd.DataFrame(recs)
+
+        epi_old = os.path.join(tmp, 'epi_old.csv')
+        epi_new = os.path.join(tmp, 'epi_new.csv')
+        episodes(old_ev, '').to_csv(epi_old, index=False, encoding='utf-8-sig')
+        episodes(new_ev, 'G2/rigid').to_csv(epi_new, index=False, encoding='utf-8-sig')
+        # 使用者貼上的是 TAB 分隔（從試算表複製）；也要讀得進來
+        episodes(old_ev, '').to_csv(os.path.join(tmp, 'epi_tab.csv'), index=False, sep='\t')
+
+        epi = read_episodes(epi_old)
+        epi_tab = read_episodes(os.path.join(tmp, 'epi_tab.csv'))
+        prov_old = detect_provenance(epi)
+        prov_new = detect_provenance(read_episodes(epi_new))
+        speed = pd.DataFrame([
+            dict(device_id='SPEED P_M1', verdict='material', vel_low=0.555, vel_high=1.034),
+            dict(device_id='SPEED Q_M1', verdict='material', vel_low=0.497, vel_high=0.673),
+            dict(device_id='CONFOUNDED K_M1', verdict='confounded', vel_low=0.5, vel_high=0.9),
+            dict(device_id='NORMAL N_M1', verdict='minor', vel_low=0.8, vel_high=0.81)])
+        seg = attribute(epi, table, speed)
+
+    t = table.set_index('device_id')
+
+    # ── 三方對照 ──
+    check("有開有關的泵：SCADA 與振動都說在轉 → agree_running",
+          t.loc['RUN A_M1', 'state'] == 'agree_running' and t.loc['RUN A_M1', 'finding'] == 'running_confirmed',
+          str(t.loc['RUN A_M1', ['state', 'finding']].to_dict()))
+    check("備機：SCADA 全零、振動 0.15（> 0.1 門檻）→ stopped_but_vib_running，水準遠低於同型運轉泵 → idle_looks_running",
+          t.loc['IDLE B_M1', 'finding'] == 'idle_looks_running'
+          and t.loc['IDLE B_M1', 'level_ratio'] < 0.5 and t.loc['IDLE B_M1', 'state'] == 'stopped_but_vib_running',
+          str(t.loc['IDLE B_M1', ['state', 'finding', 'level_ratio']].to_dict()))
+    check("SCADA 全零、振動水準與同型運轉泵相近、台帳非備機 → unexplained_running（旁路或 tag 問題，不下結論）",
+          t.loc['BYPASS C_M1', 'finding'] == 'unexplained_running', str(t.loc['BYPASS C_M1', 'finding']))
+    check("台帳標備機卻整段在轉 → standby_but_running",
+          t.loc['CONFLICT D_M1', 'ledger_check'] == 'standby_but_running',
+          str(t.loc['CONFLICT D_M1', ['state', 'ledger_check']].to_dict()))
+    check("台帳標非備機、SCADA 整段沒轉 → primary_but_stopped（且水準像環境振動）",
+          t.loc['PRIMARY E_M1', 'ledger_check'] == 'primary_but_stopped'
+          and t.loc['PRIMARY E_M1', 'finding'] == 'idle_looks_running')
+    check("定頻 tag（恆為 60）沒有運轉資訊 → no_scada，不拿來判斷",
+          t.loc['CONST F_M1', 'state'] == 'no_scada', str(t.loc['CONST F_M1', 'state']))
+    check("SCADA 全零、振動也安靜 → agree_stopped", t.loc['QUIET G_M1', 'state'] == 'agree_stopped')
+    check("沒有同型運轉泵可比、但台帳標備機 → 仍可判 idle_looks_running（有台帳佐證）",
+          t.loc['LONE I_M1', 'finding'] == 'idle_looks_running' and t.loc['LONE I_M1', 'level_evidence'] == 'unknown',
+          str(t.loc['LONE I_M1', ['finding', 'level_evidence']].to_dict()))
+    check("沒有同型可比、台帳也沒說備機 → unclear，不硬猜",
+          t.loc['LONE J_M1', 'finding'] == 'unclear', str(t.loc['LONE J_M1', 'finding']))
+    check("台帳 id 少一個空白 → 被認出是近似名稱而不是靜默忽略",
+          info['ledger_near'] == {'NAMEMISMATCH H_M1': 'NAME MISMATCH H_M1'}, str(info['ledger_near']))
+
+    # 回歸：台帳每一格都有填時 pandas 轉成 numpy 布林，`is True` 會落空，備機被當成非備機
+    check("numpy 布林的備機旗標被正確讀成 True（回歸）",
+          tri(np.True_) is True and tri(np.False_) is False and tri(None) is None and tri(float('nan')) is None)
+    check("台帳讀進來是 Python 布林／None，不是 numpy 布林",
+          all(isinstance(x, bool) or x is None for x in ledger_df['is_standby']))
+    check("台帳標備機 + SCADA 說停 → ledger_check 為 ok，而不是被誤判成 primary_but_stopped",
+          t.loc['IDLE B_M1', 'ledger_check'] == 'ok' and t.loc['QUIET G_M1', 'ledger_check'] == 'ok',
+          str(t.loc[['IDLE B_M1', 'QUIET G_M1'], 'ledger_check'].to_dict()))
+
+    # 分類邊界
+    check("SCADA 運轉 30% → intermittent", classify_state(0.3, 100, 0.9, 0.9) == 'intermittent')
+    check("SCADA 說在轉、振動沒過門檻 → scada_on_vib_quiet（運轉但很安靜，與反向的失效分開）",
+          classify_state(0.9, 100, 0.1, 0.1) == 'scada_on_vib_quiet')
+    check("SCADA 小時數不足 → no_scada", classify_state(0.0, 10, 1.0, 1.0) == 'no_scada')
+    check("水準比值 0.3 → ambient_like；0.9 → running_like；缺值 → unknown",
+          level_evidence(0.3) == 'ambient_like' and level_evidence(0.9) == 'running_like'
+          and level_evidence(None) == 'unknown')
+    check("ledger_check 未填 → unfilled", ledger_check(None, 'agree_stopped') == 'unfilled')
+
+    # stride：逐秒資料抽樣不改變小時中位數
+    with tempfile.TemporaryDirectory() as tmp2:
+        pth = os.path.join(tmp2, 'x.csv')
+        write_vib(pth, 'S_M1', np.full(H, 0.5))
+        f1, _ = hourly_vibration_all(pth, 1)
+        f2, _ = hourly_vibration_all(pth, 2)
+    check("抽樣（stride=2）後筆數減半、小時中位數不變",
+          abs(float(f2['vel_med'].median()) - float(f1['vel_med'].median())) < 0.005
+          and int(f2['n_rows'].median()) * 2 == int(f1['n_rows'].median()),
+          f"{f1['n_rows'].median()} vs {f2['n_rows'].median()}")
+
+    # ── 告警歸因 ──
+    check("軸位置：低端 0、高端 1、超過高端 > 1；兩端幾乎相同時回 NaN",
+          axis_position(0.5, 0.5, 1.0) == 0 and axis_position(1.0, 0.5, 1.0) == 1
+          and axis_position(1.5, 0.5, 1.0) > 1 and np.isnan(axis_position(1.0, 0.5, 0.5)))
+    check("基準在低轉速端、當前走到高轉速端 → 由轉速解釋",
+          explained_by_speed(0.556, 1.142, 0.555, 1.034))
+    check("基準在高轉速端、當前掉到低轉速端 → 同樣算（方向相反）",
+          explained_by_speed(1.0, 0.55, 0.5, 1.0))
+    check("基準本來就在高轉速端、只是小幅超標 → 不算由轉速解釋",
+          not explained_by_speed(0.6737, 0.7035, 0.497, 0.673))
+    check("基準在低端、當前只動一點點 → 不算", not explained_by_speed(0.556, 0.62, 0.555, 1.034))
+
+    sg = seg.set_index(['device_id', 'rule_code', 'duration_days'])['segment']
+    check("停機被撐過門檻的設備：VEL_HIGH 與其他規則的事件都歸 idle_looks_running",
+          (seg[seg['device_id'] == 'IDLE B_M1']['segment'] == 'idle_looks_running').all())
+    check("轉速敏感設備的大事件（12 天、0.56→1.14）→ speed_explained",
+          sg[('SPEED P_M1', 'VEL_HIGH', 12)] == 'speed_explained')
+    check("同一台設備的小幅超標（0.56→0.62）→ speed_device_other",
+          sg[('SPEED P_M1', 'VEL_HIGH', 1)] == 'speed_device_other'
+          and (seg[seg['device_id'] == 'SPEED Q_M1']['segment'] == 'speed_device_other').all())
+    check("confounded／minor 的設備不歸入轉速驅動 → other",
+          (seg[seg['device_id'].isin(['CONFOUNDED K_M1', 'NORMAL N_M1'])]['segment'] == 'other').all())
+
+    check("版本檢查：IMPACT_RISE 帶 kurt 通道／require_both ＝ 移除 kurtosis 之前的程式",
+          prov_old['legacy_kurtosis'] is True and prov_new['legacy_kurtosis'] is False,
+          f"{prov_old} / {prov_new}")
+    # pandas 3 的 astype(str) 不再把缺值變成 'nan'；整欄空白的 machine_class 必須仍被認成「沒帶台帳」
+    check("整欄 machine_class 空白 ＝ 這輪沒帶台帳（不因 pandas 版本而失效）",
+          prov_old['ledger_share'] == 0.0 and prov_new['ledger_share'] == 1.0,
+          f"{prov_old['ledger_share']} / {prov_new['ledger_share']}")
+    check("TAB 分隔（從試算表複製貼上）的 episodes 也讀得進來，欄位數正確",
+          len(epi_tab) == len(epi) and 'device_id' in epi_tab.columns and epi_tab.shape[1] == epi.shape[1],
+          f"{epi_tab.shape} vs {epi.shape}")
+
+
 def test_ledger() -> None:
     print("\n[12] 台帳補填：CSV 範本產出與匯入")
 
@@ -1321,6 +1529,62 @@ def _psql_env() -> dict:
     if os.environ.get("VIB_DB_PASSWORD"):
         env.setdefault("PGPASSWORD", os.environ["VIB_DB_PASSWORD"])
     return env
+
+
+def test_ledger_id_match() -> None:
+    print("\n[12b] 台帳 device_id 與資料對不上：不能安靜失效")
+
+    from validate.points import match_ledger_ids, warn_unmatched_overrides
+
+    data_ids = ['CH 01_M1', 'CH 01_M2', 'CH03_M1', 'ZP 3-1-2_M1']
+    ledger_ids = ['CH01_M1', 'CH01_M2', 'CH03_M1', 'ZP 3-1-2_M1', 'ZP 9-9_M1']
+    near, missing = match_ledger_ids(ledger_ids, data_ids)
+    check("只差空白的台帳 id 被認出是近似名稱（CH01_M1 ≈ CH 01_M1）",
+          near == {'CH01_M1': 'CH 01_M1', 'CH01_M2': 'CH 01_M2'}, str(near))
+    check("完全對得上的不列入；找不到任何相近名稱的列入 missing",
+          missing == ['ZP 9-9_M1'], str(missing))
+    check("近似比對不會把 id 悄悄改掉——只回報，由使用者去改台帳",
+          'CH01_M1' not in data_ids)
+
+    # 同一個近似鍵在資料裡對到兩個以上的名稱時，不猜（猜錯會套到另一台）
+    near2, missing2 = match_ledger_ids(['ZP 3-1-1_M1'], ['ZP 3-1-1_M1x', 'ZP3-1-1_M1', 'ZP 3 1 1_M1'])
+    check("近似名稱有多個候選時不猜，歸為 missing", near2 == {} and missing2 == ['ZP 3-1-1_M1'],
+          f"{near2} {missing2}")
+
+    class _Cap(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.msgs: list[str] = []
+
+        def emit(self, record):
+            self.msgs.append(record.getMessage())
+
+    cap, lg = _Cap(), logging.getLogger('validate.points')
+    old_level, old_prop = lg.level, lg.propagate
+    lg.setLevel(logging.WARNING)
+    lg.propagate = False          # 測試輸出不要被這些預期中的警告洗版
+    lg.addHandler(cap)
+    try:
+        warn_unmatched_overrides({k: {'is_standby': True} for k in ledger_ids}, data_ids)
+    finally:
+        lg.removeHandler(cap)
+        lg.setLevel(old_level)
+        lg.propagate = old_prop
+    check("近似名稱的警告明講「這筆台帳沒有生效」",
+          any('CH01_M1' in m and '沒有生效' in m and 'CH 01_M1' in m for m in cap.msgs), str(cap.msgs))
+    check("完全找不到的另用一行警告帶出名稱",
+          any('ZP 9-9_M1' in m for m in cap.msgs), str(cap.msgs))
+    quiet = _Cap()
+    lg.setLevel(logging.WARNING)
+    lg.propagate = False
+    lg.addHandler(quiet)
+    try:
+        warn_unmatched_overrides({'A_M1': {}}, ['A_M1'])
+    finally:
+        lg.removeHandler(quiet)
+        lg.setLevel(old_level)
+        lg.propagate = old_prop
+    check("全部對得上時不吵（沒有警告）", quiet.msgs == [], str(quiet.msgs))
 
 
 def test_db(dbname: str) -> None:
@@ -1580,7 +1844,9 @@ def main() -> int:
         test_step_change_features()
         test_scada()
         test_speed_effect()
+        test_operating_state()
         test_ledger()
+        test_ledger_id_match()
         test_db(args.dbname)
     except AssertionError as e:
         print(f"\n❌ 驗收失敗：{e}")

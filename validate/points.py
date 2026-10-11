@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -241,6 +242,68 @@ def _load_device_meta_csv(path: str) -> dict[str, dict]:
     return out
 
 
+def _name_key(name: str) -> str:
+    """比對用的鍵：去掉空白、底線、連字號並轉小寫。只用來找「看起來是同一台」的近似名稱。"""
+    return re.sub(r'[\s_\-]+', '', str(name)).lower()
+
+
+def match_ledger_ids(ledger_ids, data_ids) -> tuple[dict[str, str], list[str]]:
+    """
+    台帳的 device_id 與資料裡的設備名稱做比對。
+
+    Returns:
+        `(近似對上, 完全沒對上)`。
+        · 近似對上：`{台帳 id: 資料 id}`——只差空白／底線／連字號／大小寫，
+          幾乎可以確定是同一台，但**精確比對不會套用**（見下）。
+        · 完全沒對上：台帳 id 清單；資料裡也找不到相近名稱。
+
+    **為什麼要有這個檢查**：台帳是用 `overrides.get(device_id)` 精確比對的，
+    寫成 `CH01_M1` 而資料是 `CH 01_M1`，那一筆台帳（ISO 群組、基礎剛性、
+    是否備機）整筆不會生效，**而且不會有任何錯誤**——該設備只是安靜地
+    退回「未分類」，VEL_HIGH 走 sigma_fallback，備機旗標變成未知。
+    實測就發生在 CH01 上。這裡只報告、不自動套用近似名稱：猜錯會讓台帳
+    套到另一台設備上，那比沒套更危險。
+    """
+    data = [str(d) for d in data_ids]
+    exact = set(data)
+    by_key: dict[str, list[str]] = {}
+    for d in data:
+        by_key.setdefault(_name_key(d), []).append(d)
+
+    near: dict[str, str] = {}
+    missing: list[str] = []
+    for lid in ledger_ids:
+        lid = str(lid)
+        if lid in exact:
+            continue
+        cands = by_key.get(_name_key(lid), [])
+        if len(cands) == 1:
+            near[lid] = cands[0]
+        else:
+            missing.append(lid)
+    return near, missing
+
+
+def warn_unmatched_overrides(overrides: dict | None, device_ids) -> tuple[dict[str, str], list[str]]:
+    """
+    台帳有、資料對不上的 id 要講出來。近似名稱用 WARNING（這是寫法錯誤，台帳沒生效）；
+    完全找不到的用一行 WARNING 帶前幾個（可能只是這批資料沒涵蓋該設備）。
+    """
+    if not overrides:
+        return {}, []
+    near, missing = match_ledger_ids(overrides.keys(), device_ids)
+    for lid, did in sorted(near.items()):
+        logger.warning(
+            f"台帳的 {lid!r} 沒有對上任何設備，但資料裡有相近的 {did!r}（只差空白／底線／大小寫）。"
+            f"這筆台帳**沒有生效**——請把台帳的 device_id 改成與資料一致。")
+    if missing:
+        shown = '、'.join(sorted(missing)[:6]) + (' …' if len(missing) > 6 else '')
+        logger.warning(
+            f"台帳有 {len(missing)} 筆在這批資料裡找不到對應設備（{shown}）。"
+            f"若其中有應該有資料的設備，請檢查 device_id 寫法。")
+    return near, missing
+
+
 def load_device_meta_overrides(path: str | None) -> dict[str, dict]:
     """
     讀取 `--device-meta`：`{device_id: {is_standby, iso_machine_group,
@@ -386,6 +449,8 @@ def load_points(folder: str, pattern: str = '*.csv',
             continue
         device_id = str(meta.get('Name', '')).strip() or os.path.splitext(os.path.basename(path))[0]
         per_device.setdefault(device_id, []).append((df, meta, path))
+
+    warn_unmatched_overrides(overrides, per_device.keys())
 
     points: list[PointSeries] = []
     next_point_id = 1

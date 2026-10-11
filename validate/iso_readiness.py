@@ -37,6 +37,7 @@ from vibcore.metrics.iso import (ISO_FOUNDATIONS, ISO_GROUPS,
                                  ISO_MIN_RATED_POWER_KW, ISO_THRESHOLDS,
                                  classify_zone, iso_alert_threshold)
 from validate.points import (_ISO_CODE_TO_GROUP, load_device_meta_overrides,
+                             warn_unmatched_overrides,
                              parse_iso_assumption)
 
 logger = logging.getLogger(__name__)
@@ -602,6 +603,12 @@ def main(argv: list[str] | None = None) -> int:
     df = collect(args.data_dir, args.pattern, assume=assume, overrides=overrides)
     if overrides:
         print(f'（台帳：{args.device_meta}，讀到 {len(overrides)} 台的補充資訊）\n')
+        if not df.empty:
+            near, missing = warn_unmatched_overrides(overrides, df['device_id'])
+            for lid, did in sorted(near.items()):
+                print(f'⚠ 台帳的 {lid!r} 對不上，資料裡是 {did!r}（只差空白／底線／大小寫）——這筆台帳沒有生效')
+            if near:
+                print()
     if assume is not None:
         print(f'（分類假設：{"/".join(assume)}——這是假設值，不是台帳實際資料）\n')
     report(df)
