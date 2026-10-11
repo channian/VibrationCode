@@ -108,7 +108,7 @@
 呼叫 send_report 時提供：
 
   verdict   err / warn / ok 三選一，整體狀態總評
-  headline  一句話總評，300 字以內
+  headline  一句話總評，200 字以內
   actions   需要行動的事項，最多 10 筆（實務上建議 5 筆以內，
             次要事項併入 notes）
             每筆含 level（err/warn/ok）、title、detail、suggestion，
