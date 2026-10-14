@@ -140,6 +140,10 @@ def load_analytic_dir(folder: str, pattern: str = '*.csv') -> dict[str, pd.DataF
             logger.error(f"{os.path.basename(path)} 讀取失敗，已跳過：{e}")
             continue
         if df.empty:
+            # 整個檔案沒有可用的讀值列（感測器整段沒送資料、或時間欄全部解析失敗）。不說的話，
+            # 這台設備就從資料庫裡憑空消失：沒有量測點，也就不會有任何離線告警。
+            logger.warning(f"{os.path.basename(path)}：沒有可用的讀值列，已跳過"
+                           f"（這個檔案對應的設備不會出現在資料庫）")
             continue
         device_id = str(meta.get('Name', '')).strip() or os.path.splitext(os.path.basename(path))[0]
         grouped.setdefault(device_id, []).append(df)

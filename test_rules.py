@@ -2130,6 +2130,42 @@ def test_review_sheet() -> None:
           and res.loc['SENSOR_OFFLINE', 'unreviewed'] == 1, str(res[['decided', 'unreviewed']].to_dict()))
 
 
+def test_loader_empty_file() -> None:
+    """整個檔案沒有可用讀值列時要說出來——否則這台設備憑空消失，沒有量測點，也就沒有離線告警。"""
+    import logging
+    import tempfile
+    from vibcore.io.analytic_reader import load_analytic_dir
+
+    print("\n[12e] 每日排程讀檔：沒有可用讀值的檔案要有警告")
+    msgs: list[str] = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            msgs.append(record.getMessage())
+    lg = logging.getLogger('vibcore.io.analytic_reader')
+    h, old_level, old_prop = _H(), lg.level, lg.propagate
+    lg.addHandler(h)
+    lg.setLevel(logging.WARNING)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            good = pd.DataFrame({'Time': ['2026-06-01 00:00:00', '2026-06-01 00:10:00'],
+                                 'Name': ['OK_M1', 'OK_M1'], 'velRMS': [0.5, 0.6]})
+            good.to_csv(os.path.join(d, 'ok.csv'), index=False, encoding='utf-8-sig')
+            pd.DataFrame({'Time': [], 'Name': [], 'velRMS': []}).to_csv(
+                os.path.join(d, 'empty_CP01.csv'), index=False, encoding='utf-8-sig')
+            pd.DataFrame({'Time': ['not a time', ''], 'Name': ['BAD_M1', 'BAD_M1'], 'velRMS': [1.0, 2.0]}).to_csv(
+                os.path.join(d, 'badtime_CH06.csv'), index=False, encoding='utf-8-sig')
+            got = load_analytic_dir(d)
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old_level)
+        lg.propagate = old_prop
+    check("有讀值的檔案照常載入，沒有可用列的檔案不產生設備", sorted(got) == ['OK_M1'], str(sorted(got)))
+    check("沒有可用列的檔案各有一則警告，帶出檔名",
+          any('empty_CP01.csv' in m and '沒有可用的讀值列' in m for m in msgs)
+          and any('badtime_CH06.csv' in m and '沒有可用的讀值列' in m for m in msgs), str(msgs))
+
+
 def test_ledger_id_match() -> None:
     print("\n[12b] 台帳 device_id 與資料對不上：不能安靜失效")
 
@@ -3001,6 +3037,7 @@ def main() -> int:
         test_speed_effect()
         test_operating_state()
         test_ledger()
+        test_loader_empty_file()
         test_ledger_id_match()
         test_ledger_import_logic()
         test_review_sheet()
