@@ -613,6 +613,136 @@ def test_cli(conn) -> None:
     check("命令列入口沒帶 --save 時不寫資料庫", n_rows("weekly_report") == before_reports + 1)
 
 
+def test_agent_guard(conn) -> None:
+    """Agent 文字進資料庫之前的伺服器端把關：診斷性用語、總評下限、數字白名單、去識別。"""
+    from fastapi import HTTPException
+    from vibcore.api import agent_guard, queries, service
+    from vibcore.api.schemas import SendReportRequest
+
+    print("\n[3b] Agent 把關：診斷性用語、總評下限、數字白名單、人員姓名不外洩")
+
+    # ── 純函式 ──
+    texts = [("t", "疑似軸承內環缺陷，建議更換軸承")]
+    check("斷言式的診斷用語被抓到（疑似…缺陷、建議更換）",
+          len(agent_guard.diagnostic_violations(texts)) >= 2, str(agent_guard.diagnostic_violations(texts)))
+    check("有免責語的可能性列舉通過",
+          agent_guard.diagnostic_violations([("t", "衝擊性指標上升，常見於軸承劣化或潤滑不足，本系統無法區分成因")]) == [])
+    check("總評下限：Agent 可以比推算值更嚴，不可以更鬆",
+          [agent_guard.apply_verdict_floor(a, b) for a, b in
+           (("ok", "err"), ("warn", "err"), ("err", "ok"), ("warn", "warn"), ("ok", "ok"))]
+          == [("err", True), ("err", True), ("err", False), ("warn", False), ("ok", False)])
+    facts = agent_guard.facts_tokens({"count": 14, "hours": 207.0, "cov": {"org_analyzable_ratio": 0.755},
+                                      "last": "2026-09-22 17:00:00+08:00", "dev": "CWP 05_M1", "s": -3.88})
+    def bad(t):
+        return agent_guard.unverified_tokens([("t", t)], facts)
+    check("數字白名單：引用事實的數字（含百分比、設備代號裡的數字、日期時間）通過",
+          bad("CWP 05_M1 已 207 小時沒有資料，本週共 14 件，涵蓋率 75.5%，最後資料 9/22 17:00，偏離 3.88σ") == [],
+          str(bad("CWP 05_M1 已 207 小時沒有資料，本週共 14 件，涵蓋率 75.5%，最後資料 9/22 17:00，偏離 3.88σ")))
+    check("自行改寫的數字被抓到（事實 207，寫成 210；事實 3.88，寫成 3.9）",
+          len(bad("已 210 小時沒有資料")) == 1 and len(bad("偏離 3.9σ")) == 1)
+    check("全形數字不能繞過比對（捏造的全形數字照樣被抓，事實裡的全形寫法照樣通過）",
+          len(bad("共１５件")) == 1 and bad("共１４件") == [])
+    check("日期與時間也要核對", len(bad("9/23 之後無資料")) == 1 and len(bad("17:30 停止")) == 1)
+    check("全形的斜線與冒號（9／22 17：00）當成日期時間，不是兩三個零散的數字",
+          bad("最後資料 9／22 17：00") == [] and len(bad("最後資料 9／23 17：30")) == 2,
+          str(bad("最後資料 9／22 17：00")))
+    check("條列編號不算數量", bad("1. 先確認來源檔\n2. 再安排複測") == [])
+    os.environ.pop("VIB_GUARDRAIL_NUMBERS", None)
+    check("數字白名單預設是 report 模式（先量誤退率，不直接退回）", agent_guard.number_mode() == "report")
+    os.environ["VIB_GUARDRAIL_NUMBERS"] = "bogus"
+    check("不認得的模式退回預設，不是關閉", agent_guard.number_mode() == "report")
+    os.environ.pop("VIB_GUARDRAIL_NUMBERS", None)
+
+    # ── 經過 send_report 的完整路徑 ──
+    def count(table, where="TRUE"):
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) AS n FROM {table} WHERE {where}")
+            return cur.fetchone()["n"]
+
+    def req(**kw):
+        base = dict(report_type="weekly", days=7, verdict="err", headline="本期有嚴重事項。", actions=[])
+        base.update(kw)
+        return SendReportRequest(**base)
+
+    before_reports = count("weekly_report")
+    before_quota = queries.count_send_report_today(conn)
+    try:
+        service.send_report(conn, req(headline="AHU-601 疑似軸承內環缺陷，建議更換軸承"), daily_limit=50)
+        rejected = None
+    except HTTPException as e:
+        rejected = e
+    check("診斷性用語：整份退回（HTTP 422，原因與違規處都回給 Agent）",
+          rejected is not None and rejected.status_code == 422
+          and rejected.detail["reason"] == "diagnostic_language" and rejected.detail["problems"],
+          str(rejected.detail if rejected else None))
+    check("退回的報告不落庫、不吃每日額度，但稽核有留一筆（連續被退回才查得出來）",
+          count("weekly_report") == before_reports and queries.count_send_report_today(conn) == before_quota
+          and count("audit_log", "action = 'send_report_rejected'") >= 1)
+
+    r = service.send_report(conn, req(verdict="ok", headline="一切正常。"), daily_limit=50)
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT verdict, agent_payload, html FROM weekly_report WHERE report_id = %s", (r["report_id"],))
+        stored = cur.fetchone()
+    check("總評下限：有嚴重事項的一期，Agent 給 ok → 採用推算值 err，且回傳與落庫都標明被調高",
+          r["verdict"] == "err" and r["verdict_adjusted"] is True and r["verdict_submitted"] == "ok"
+          and stored["verdict"] == "err" and stored["agent_payload"]["verdict_adjusted"] is True
+          and stored["agent_payload"]["verdict_submitted"] == "ok", str({k: r[k] for k in ("verdict", "verdict_adjusted")}))
+    check("調高的總評也反映在報告 HTML 上", "嚴重" in stored["html"])
+
+    r2 = service.send_report(conn, req(headline="本週有 9999 件事項"), daily_limit=50)
+    conn.commit()
+    check("report 模式：捏造的數字不退回，但回報給 Agent、記進稽核",
+          r2["guardrail"]["number_mode"] == "report" and any("9999" in w for w in r2["guardrail"]["unverified"]),
+          str(r2["guardrail"]))
+    with conn.cursor() as cur:
+        cur.execute("SELECT detail FROM audit_log WHERE action = 'send_report' ORDER BY audit_id DESC LIMIT 1")
+        last_audit = cur.fetchone()["detail"]
+    check("稽核紀錄帶出未核對的項目數與內容", last_audit["n_unverified_tokens"] >= 1
+          and any("9999" in x for x in last_audit["unverified_tokens"]), str(last_audit))
+
+    os.environ["VIB_GUARDRAIL_NUMBERS"] = "enforce"
+    try:
+        n_before = count("weekly_report")
+        try:
+            service.send_report(conn, req(headline="本週有 9999 件事項"), daily_limit=50)
+            enforced = None
+        except HTTPException as e:
+            enforced = e
+        check("enforce 模式：未核對的數字整份退回，不落庫",
+              enforced is not None and enforced.detail["reason"] == "unverified_numbers"
+              and count("weekly_report") == n_before, str(enforced.detail if enforced else None))
+        # 引用事實裡的數字：週報期間的 days（7）、已存在的 finding 數值（7.8 mm/s、基準 3.2）
+        ok = service.send_report(conn, req(headline="AHU-601 的速度整體值為 7.8 mm/s，基準 3.2 mm/s。"), daily_limit=50)
+        conn.commit()
+        check("enforce 模式：原樣引用事實裡的數字（含設備代號裡的數字）通過", ok["guardrail"]["unverified"] == [],
+              str(ok["guardrail"]))
+    finally:
+        os.environ.pop("VIB_GUARDRAIL_NUMBERS", None)
+
+    # ── 人員姓名不外洩 ──
+    with conn.cursor() as cur:
+        cur.execute("SELECT finding_id FROM finding WHERE finding_key = 'point:AHU-601/M1:VEL_HIGH'")
+        fid = cur.fetchone()["finding_id"]
+        cur.execute("INSERT INTO finding_note (finding_id, stage, author_id, author_role, is_human, note) "
+                    "VALUES (%s, 'engineer_replied', 1, 'engineer', true, '已派人檢查')", (fid,))
+        cur.execute("INSERT INTO finding_status_history (finding_id, from_status, to_status, changed_by) "
+                    "VALUES (%s, 'open', 'engineer_replied', 1)", (fid,))
+    conn.commit()
+    ctx = service.get_event_context(conn, "point:AHU-601/M1:VEL_HIGH")
+    opened = service.get_open_findings(conn)
+    blob = json.dumps({"ctx": ctx, "open": opened}, ensure_ascii=False)
+    check("Agent 拿到的事件脈絡與未結案事項不含任何人員姓名", "王工程師" not in blob, "姓名外洩")
+    check("回覆者改以角色呈現", ctx["notes"][0]["author"] == "設備工程師"
+          and ctx["status_history"][0]["changed_by"] == "人員"
+          and any(f.get("latest_note", {}).get("author") == "設備工程師" for f in opened["findings"]
+                  if f.get("latest_note")), str(ctx["notes"]))
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM finding_note WHERE finding_id = %s", (fid,))
+        cur.execute("DELETE FROM finding_status_history WHERE finding_id = %s", (fid,))
+    conn.commit()
+
+
 def _raises(exc, fn) -> bool:
     try:
         fn()
@@ -667,6 +797,7 @@ def main() -> int:
         test_render(conn)
         test_cli(conn)
         test_api(conn)
+        test_agent_guard(conn)
     except AssertionError as e:
         print(f"\n❌ 驗收失敗：{e}")
         return 1

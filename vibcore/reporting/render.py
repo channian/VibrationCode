@@ -643,6 +643,10 @@ def _infer_verdict(data: dict[str, Any]) -> str:
     return "ok"
 
 
+#: 公開名稱：API 的總評下限（`vibcore.api.agent_guard`）要用同一份推算
+infer_verdict = _infer_verdict
+
+
 def _fallback_headline(data: dict[str, Any], period_word: str) -> str:
     s = data["stats"]
     return (f"{period_word}新增 {s['new_count']} 件事項，追蹤中 {s['tracking_count']} 件，"

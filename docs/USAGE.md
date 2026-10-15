@@ -156,6 +156,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 | `VIB_DB_PASSWORD` | 空字串 | 連線密碼 |
 | `VIB_AGENT_API_KEY` | 無 | Agent 呼叫 API 的金鑰。**未設定時 API 一律回 503**（拒絕服務而非放行） |
 | `VIB_REPORT_DAILY_LIMIT` | `3` | `send_report` 每日寄送次數上限，超過回 429 |
+| `VIB_GUARDRAIL_NUMBERS` | `report` | `send_report` 的數字白名單模式：`report` 只回報並記稽核；`enforce` 有未核對的數字就整份退回（422）；`off` 不檢查 |
 
 </details>
 
@@ -495,6 +496,34 @@ python -m vibcore.reporting.cli --days 7 --out output/weekly.html --save
 - 輸出文字掃一遍 → 有沒有出現禁止的故障類型用語
 
 `docs/agent_prompt_weekly.md` 文末有完整檢查清單。
+
+### 6.2 系統會幫你擋什麼，什麼擋不住
+
+Agent 平台是 no-code，提示詞只是請求。以下由**伺服器端**檢查（`send_report`），不靠 Agent 自律：
+
+| 檢查 | 結果 |
+|---|---|
+| 文字含診斷性斷言（指認故障類型、建議更換、估計剩餘壽命） | 整份退回（422），不落庫、不計額度，稽核記 `send_report_rejected` |
+| 數字、日期、時間不在本期事實內 | 預設只回報並記稽核；`VIB_GUARDRAIL_NUMBERS=enforce` 才退回 |
+| 總評低於規則引擎推算 | 不退回，改用推算值並標 `verdict_adjusted` |
+| 回覆者、簽核者姓名 | Agent 查到的工具回傳一律是角色，不含姓名 |
+
+**擋不住的**：把 A 設備的數字寫到 B 設備上（只確認數字存在於事實，不確認引用對象）；中文數字（「六成」）；
+沒有診斷詞的腦補敘述；現場人員自由文字裡的姓名。這些靠人工抽查。
+
+**看 Agent 的把關統計**（稽核紀錄）：
+
+```sql
+-- 被退回的次數與原因
+SELECT detail->>'reason' AS reason, COUNT(*) FROM audit_log
+WHERE action = 'send_report_rejected' GROUP BY 1;
+
+-- 成功送出的報告：總評被調高幾次、數字未核對幾項
+SELECT COUNT(*) AS n,
+       COUNT(*) FILTER (WHERE (detail->>'verdict_adjusted')::boolean) AS verdict_raised,
+       SUM((detail->>'n_unverified_tokens')::int) AS unverified_tokens
+FROM audit_log WHERE action = 'send_report';
+```
 
 ---
 

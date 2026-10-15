@@ -572,8 +572,8 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 |---|---|---|---|
 | `report_type` | `"daily"` \| `"weekly"` | 否（預設 `weekly`） | |
 | `days` | int | 否（預設 7） | 相對窗口天數，範圍 1–365；**日報傳 1**。窗口為 `[end_date - days + 1, end_date]`，以日曆日切齊 |
-| `end_date` | date（`YYYY-MM-DD`） | 否（預設今日） | 僅在補產歷史報告時使用，一般情況不要帶 |
-| `verdict` | `"err"` \| `"warn"` \| `"ok"` | 是 | 其他值 → 422 |
+| `end_date` | date（`YYYY-MM-DD`） | 否（預設今日） | 僅在補產歷史報告時使用，一般情況不要帶；`get_weekly_report_data` 也接受同名參數，兩者要帶一致 |
+| `verdict` | `"err"` \| `"warn"` \| `"ok"` | 是 | 其他值 → 422。**總評有下限**：低於規則引擎依資料庫推算的結果時，系統改用推算值（見〈文字把關〉） |
 | `headline` | string | 是 | 1–200 字元 |
 | `actions` | array | 否（預設空陣列） | **最多 10 筆**；欄位見下表 |
 | `notes` | string \| null | 否 | 最多 4000 字元 |
@@ -655,9 +655,16 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
     "note": "SMTP 尚未設定，本次僅落庫，尚未寄出。寄送介面已預留，待 SMTP 設定後啟用。"
   },
   "daily_send_count": 1,
-  "daily_send_limit": 3
+  "daily_send_limit": 3,
+  "verdict_submitted": "warn",
+  "verdict_adjusted": false,
+  "guardrail": {"number_mode": "report", "unverified": [], "note": ""}
 }
 ```
+
+回傳的 `verdict` 是**實際採用**的總評；`verdict_submitted` 是你送來的值；兩者不同時
+`verdict_adjusted` 為 `true`。`guardrail.unverified` 列出沒能與本期事實核對的數字、日期、
+時間（`report` 模式下不退回，但請下一期避免）。
 
 #### 四道卡控
 
@@ -666,7 +673,7 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 | 1 | **不接受收件人欄位** | 請求 body 的 Pydantic 模型設 `extra="forbid"`：任何不在契約內的欄位（`to`/`recipients`/`cc` 等）一律 **422**，不是被靜默忽略 |
 | 2 | **主旨由系統產生** | 呼叫方不可指定主旨；系統依 `report_type` + `period_label` 產生 |
 | 3 | **只收結構化欄位，不收 raw HTML** | `headline`／`notes`／`actions` 的文字欄位一律在寫入前用 `html.escape()` 轉義；即使傳入 `<script>...</script>`，落庫的 `agent_payload` 與 API 回傳內容都會是 `&lt;script&gt;...&lt;/script&gt;`。報告 HTML 走另一條路徑——由樣板引擎的 autoescape 處理（刻意不共用同一份已轉義的字串，否則會轉義兩次，讀者會在報告上看到 `&lt;b&gt;` 這種字面值），結果同樣安全：標記一律顯示為文字，不會生效 |
-| 4 | **每日發送次數上限** | 預設 **3** 次／日曆日，環境變數 `VIB_REPORT_DAILY_LIMIT` 可調；超過回 **429**；每次成功呼叫寫入 `audit_log`（`action='send_report'`），失敗（422/429）不計入次數也不寫稽核 |
+| 4 | **每日發送次數上限** | 預設 **3** 次／日曆日，環境變數 `VIB_REPORT_DAILY_LIMIT` 可調；超過回 **429**；每次成功呼叫寫入 `audit_log`（`action='send_report'`），失敗（422/429）不計入次數；429 不寫稽核，文字把關造成的 422 另寫 `send_report_rejected`（見下） |
 
 **驗證錯誤範例**（422，`verdict` 非法值）：
 
@@ -681,14 +688,42 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 {"detail": "已達每日寄送上限（3 次），請明日再試"}
 ```
 
+#### 文字把關（四道卡控之外，針對你寫的內容）
+
+欄位合法不代表內容可用。`send_report` 收到後，伺服器端另外檢查你寫的每個文字欄位
+（`headline`、`notes`、每筆 action 的 `title`／`detail`／`suggestion`）：
+
+| 順序 | 檢查 | 不通過時 |
+|---|---|---|
+| 1 | **診斷性用語**：斷言故障類型（「疑似…軸承」「判定為」）、建議更換零件、估計剩餘壽命；提及故障詞彙卻沒有免責語（「無法區分成因」「常見於」「建議安排複測」） | **422**，`error: "report_rejected"`、`reason: "diagnostic_language"`，`problems` 列出欄位與違規處；整份不落庫、不計入每日額度 |
+| 2 | **數字白名單**：文字裡的每個數字、日期、時間，都要出現在你能查到的本期事實裡（`get_weekly_report_data`、`get_open_findings`、`get_vibration_thresholds` 的回傳） | 依環境變數 `VIB_GUARDRAIL_NUMBERS`：`report`（預設）→ 照常落庫，未核對的項目列在回傳的 `guardrail.unverified` 並記入稽核；`enforce` → **422**，`reason: "unverified_numbers"`；`off` → 不檢查 |
+| 3 | **總評下限**：`verdict` 不得低於規則引擎依資料庫推算的結果 | 不退回；改用推算值，`verdict_adjusted: true`，稽核記 `verdict_submitted` 與實際值。你可以比推算值更嚴，不可以更鬆 |
+
+被退回（422）時：依 `problems` 的指示改寫，**重送一次**即可。同樣的內容不要原樣重試。
+退回另寫一筆稽核 `send_report_rejected`，不計入每日額度。
+
+**數字白名單怎麼比**：全形數字與標點先轉半形；設備代號、量測位置、ISO 編號（如 `ISO 20816-3`）、
+條列編號裡的數字不算數量；`2.0` 與 `2` 視為同一個數；比例欄位（`*_ratio`、`*_pct`）可寫成百分比；
+日期與時間（`2026-09-22`、`9/22`、`9月22日`、`17:00`）須與事實裡的某一個相同。
+
+**寫數字的原則**：原樣引用工具回傳的值，不要四捨五入成別的位數、不要自己加總或相減、不要把
+「約」當作改寫數字的理由。需要「差了多少」時，用工具已經算好的欄位（如 `baseline_value`／`current_value`
+各自引用），不要自己算差。
+
+**限制（如實揭露）**：中文數字（「六成」「三台」）不檢查；只確認數字有出現在事實裡，不確認
+引用得對不對；你若呼叫了上述三支以外的工具，那些數字不在白名單內。這些由導讀判讀一致性的人工抽查補足。
+
+**姓名**：`get_open_findings` 與 `get_event_context` 回傳的回覆者、簽核者一律是角色
+（設備工程師／主管／專家），不含姓名。人員自己寫的回覆內文原樣提供；報告裡不要轉述其中的人名。
+
 **給 Agent 的提示**：
 
 - 呼叫前務必先跑過 §4 的建議工作流程（`get_open_findings` → `get_weekly_report_data`），
-  `headline`/`actions` 的措辭一律遵守 §2 的用語限制——本工具**不會**幫忙過濾故障類型
-  判定用語，寫進 `headline`/`actions[].text` 的內容會照樣落庫並（未來）寄出。
-  Agent 的系統提示必須自律，API 只保證「結構合法、不含可執行 HTML」。
-- 同一 `(report_type, period_label)` 重送視為重新產出該期報告（upsert），但**仍會
-  消耗一次每日發送額度**——不要把「重送」當成免費操作。
+  `headline`/`actions` 的措辭一律遵守 §2 的用語限制。伺服器端現在會擋診斷性用語與
+  改寫過的數字（見上），但擋不住所有情況（例如把 A 設備的數字寫到 B 設備），
+  Agent 的系統提示仍須自律。
+- 同一 `(report_type, period_label)` 重送視為重新產出該期報告（upsert），且成功的重送
+  **仍會消耗一次每日發送額度**——不要把「重送」當成免費操作。被 422 退回的不算。
 - `429` 發生時不會寫入任何資料，可安全重試（隔日或提高限制後）。
 
 ---

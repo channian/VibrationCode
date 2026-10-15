@@ -30,7 +30,7 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from fastapi import HTTPException
 
-from vibcore.api import queries
+from vibcore.api import agent_guard, queries
 from vibcore.api.schemas import SendReportRequest
 from vibcore.api.util import jsonable
 from vibcore.config import AGG_SPEC
@@ -39,6 +39,7 @@ from vibcore.metrics import iso as iso_mod
 from vibcore.metrics import trend as trend_mod
 from vibcore.pipeline.aggregate import coverage_report
 from vibcore.reporting import collect_weekly_data, render_weekly_html
+from vibcore.reporting.render import infer_verdict
 from vibcore.reporting.collect import ReportScope, collect_observations, fetch_point_coverage
 from vibcore.types import CoverageInfo
 
@@ -133,9 +134,26 @@ def _period_utc_bounds(period_start: date, period_end: date) -> tuple[datetime, 
     return start, end
 
 
+#: Agent 的輸入不含個資：回覆者、簽核者一律以角色呈現，不回傳姓名。
+#: 人員自己寫的回覆內文（note／action_taken／root_cause）無法替他們去識別，
+#: 那是現場文字，原樣交給 Agent；這裡擋的是系統自己從使用者表帶出來的姓名欄位。
+_ROLE_LABELS = {"engineer": "設備工程師", "supervisor": "主管", "expert": "專家", "admin": "管理員"}
+
+
+def _role_label(role: str | None) -> str:
+    return _ROLE_LABELS.get(role or "", "人員")
+
+
+def _mask_latest_note(d: dict) -> None:
+    note = d.get("latest_note")
+    if isinstance(note, dict):
+        note["author"] = _role_label(note.get("role"))
+
+
 def _finding_public(row: dict) -> dict:
     """把 finding 相關的 DB row 轉成給 agent 的 dict，強制補上 interpretation_limit。"""
     d = jsonable(dict(row))
+    _mask_latest_note(d)
     if not d.get("interpretation_limit"):
         logger.warning(
             f"finding_key={d.get('finding_key')} 缺少 interpretation_limit，"
@@ -391,6 +409,7 @@ def get_weekly_report_data(
     building: str | None = None,
     floor: str | None = None,
     system_name: str | None = None,
+    end_date: date | None = None,
 ) -> dict:
     """
     週報彙總；`days=1` 供日報使用。
@@ -400,7 +419,7 @@ def get_weekly_report_data(
     `send_report(days=N)`，兩者算出的期間保證相同，不會因為呼叫時間點
     相差幾分鐘而各自對到不同的一天（`days=1` 跨午夜時尤其關鍵）。
     """
-    period_start, period_end = resolve_period(days)
+    period_start, period_end = resolve_period(days, end_date=end_date)
     start, end = _period_utc_bounds(period_start, period_end)
 
     summary = queries.finding_summary_for_period(
@@ -514,10 +533,14 @@ def get_event_context(conn, finding_key: str) -> dict:
         data_quality = jsonable(coverage_report(agg))
 
     finding_public = _finding_public(row)
+    # 回覆者與簽核者只給角色，不給姓名（見 `_ROLE_LABELS`）
+    notes_public = [{**n, "author": _role_label(n.get("role"))} for n in jsonable(notes)]
+    history_public = [{**h, "changed_by": "系統" if h.get("changed_by") is None else "人員"}
+                      for h in jsonable(history)]
     return {
         "finding": finding_public,
-        "notes": jsonable(notes),
-        "status_history": jsonable(history),
+        "notes": notes_public,
+        "status_history": history_public,
         "data_quality": data_quality,
         "interpretation_limit": finding_public["interpretation_limit"],
         "agent_guidance": GUARDRAIL_NOTE,
@@ -534,6 +557,7 @@ def _render_report_html(
     period_start: date,
     period_end: date,
     raw_agent_payload: dict,
+    data: dict | None = None,
 ) -> str:
     """
     產出完整報告 HTML：資料由 `collect_weekly_data` 從資料庫收集，
@@ -551,14 +575,15 @@ def _render_report_html(
     結論其實不依賴渲染就已經拿到手了。
     """
     try:
-        data = collect_weekly_data(
-            conn, period_start, period_end,
-            ReportScope(
-                building=payload.building,
-                floor=payload.floor,
-                system_name=payload.system_name,
-            ),
-        )
+        if data is None:
+            data = collect_weekly_data(
+                conn, period_start, period_end,
+                ReportScope(
+                    building=payload.building,
+                    floor=payload.floor,
+                    system_name=payload.system_name,
+                ),
+            )
         return render_weekly_html(data, raw_agent_payload, payload.report_type)
     except Exception:
         logger.exception(
@@ -584,6 +609,20 @@ def _render_fallback_html(payload: SendReportRequest) -> str:
         f"<p>{html_escape.escape(payload.headline)}</p>"
         f"<ul>{items}</ul>{notes}</div>"
     )
+
+
+def _reject_report(conn, payload: SendReportRequest, period_label: str, reason: str,
+                   problems: list[str], hint: str) -> None:
+    """退回 Agent 的報告：寫一筆稽核（先提交，否則隨例外一起 rollback），再回 422。不落庫、不計額度。"""
+    queries.insert_audit_log(
+        conn, actor="agent", action="send_report_rejected",
+        target=f"{payload.report_type}:{period_label}",
+        detail={"reason": reason, "n_problems": len(problems), "problems": problems[:20]},
+    )
+    conn.commit()
+    raise HTTPException(status_code=422, detail={
+        "error": "report_rejected", "reason": reason, "problems": problems, "hint": hint,
+    })
 
 
 def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
@@ -622,6 +661,44 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
             status_code=429,
             detail=f"已達每日寄送上限（{daily_limit} 次），請明日再試",
         )
+
+    # ── Agent 文字的伺服器端把關（見 vibcore/api/agent_guard.py）──
+    # 順序：先擋診斷性用語（整份退回）→ 數字白名單（依模式退回或僅回報）→ 總評下限（調高並留紀錄）。
+    # 退回不計入每日寄送額度（額度只數成功的 send_report），但會寫一筆稽核，
+    # 「連續 2 期被退回即停用導讀」的監控才有資料可看。
+    guard_period_start, guard_period_end = resolve_period(payload.days, end_date=payload.end_date)
+    guard_label = report_period_label(payload.report_type, guard_period_end)
+    texts = agent_guard.agent_texts(payload)
+
+    violations = agent_guard.diagnostic_violations(texts)
+    if violations:
+        _reject_report(conn, payload, guard_label, "diagnostic_language", violations,
+                       "報告只能陳述現象與建議下一步，不能指認故障類型、建議更換零件或估計剩餘壽命。"
+                       "請改寫後重送；可以說「常見於 X 或 Y，本系統無法區分成因」。")
+
+    number_mode = agent_guard.number_mode()
+    number_warnings: list[str] = []
+    if number_mode != "off":
+        scope_kw = dict(building=payload.building, floor=payload.floor, system_name=payload.system_name)
+        facts = agent_guard.facts_tokens(
+            get_weekly_report_data(conn, days=payload.days, end_date=payload.end_date, **scope_kw),
+            get_open_findings(conn, **scope_kw),
+            get_vibration_thresholds(conn),
+        )
+        number_warnings = agent_guard.unverified_tokens(texts, facts)
+        if number_warnings and number_mode == "enforce":
+            _reject_report(conn, payload, guard_label, "unverified_numbers", number_warnings,
+                           "報告裡的數字、日期、時間必須原樣引用工具回傳的值，不要自行計算或改寫。"
+                           "請對照 get_weekly_report_data／get_open_findings／get_vibration_thresholds 的回傳修正後重送。")
+
+    scope = ReportScope(building=payload.building, floor=payload.floor, system_name=payload.system_name)
+    try:
+        report_data = collect_weekly_data(conn, guard_period_start, guard_period_end, scope)
+        inferred_verdict = infer_verdict(report_data)
+    except Exception:
+        logger.exception("總評下限的推算失敗，沿用 Agent 的總評")
+        report_data, inferred_verdict = None, payload.verdict
+    verdict, verdict_adjusted = agent_guard.apply_verdict_floor(payload.verdict, inferred_verdict)
 
     # 兩份 actions：`raw_actions` 給渲染層（Jinja2 autoescape 會處理），
     # `actions` 是轉義後的版本，供落庫與 API 回傳（四道卡控 #3）。
@@ -664,20 +741,24 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
     period_label = report_period_label(payload.report_type, period_end)
 
     agent_payload = {
-        "verdict": payload.verdict,
+        "verdict": verdict,
+        "verdict_submitted": payload.verdict,
+        "verdict_adjusted": verdict_adjusted,
         "headline": headline,
         "actions": actions,
         "notes": notes,
+        "guardrail_warnings": number_warnings,
         "submitted_at": jsonable(_now()),
     }
     report_html = _render_report_html(
         conn, payload, period_start, period_end,
         raw_agent_payload={
-            "verdict": payload.verdict,
+            "verdict": verdict,
             "headline": payload.headline,
             "actions": raw_actions,
             "notes": payload.notes,
         },
+        data=report_data,
     )
 
     row = queries.upsert_weekly_report(
@@ -686,7 +767,7 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         period_label=period_label,
         period_start=period_start,
         period_end=period_end,
-        verdict=payload.verdict,
+        verdict=verdict,
         headline=headline,
         agent_payload=agent_payload,
         html=report_html,
@@ -699,7 +780,10 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         conn, actor="agent", action="send_report",
         target=f"{payload.report_type}:{period_label}",
         detail={
-            "report_id": row["report_id"], "verdict": payload.verdict,
+            "report_id": row["report_id"], "verdict": verdict,
+            "verdict_submitted": payload.verdict, "verdict_adjusted": verdict_adjusted,
+            "number_mode": number_mode, "n_unverified_tokens": len(number_warnings),
+            "unverified_tokens": number_warnings[:20],
             "headline": headline, "n_actions": len(actions),
             "scope": {"building": payload.building, "floor": payload.floor,
                       "system_name": payload.system_name},
@@ -728,4 +812,15 @@ def send_report(conn, payload: SendReportRequest, daily_limit: int) -> dict:
         },
         "daily_send_count": sent_today + 1,
         "daily_send_limit": daily_limit,
+        # 把關結果回給呼叫端：總評被調高時 Agent 要看得到（下一期才不會再犯），
+        # 數字未能核對時（report 模式）列出是哪幾個。
+        "verdict_submitted": payload.verdict,
+        "verdict_adjusted": verdict_adjusted,
+        "guardrail": {
+            "number_mode": number_mode,
+            "unverified": number_warnings,
+            "note": ("總評已依資料庫推算調高（不得低於規則引擎的結果）。" if verdict_adjusted else "")
+                    + ("有數字、日期或時間未能與本期事實核對（report 模式不退回，但已記入稽核）；"
+                       "請只引用工具回傳的值。" if number_warnings else ""),
+        },
     }

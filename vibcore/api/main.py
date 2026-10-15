@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from typing import Iterator, Literal
 
 from fastapi import Depends, FastAPI, Query
@@ -137,12 +138,16 @@ def get_weekly_report_data(
     building: str | None = None,
     floor: str | None = None,
     system: str | None = None,
+    end_date: date | None = Query(
+        default=None,
+        description="窗口結束日（含），預設系統當下日期（UTC）。只用於補產歷史報告，一般呼叫不要帶。",
+    ),
     _: None = Depends(verify_api_key),
     conn: Connection = Depends(get_db),
 ) -> dict:
     """週報彙總，支援 days 參數（日報傳 days=1；日曆日切齊，見 service.resolve_period）。"""
     return service.get_weekly_report_data(
-        conn, days=days, building=building, floor=floor, system_name=system
+        conn, days=days, building=building, floor=floor, system_name=system, end_date=end_date
     )
 
 
