@@ -210,7 +210,9 @@ def _period_label(period_start: date, period_end: date, report_type: str = "week
     """
     if report_type == "daily" or period_start == period_end:
         return f"{period_end:%Y-%m-%d}"
-    iso_year, iso_week, _ = period_start.isocalendar()
+    # ISO 週次以「結束日」為準，與 weekly_report 的期間鍵（api.service.report_period_label）同一個算法：
+    # 窗口是滾動 7 天，常跨兩個 ISO 週；標題寫 W39、資料庫鍵與 CLI 摘要寫 W40 會讓同一份報告有兩個名字。
+    iso_year, iso_week, _ = period_end.isocalendar()
     return f"{iso_year}-W{iso_week:02d} · {period_start:%m/%d} – {period_end:%m/%d}"
 
 

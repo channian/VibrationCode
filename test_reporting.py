@@ -451,6 +451,14 @@ def test_render(conn) -> None:
           daily.split("<title>")[1].split("</title>")[0].endswith(str(today)))
     check("週報期間標籤為 ISO 週次",
           "-W" in html.split("<title>")[1].split("</title>")[0])
+    from vibcore.api.service import report_period_label
+    check("報告標題的週次與 weekly_report 的期間鍵同一個算法（跨週的滾動窗口也不會有兩個名字）",
+          report_period_label("weekly", today) in html.split("<title>")[1].split("</title>")[0],
+          html.split("<title>")[1].split("</title>")[0])
+    cross = render_weekly_html(collect_weekly_data(conn, dt.date(2026, 9, 24), dt.date(2026, 9, 30)), None, "weekly")
+    check("09/24～09/30 跨 W39／W40：標題與資料庫鍵都是 W40",
+          "2026-W40" in cross.split("<title>")[1].split("</title>")[0]
+          and report_period_label("weekly", dt.date(2026, 9, 30)) == "2026-W40")
     check("非法 report_type 退回週報用語，不丟例外",
           "設備振動週報" in render_weekly_html(data, None, "monthly"))
 
