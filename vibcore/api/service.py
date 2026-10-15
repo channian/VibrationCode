@@ -39,7 +39,7 @@ from vibcore.metrics import iso as iso_mod
 from vibcore.metrics import trend as trend_mod
 from vibcore.pipeline.aggregate import coverage_report
 from vibcore.reporting import collect_weekly_data, render_weekly_html
-from vibcore.reporting.collect import ReportScope, collect_observations
+from vibcore.reporting.collect import ReportScope, collect_observations, fetch_point_coverage
 from vibcore.types import CoverageInfo
 
 logger = logging.getLogger(__name__)
@@ -412,8 +412,10 @@ def get_weekly_report_data(
     open_by_severity = Counter(r["severity"] for r in open_rows)
     escalated_rows = [r for r in open_rows if r.get("escalated_at")]
 
-    coverage_rows = queries.point_coverage_for_period(
-        conn, start, end, building=building, floor=floor, system_name=system_name
+    # 與週報同一套算法：窗口內根本沒有列的小時（感測器停掉之後）也算缺資料，
+    # 只數既有的列，死掉的感測器會從分母裡消失，涵蓋率就偏高。
+    coverage_rows = fetch_point_coverage(
+        conn, start, end, ReportScope(building=building, floor=floor, system_name=system_name)
     )
     coverage_items = []
     insufficient = []

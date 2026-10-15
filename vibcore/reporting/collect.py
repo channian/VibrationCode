@@ -117,7 +117,14 @@ _DEFAULT_STANDBY_DAYS = 30
 #: （例如只斷線 1 小時、幾乎不影響判定的量測點，沒必要塞滿清單）
 _GAP_NO_DATA_MIN_HOURS = 1
 _GAP_PARTIAL_MIN_HOURS = 1
-_GAP_LIST_MAX_ITEMS = 20
+_GAP_LIST_MAX_ITEMS = 40
+
+#: 資料品質區塊裡，結尾連續缺資料超過幾小時才標成「現場檢查感測器」（還在斷線）；
+#: 更短、或已經恢復的缺口只標成「本期累計 N 小時無資料（已恢復）」。
+_GAP_OFFLINE_MIN_HOURS = 3
+
+#: 這些狀態代表「資料有進來」（設備沒運轉也算：資料是完整的，只是沒東西可分析）
+_STATUSES_WITH_DATA = ("ok", "partial", "not_running")
 
 #: 匯入稽核清單只列出真正需要人看的項目，同理設一個上限避免塞爆週報
 _INGEST_ISSUE_MAX_ITEMS = 30
@@ -192,6 +199,7 @@ def _normalize_open_finding(row: dict, assignee_names: dict[int, str]) -> dict[s
 
     return {
         "finding_key": row["finding_key"],
+        "rule_code": row.get("rule_code"),
         "severity": row["severity"],
         "device_label": _device_label(row),
         "location": _location_label(row),
@@ -309,35 +317,117 @@ def _fetch_resolved_findings(
         return [dict(r) for r in cur.fetchall()]
 
 
+def _hours_between(a: datetime, b: datetime) -> int:
+    return max(0, int((b - a).total_seconds() // 3600))
+
+
+def _fetch_data_horizon(conn: Connection, end: datetime) -> datetime | None:
+    """
+    全廠最後一筆「有資料」的小時的下一個整點（不含）；沒有任何資料時回傳 None。
+
+    報告窗口超出這個時間的部分不是「缺資料」，只是資料還沒進來。窗口以 UTC 日界切，
+    而資料匯出常在當地深夜結束（UTC+8 的 23:00 ＝ UTC 15:00）：不扣掉這段，每個量測點都會被
+    算成「斷線 9 小時」。
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT MAX(ma.ts_hour) AS t
+            FROM measurement_agg ma
+            JOIN measure_point mp ON mp.point_id = ma.point_id
+            JOIN device d ON d.device_id = mp.device_id
+            WHERE ma.ts_hour < %(end)s AND ma.data_status = ANY(%(st)s)
+              AND d.status = 'active' AND mp.is_active
+            """,
+            {"end": end, "st": list(_STATUSES_WITH_DATA)},
+        )
+        row = cur.fetchone()
+    return row["t"] + timedelta(hours=1) if row and row["t"] is not None else None
+
+
+def fetch_point_extents(
+    conn: Connection, start: datetime, end: datetime, scope: ReportScope,
+) -> list[dict[str, Any]]:
+    """
+    逐量測點的涵蓋率底稿：窗口內各狀態小時數，加上**窗口內本來該有、但根本沒有列的小時**
+    （`missing_hours`，算作 `no_data`）。
+
+    為什麼要補：`aggregate_hourly` 只替「這個點自己的資料範圍之內」的缺口補上 `no_data` 列，
+    資料中途停掉的點，停掉之後的小時**根本沒有列**。只數既有的列，死掉的感測器就從涵蓋率的分母
+    裡消失——一份有 14 個量測點已停止八天的週報，會寫出「涵蓋率 98.8%」。
+    所以期望時數由日曆決定：從 `max(窗口起點, 該點第一筆資料)` 到全廠資料所及之處
+    （見 `_fetch_data_horizon`），列數不足的部分就是缺資料。
+
+    從未有過任何資料的點（剛建立）不納入。
+    """
+    horizon = _fetch_data_horizon(conn, end)
+    eff_end = min(end, horizon) if horizon is not None else start
+    sql = """
+        SELECT mp.point_id, mp.position, d.device_id, d.device_name,
+               d.building, d.floor, d.system_name, d.is_standby,
+               MIN(ma.ts_hour) AS first_ts,
+               MAX(ma.ts_hour) FILTER (WHERE ma.data_status = ANY(%(st)s)) AS last_data_ts,
+               COUNT(*) FILTER (WHERE ma.ts_hour >= %(start)s) AS n_rows,
+               COUNT(*) FILTER (WHERE ma.ts_hour >= %(start)s AND ma.data_status = 'ok') AS ok_hours,
+               COUNT(*) FILTER (WHERE ma.ts_hour >= %(start)s AND ma.data_status = 'partial') AS partial_hours,
+               COUNT(*) FILTER (WHERE ma.ts_hour >= %(start)s AND ma.data_status = 'no_data') AS no_data_rows,
+               COUNT(*) FILTER (WHERE ma.ts_hour >= %(start)s AND ma.data_status = 'not_running') AS not_running_hours
+        FROM measure_point mp
+        JOIN device d ON d.device_id = mp.device_id
+        LEFT JOIN measurement_agg ma ON ma.point_id = mp.point_id AND ma.ts_hour < %(eff_end)s
+        WHERE d.status = 'active' AND mp.is_active
+    """ + _scope_sql("d") + """
+        GROUP BY mp.point_id, mp.position, d.device_id, d.device_name,
+                 d.building, d.floor, d.system_name, d.is_standby
+        ORDER BY d.device_id, mp.position
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, {"start": start, "eff_end": eff_end, "st": list(_STATUSES_WITH_DATA),
+                          **scope.params})
+        rows = [dict(r) for r in cur.fetchall()]
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if r["first_ts"] is None:
+            continue
+        lo = max(start, r["first_ts"])
+        expected = _hours_between(lo, eff_end)
+        r["missing_hours"] = max(0, expected - int(r["n_rows"]))
+        r["no_data_hours"] = int(r["no_data_rows"]) + r["missing_hours"]
+        r["total_hours"] = int(r["n_rows"]) + r["missing_hours"]
+        r["eff_end"] = eff_end
+        out.append(r)
+    return out
+
+
+def fetch_point_coverage(
+    conn: Connection, start: datetime, end: datetime, scope: ReportScope | None = None,
+) -> list[dict[str, Any]]:
+    """每個量測點的 ok 小時數／期望小時數（含窗口內根本沒有列的小時），給 API 的涵蓋率摘要用。"""
+    return [
+        {"point_id": r["point_id"], "device_id": r["device_id"], "position": r["position"],
+         "ok_hours": int(r["ok_hours"]), "total_hours": r["total_hours"]}
+        for r in fetch_point_extents(conn, start, end, scope or ReportScope())
+    ]
+
+
 def _fetch_coverage(
     conn: Connection, start: datetime, end: datetime, scope: ReportScope
 ) -> dict[str, Any]:
     """
-    全廠資料涵蓋率：本期每小時聚合列依 `data_status` 分組計數。
+    全廠資料涵蓋率：本期每小時聚合列依 `data_status` 分組計數（含窗口內根本沒有列的小時，
+    算作 `no_data`，見 `fetch_point_extents`）。
 
     四種狀態刻意分開回傳，不合併成單一「涵蓋率」數字——`no_data`（斷線）
     是設備異常需要現場處理，`not_running`（未運轉）是正常狀態，兩者混在
     一起會讓「涵蓋率偏低」這件事失去指向性（見 PLAN §需求：斷線與未運轉
     是完全不同的事）。
     """
-    sql = """
-        SELECT ma.data_status, COUNT(*) AS hours
-        FROM measurement_agg ma
-        JOIN measure_point mp ON mp.point_id = ma.point_id
-        JOIN device d ON d.device_id = mp.device_id
-        WHERE ma.ts_hour >= %(start)s AND ma.ts_hour < %(end)s
-          AND d.status = 'active' AND mp.is_active
-    """ + _scope_sql("d") + """
-        GROUP BY ma.data_status
-    """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, {"start": start, "end": end, **scope.params})
-        by_status = {r["data_status"]: int(r["hours"]) for r in cur.fetchall()}
-
-    ok_hours = by_status.get("ok", 0)
-    partial_hours = by_status.get("partial", 0)
-    no_data_hours = by_status.get("no_data", 0)
-    not_running_hours = by_status.get("not_running", 0)
+    extents = fetch_point_extents(conn, start, end, scope)
+    ok_hours = sum(int(r["ok_hours"]) for r in extents)
+    partial_hours = sum(int(r["partial_hours"]) for r in extents)
+    no_data_hours = sum(r["no_data_hours"] for r in extents)
+    not_running_hours = sum(int(r["not_running_hours"]) for r in extents)
     total_hours = ok_hours + partial_hours + no_data_hours + not_running_hours
 
     def _ratio(n: int) -> float:
@@ -370,28 +460,13 @@ def _fetch_coverage_gaps(
 
     只列出真正需要人看的項目（斷線、資料不全、備機閒置超標），
     正常運轉的量測點不出現在清單裡。
+
+    斷線分兩種：結尾還連續缺資料超過 `_GAP_OFFLINE_MIN_HOURS` 的是 `offline`（還在斷線，
+    「自何時起、已連續多久」），其餘是 `recovered`（本期缺過資料，現在已經恢復）。
+    缺口長度量到全廠資料所及之處，不是量到報告窗口結尾（見 `_fetch_data_horizon`）。
     """
-    sql = """
-        SELECT
-            mp.point_id, mp.position, d.device_id, d.device_name,
-            d.building, d.floor, d.system_name, d.is_standby,
-            COUNT(*) FILTER (WHERE ma.data_status = 'no_data')      AS no_data_hours,
-            COUNT(*) FILTER (WHERE ma.data_status = 'partial')      AS partial_hours,
-            COUNT(*) FILTER (WHERE ma.data_status = 'ok')           AS ok_hours,
-            MAX(ma.ts_hour) FILTER (WHERE ma.data_status IN ('ok','partial')) AS last_data_at
-        FROM measurement_agg ma
-        JOIN measure_point mp ON mp.point_id = ma.point_id
-        JOIN device d ON d.device_id = mp.device_id
-        WHERE ma.ts_hour >= %(start)s AND ma.ts_hour < %(end)s
-          AND d.status = 'active' AND mp.is_active
-    """ + _scope_sql("d") + """
-        GROUP BY mp.point_id, mp.position, d.device_id, d.device_name,
-                 d.building, d.floor, d.system_name, d.is_standby
-        ORDER BY no_data_hours DESC, partial_hours DESC
-    """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, {"start": start, "end": end, **scope.params})
-        rows = [dict(r) for r in cur.fetchall()]
+    extents = fetch_point_extents(conn, start, end, scope)
+    rows = sorted(extents, key=lambda r: (-r["no_data_hours"], -int(r["partial_hours"])))
 
     period_end_dt = datetime(period_end.year, period_end.month, period_end.day, tzinfo=timezone.utc) + timedelta(days=1)
 
@@ -401,17 +476,25 @@ def _fetch_coverage_gaps(
         location = _location_label(row)
 
         if row["no_data_hours"] >= _GAP_NO_DATA_MIN_HOURS:
-            last_data_at = row.get("last_data_at")
-            gap_since = last_data_at if last_data_at is not None else start
-            gap_hours = max(0.0, (period_end_dt - gap_since).total_seconds() / 3600.0)
-            gaps.append({
-                "kind": "offline",
-                "device_label": label,
-                "location": location,
-                "since": gap_since,
-                "gap_hours": gap_hours,
-                "no_data_hours": row["no_data_hours"],
-            })
+            last_data_ts = row.get("last_data_ts")
+            gap_since = (last_data_ts + timedelta(hours=1)) if last_data_ts is not None else max(start, row["first_ts"])
+            gap_hours = float(_hours_between(gap_since, row["eff_end"]))
+            if gap_hours >= _GAP_OFFLINE_MIN_HOURS:
+                gaps.append({
+                    "kind": "offline",
+                    "device_label": label,
+                    "location": location,
+                    "since": gap_since,
+                    "gap_hours": gap_hours,
+                    "no_data_hours": row["no_data_hours"],
+                })
+            else:
+                gaps.append({
+                    "kind": "recovered",
+                    "device_label": label,
+                    "location": location,
+                    "no_data_hours": row["no_data_hours"],
+                })
 
         if row["partial_hours"] >= _GAP_PARTIAL_MIN_HOURS:
             gaps.append({

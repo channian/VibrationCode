@@ -473,7 +473,7 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
 <section>
   <div class="sechead">
     <h2>{{ period_word }}新發現</h2>
-    <span class="count mono">{{ new_findings|length }} 件</span>
+    <span class="count mono">{{ new_count }} 件</span>
     <span class="src">系統依資料庫判定</span>
   </div>
   {% if new_findings %}
@@ -486,7 +486,7 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
 <section>
   <div class="sechead">
     <h2>追蹤中</h2>
-    <span class="count mono">{{ tracking_findings|length }} 件</span>
+    <span class="count mono">{{ tracking_count }} 件</span>
     <span class="src">依簽核進度</span>
   </div>
   {% if tracking_findings %}
@@ -570,6 +570,7 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
   {% endif %}
 </section>
 
+{% if agent_present %}
 <section>
   <div class="sechead">
     <h2>觀察與建議</h2>
@@ -583,12 +584,14 @@ WEEKLY_REPORT_TEMPLATE = r"""<!doctype html>
   <p class="empty">{{ period_word }}無額外觀察與建議。</p>
   {% endif %}
 </section>
+{% endif %}
 
 <footer>
   本報告由設備振動監測系統自動產生（產出時間 {{ generated_at_label }} UTC+8）。
   異常判定、嚴重度分級與簽核狀態由規則引擎依現行門檻設定計算；
-  「觀察與建議」一節由 Agent 依上述判定結果撰寫，不含故障類型判定。
-  深度診斷請另行安排專家量測系統。
+  {% if agent_present %}「觀察與建議」一節由 Agent 依上述判定結果撰寫，不含故障類型判定。
+  {% else %}本期未附 Agent 導讀，版面上的數字與文字全部來自資料庫與規則引擎。
+  {% endif %}深度診斷請另行安排專家量測系統。
 </footer>
 
 </div>

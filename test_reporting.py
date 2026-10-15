@@ -28,6 +28,7 @@ test_reporting.py — 報表層（vibcore.reporting）與 send_report 的驗收�
 
 import argparse
 import datetime as dt
+import json
 import logging
 import os
 import re
@@ -246,6 +247,162 @@ def test_scope(conn) -> None:
     check("範圍查無設備時全部為空，不報錯",
           z["stats"]["new_count"] == 0 and z["coverage"]["total_hours"] == 0
           and z["coverage_gaps"] == [])
+
+
+def test_coverage_calendar(conn) -> None:
+    """涵蓋率以日曆為準：感測器停掉之後根本沒有列的小時，也要算缺資料；窗口超出資料所及之處不算缺。"""
+    from vibcore.reporting import collect_weekly_data
+    from vibcore.api import service
+
+    print("\n[1b] 涵蓋率：死掉的感測器不能從分母裡消失")
+    today = dt.date.today()
+    start = today - dt.timedelta(days=6)
+    base = collect_weekly_data(conn, start, today)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SET search_path TO vib, public;
+            INSERT INTO device (device_id, device_name, building, floor, system_name, status, is_standby)
+            VALUES ('DEAD-1', '停掉的泵', 'A棟', '6F', '空調', 'active', false),
+                   ('REC-1',  '缺過又恢復的泵', 'A棟', '6F', '空調', 'active', false);
+            INSERT INTO measure_point (device_id, position, is_active)
+            VALUES ('DEAD-1', 'M1', true), ('REC-1', 'M1', true);
+        """)
+        cur.execute("SELECT point_id, device_id FROM measure_point WHERE device_id IN ('DEAD-1', 'REC-1')")
+        pid = {r["device_id"]: r["point_id"] for r in cur.fetchall()}
+        win0 = f"(date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' - interval '6 day')"
+        # DEAD-1：窗口前 72 小時正常，之後完全沒有列（不是 no_data 列，是根本沒有）
+        cur.execute(f"""
+            INSERT INTO measurement_agg (point_id, ts_hour, data_status, completeness, n_samples_total,
+                                         n_samples_running, vel_rms)
+            SELECT %s, generate_series({win0}, {win0} + interval '71 hour', interval '1 hour'),
+                   'ok', 1.0, 360, 360, 2.0
+        """, (pid["DEAD-1"],))
+        # REC-1：整個窗口都有列，中間有 5 小時 no_data，之後恢復一路到最後
+        cur.execute(f"""
+            INSERT INTO measurement_agg (point_id, ts_hour, data_status, completeness, n_samples_total,
+                                         n_samples_running, vel_rms)
+            SELECT %s, g, CASE WHEN g >= {win0} + interval '40 hour' AND g < {win0} + interval '45 hour'
+                               THEN 'no_data' ELSE 'ok' END, 1.0, 360, 360, 2.0
+            FROM generate_series({win0}, date_trunc('hour', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+                                 interval '1 hour') g
+        """, (pid["REC-1"],))
+    conn.commit()
+
+    d = collect_weekly_data(conn, start, today)
+    gaps = {g["device_label"]: g for g in d["coverage_gaps"]}
+    dead = gaps.get("DEAD-1 / M1")
+    rec = gaps.get("REC-1 / M1")
+    win_start = dt.datetime.combine(start, dt.time.min, tzinfo=dt.timezone.utc)
+    check("死掉的感測器（之後完全沒有列）出現在資料品質清單，標為還在斷線",
+          dead is not None and dead["kind"] == "offline", str(sorted(gaps)))
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(ts_hour) AS t FROM measurement_agg WHERE data_status <> 'no_data'")
+        horizon_end = cur.fetchone()["t"] + dt.timedelta(hours=1)
+    since = win_start + dt.timedelta(hours=72)
+    check("斷線起點是最後一筆資料的下一個小時（窗口起點 + 72 小時），已連續的時數量到全廠資料所及之處"
+          "（不是量到窗口結尾）",
+          dead is not None and dead["since"] == since
+          and dead["gap_hours"] == int((horizon_end - since).total_seconds() // 3600), str(dead))
+    added = d["coverage"]["no_data_hours"] - base["coverage"]["no_data_hours"]
+    check("涵蓋率的缺資料小時數把這些根本沒有列的小時算進去（只數既有的列會偏高）",
+          dead is not None and added >= dead["gap_hours"] + 5, f"新增 {added} 小時")
+    check("死掉的點在分母裡佔滿整個窗口（72 小時有資料 ＋ 之後缺的小時），不是只佔 72 小時",
+          dead is not None and d["coverage"]["total_hours"] - base["coverage"]["total_hours"]
+          >= 72 + dead["gap_hours"],
+          f'{d["coverage"]["total_hours"]} vs {base["coverage"]["total_hours"]}')
+    check("缺過又恢復的點標為「已恢復」，不是「已連續 N 小時無資料」",
+          rec is not None and rec["kind"] == "recovered" and rec["no_data_hours"] >= 5, str(rec))
+    check("資料到全廠最新一筆的點不會因為窗口算到隔天零時而被標成斷線",
+          "AHU-601 / M1" not in gaps, str(sorted(gaps)))
+
+    api = service.get_weekly_report_data(conn, days=7)
+    bad_points = {(p["device_id"]) for p in api["coverage"]["points_with_insufficient_data"]}
+    check("API 的涵蓋率摘要用同一套算法：死掉的點被列為資料不足",
+          "DEAD-1" in bad_points, str(bad_points))
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM device WHERE device_id IN ('DEAD-1', 'REC-1')")
+    conn.commit()
+
+
+def test_outage_group_and_labels(conn) -> None:
+    """共因中斷合併卡、沒有 Agent 時不掛 Agent 標籤、空值不顯示。"""
+    from vibcore.reporting import collect_weekly_data, render_weekly_html
+    from vibcore.reporting.render import _evidence_display, _group_common_cause_offline
+
+    print("\n[1c] 版面：共因中斷合併、無 Agent 的誠實標示、空證據不顯示")
+
+    def f(key, label, t, rule="SENSOR_OFFLINE", hours=200):
+        return {"finding_key": key, "rule_code": rule, "severity": "err", "device_label": label,
+                "location": "A棟", "title": "感測器逾時無資料", "detail": "d", "interpretation_limit": "x",
+                "evidence": {"last_data_at": t, "hours_since_last_data": hours} if t else {},
+                "first_seen_at": dt.datetime(2026, 10, 1, tzinfo=dt.timezone.utc),
+                "reply_deadline": dt.datetime(2026, 10, 6, tzinfo=dt.timezone.utc),
+                "escalated": False, "is_overdue": False, "status": "open", "stage_label": "待回覆"}
+
+    items = [f("k1", "A / M1", "2026-09-22 17:00:00+08:00"),
+             f("k2", "B / M1", "2026-09-22 16:00:00+08:00"),
+             f("kx", "X / M1", "2026-09-09 11:00:00+08:00"),            # 離群：兩週前就停了
+             f("kv", "V / M1", None, rule="VEL_HIGH"),                   # 別的規則
+             f("k3", "C / M1", "2026-09-22 15:00:00+08:00"),
+             f("k4", "D / M1", "2026-09-22 17:00:00+08:00")]
+    out = _group_common_cause_offline(items)
+    grp = [x for x in out if x.get("_members")]
+    check("同一時段停止的 4 個點合併成一張，離群的與別的規則維持單獨一張（6 件 → 3 張）",
+          len(out) == 3 and len(grp) == 1 and len(grp[0]["_members"]) == 4
+          and {x["finding_key"] for x in out} >= {"kx", "kv"}, str([x["finding_key"] for x in out]))
+    check("合併卡放在它涵蓋的第一件的位置，其餘順序不變",
+          [x["finding_key"].split(":")[0] for x in out][0] == "group", str([x["finding_key"] for x in out]))
+    check("不到 3 個點同時停止時不合併", _group_common_cause_offline(items[:2]) == items[:2])
+    check("空值不顯示（None、空字串、空容器、全空的巢狀容器）",
+          _evidence_display({"evidence": {"a": None, "b": 1, "c": {"x": None, "y": 2}, "d": [], "e": {"z": None}}})
+          == [("b", "1"), ("c", "y 2")])
+
+    # 端到端：資料庫裡有 4 件同時停止的離線事項 ＋ 1 件離群的
+    with conn.cursor() as cur:
+        cur.execute("SET search_path TO vib, public")
+        for i, hhmm in enumerate(["17:00", "17:00", "16:00", "15:00", None]):
+            dev = f"OFF-{i}"
+            cur.execute("INSERT INTO device (device_id, device_name, building, floor, system_name) "
+                        "VALUES (%s, %s, 'C棟', '2F', '冰水')", (dev, dev))
+            cur.execute("INSERT INTO measure_point (device_id, position, is_active) VALUES (%s, 'M1', true) "
+                        "RETURNING point_id", (dev,))
+            pid = cur.fetchone()["point_id"]
+            last = f"2026-09-22 {hhmm}:00+08:00" if hhmm else "2026-09-09 11:00:00+08:00"
+            cur.execute("""
+                INSERT INTO finding (finding_key, device_id, point_id, target_type, target, issue_type, family,
+                                     rule_code, title, severity, peak_severity, status, first_seen_at, last_seen_at,
+                                     stage_entered_at, evidence, interpretation_limit)
+                VALUES (%s, %s, %s, 'point', %s, 'sensor_offline', 'event', 'SENSOR_OFFLINE', '感測器逾時無資料',
+                        'err', 'err', 'open', now(), now(), now(), %s::jsonb, '斷線期間不代表設備正常')
+            """, (f"point:{dev}_M1:sensor_offline", dev, pid, f"{dev}_M1",
+                  json.dumps({"last_data_at": last, "hours_since_last_data": 200 + i, "hours_threshold": 24,
+                              "last_data_at_is_lower_bound": False, "note": None})))
+    conn.commit()
+    today = dt.date.today()
+    data = collect_weekly_data(conn, today - dt.timedelta(days=6), today)
+    html = render_weekly_html(data, None, "weekly")
+    new_n = data["stats"]["new_count"]
+    check("端到端：合併卡出現，標題帶點數，且說明資料庫裡仍是個別事項",
+          "4 個量測點約在同一時間停止送資料" in html and "仍是 4 件個別事項" in html)
+    check("合併卡逐點列出最後資料時間；離群的那一件仍是單獨一張卡",
+          "最後資料 09/22 17:00" in html and "OFF-4" in html and html.count("感測器逾時無資料") >= 1)
+    check("區塊的件數仍是資料庫的真實件數（不因合併而變少）",
+          f'<span class="count mono">{new_n} 件</span>' in html, f"new_count={new_n}")
+    check("證據欄沒有「note None」這種空值行（卡片上的證據是給人讀的）", "note None" not in html)
+
+    # 沒有 Agent 時不能掛著 Agent 的標籤
+    check("無 Agent 導讀：版面沒有「Agent 撰寫」，頁尾寫明本期未附導讀",
+          "Agent 撰寫" not in html and "本期未附 Agent 導讀" in html and "由 Agent 依上述判定結果撰寫" not in html)
+    with_agent = render_weekly_html(data, {"verdict": "err", "headline": "測試", "notes": "補充說明"}, "weekly")
+    check("有 Agent 導讀時照舊標示",
+          "Agent 撰寫" in with_agent and "由 Agent 依上述判定結果撰寫" in with_agent and "補充說明" in with_agent)
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM finding WHERE device_id LIKE 'OFF-%'")
+        cur.execute("DELETE FROM device WHERE device_id LIKE 'OFF-%'")
+    conn.commit()
 
 
 def test_render(conn) -> None:
@@ -497,6 +654,8 @@ def main() -> int:
 
     try:
         test_scope(conn)
+        test_coverage_calendar(conn)
+        test_outage_group_and_labels(conn)
         test_render(conn)
         test_cli(conn)
         test_api(conn)

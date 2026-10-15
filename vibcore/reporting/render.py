@@ -157,13 +157,24 @@ def _humanize_key(key: str) -> str:
     return key.replace("_", " ")
 
 
+def _is_blank(v: Any) -> bool:
+    """None、空字串、空容器、以及內容全是空的容器。"""
+    if v is None or v == "":
+        return True
+    if isinstance(v, dict):
+        return all(_is_blank(x) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return all(_is_blank(x) for x in v)
+    return False
+
+
 def _fmt_evidence_value(v: Any) -> str:
     if isinstance(v, (int, float, Decimal)):
         return _fmt_num(v)
     if isinstance(v, dict):
-        return "、".join(f"{k} {_fmt_evidence_value(val)}" for k, val in v.items())
+        return "、".join(f"{k} {_fmt_evidence_value(val)}" for k, val in v.items() if not _is_blank(val))
     if isinstance(v, (list, tuple)):
-        return "、".join(_fmt_evidence_value(x) for x in v)
+        return "、".join(_fmt_evidence_value(x) for x in v if not _is_blank(x))
     return str(v)
 
 
@@ -179,6 +190,10 @@ def _evidence_display(item: dict[str, Any]) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     evidence = item.get("evidence") or {}
     for k, v in evidence.items():
+        # 空值（None／空字串／空容器）不顯示：一張卡片上七八行「machine class None」「bc boundary None」
+        # 沒有資訊量，只會把真正的數字淹掉。
+        if _is_blank(v):
+            continue
         out.append((_humanize_key(k), _fmt_evidence_value(v)))
     if not out and item.get("current_value") is not None:
         unit = item.get("value_unit") or ""
@@ -242,6 +257,110 @@ def _match_action(finding_key: str, actions_index: dict[str, dict], severity: st
 # 卡片呈現
 # ──────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────
+# 共因中斷合併（只影響版面）
+# ──────────────────────────────────────────────────────────
+
+#: 約在同一時間停止送資料的量測點，至少幾個才合併成一張卡
+_OUTAGE_GROUP_MIN = 3
+#: 「同一時間」＝最後一筆資料的時間彼此（依序）相差不超過幾小時
+_OUTAGE_GROUP_GAP_HOURS = 3
+
+
+def _last_data_time(item: dict[str, Any]) -> datetime | None:
+    raw = (item.get("evidence") or {}).get("last_data_at")
+    if not raw:
+        return None
+    try:
+        t = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    return t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc)
+
+
+def _group_common_cause_offline(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    把「約在同一時間停止送資料」的 SENSOR_OFFLINE 事項合併成一張卡。
+
+    實測第一份週報有 14 件「感測器逾時無資料」，其中 13 件的最後一筆資料落在同一個三小時內——
+    那是收集端或匯出的共同原因，不是 13 個感測器剛好在同一刻壞掉。14 張一模一樣的紅色卡片會把
+    其他內容淹沒，也會讓人一台一台跑現場。
+
+    **只影響版面**：資料庫裡仍是逐件事項，各自走簽核、各自自動結案；合併卡明說了這一點。
+    不夠 `_OUTAGE_GROUP_MIN` 個、或最後資料時間離群的（例如另一台早在兩週前就停了）維持單獨一張。
+    合併卡放在它涵蓋的第一件所在的位置。
+    """
+    timed = [(t, f) for f in findings
+             if f.get("rule_code") == "SENSOR_OFFLINE" and (t := _last_data_time(f)) is not None]
+    timed.sort(key=lambda x: x[0])
+    clusters: list[list[tuple[datetime, dict]]] = []
+    for t, f in timed:
+        if clusters and (t - clusters[-1][-1][0]) <= timedelta(hours=_OUTAGE_GROUP_GAP_HOURS):
+            clusters[-1].append((t, f))
+        else:
+            clusters.append([(t, f)])
+    groups = [c for c in clusters if len(c) >= _OUTAGE_GROUP_MIN]
+    if not groups:
+        return findings
+
+    member_ids = {id(f) for c in groups for _, f in c}
+    group_at: dict[int, list[tuple[datetime, dict]]] = {}
+    for c in groups:
+        first_in_list = min((f for _, f in c), key=lambda f: findings.index(f))
+        group_at[id(first_in_list)] = c
+
+    out: list[dict[str, Any]] = []
+    for f in findings:
+        if id(f) in group_at:
+            out.append(_outage_group_item(group_at[id(f)]))
+        elif id(f) not in member_ids:
+            out.append(f)
+    return out
+
+
+def _outage_group_item(cluster: list[tuple[datetime, dict]]) -> dict[str, Any]:
+    members = [f for _, f in cluster]
+    first = members[0]
+    t_first, t_last = cluster[0][0], cluster[-1][0]
+    when = (_fmt_datetime(t_first) if t_first == t_last
+            else f"{_fmt_datetime(t_first)} ～ {_fmt_datetime(t_last)}")
+    deadlines = [m["reply_deadline"] for m in members if m.get("reply_deadline") is not None]
+    firsts = [m["first_seen_at"] for m in members if m.get("first_seen_at") is not None]
+    return {
+        "finding_key": f"group:sensor_offline:{first['finding_key']}",
+        "rule_code": "SENSOR_OFFLINE",
+        "severity": max((m["severity"] for m in members), key=lambda s_: 0 if s_ == "warn" else 1),
+        "device_label": f"{len(members)} 個量測點",
+        "location": first.get("location") or "",
+        "title": f"{len(members)} 個量測點約在同一時間停止送資料",
+        "detail": (f"這些量測點的最後一筆資料都落在 {when}（UTC+8）。同一個時段先後停止，"
+                   f"比較像資料收集或匯出那一端的共同原因，而不是各自的感測器同時故障。"
+                   f"請先確認這批設備的來源檔案在那之後是否還有資料；收集端確認正常後，才需要到現場。"
+                   f"（資料庫中仍是 {len(members)} 件個別事項，逐件走簽核與自動結案；這裡只是合併顯示。）"),
+        "interpretation_limit": first.get("interpretation_limit") or "",
+        "evidence": {},
+        "first_seen_at": min(firsts) if firsts else first.get("first_seen_at"),
+        "last_seen_at": first.get("last_seen_at"),
+        "assignee_name": None,
+        "reply_deadline": min(deadlines) if deadlines else None,
+        "escalated": any(m.get("escalated") for m in members),
+        "is_overdue": any(m.get("is_overdue") for m in members),
+        "overdue_days": max((m.get("overdue_days") or 0 for m in members), default=0) or None,
+        "days_open": max((m.get("days_open") or 0 for m in members), default=0),
+        "days_in_stage": max((m.get("days_in_stage") or 0 for m in members), default=0),
+        "sla_days": first.get("sla_days"),
+        "status": first.get("status", "open"),
+        "stage_label": first.get("stage_label", ""),
+        "latest_note": None,
+        "occurrence_count": 1,
+        "_members": [
+            (m["device_label"], t) for t, m in cluster
+        ],
+        "_hours": {m["device_label"]: (m.get("evidence") or {}).get("hours_since_last_data") for m in members},
+    }
+
+
+
 def _present_open_finding(item: dict[str, Any], action: dict | None, kind: str) -> dict[str, Any]:
     title = item["title"]
     narrative = item.get("detail") or ""
@@ -293,6 +412,16 @@ def _present_open_finding(item: dict[str, Any], action: dict | None, kind: str) 
 
     occurrence_suffix = f"（第 {item['occurrence_count']} 次提出）" if kind == "tracking" else ""
 
+    if item.get("_members"):
+        # 合併卡：證據欄逐點列出最後資料時間與已中斷多久
+        hours = item.get("_hours") or {}
+        evidence = []
+        for label, t in item["_members"]:
+            h = hours.get(label)
+            evidence.append((label, f"最後資料 {_fmt_datetime(t)}" + (f"，已 {_fmt_hours(float(h))}" if h is not None else "")))
+    else:
+        evidence = _evidence_display(item)
+
     return {
         "severity": item["severity"],
         "severity_label": SEVERITY_LABELS.get(item["severity"], item["severity"]),
@@ -301,7 +430,7 @@ def _present_open_finding(item: dict[str, Any], action: dict | None, kind: str) 
         "flags": flags,
         "title": title,
         "occurrence_suffix": occurrence_suffix,
-        "evidence": _evidence_display(item),
+        "evidence": evidence,
         "narrative": narrative,
         "limit_text": limit_text,
         "reply": reply,
@@ -398,6 +527,9 @@ def _gap_sentence(gap: dict[str, Any], period_word: str) -> str:
         since_label = _fmt_datetime(gap["since"])
         return (f"自 {since_label} 起無資料，已連續 {_fmt_hours(gap['gap_hours'])}。"
                 f"{period_word}該點所有指標未評估。")
+    if gap["kind"] == "recovered":
+        return (f"{period_word}累計 {gap['no_data_hours']} 小時無資料，目前已恢復。"
+                f"該時段指標未評估。")
     if gap["kind"] == "partial":
         return f"本期累計 {gap['partial_hours']} 小時資料不全，該時段指標已標記為不可信。"
     if gap["kind"] == "standby":
@@ -540,6 +672,9 @@ def render_weekly_html(
         完整、樣式內嵌的 HTML 字串（可直接存檔或作為 email HTML 內文寄送）。
     """
     agent_payload = agent_payload or {}
+    # 沒有 Agent 導讀時（例如 `python -m vibcore.reporting.cli`），版面不能掛著「Agent 撰寫」的標籤，
+    # 頁尾也不能寫「由 Agent 撰寫」——那會讓讀者以為有模型參與，而這份報告全部來自資料庫與規則引擎。
+    agent_present = any(agent_payload.get(k) for k in ("verdict", "headline", "notes", "actions"))
     labels = _REPORT_LABELS.get(report_type)
     if labels is None:
         logger.warning("report_type=%r 不是合法值，退回 weekly 用語", report_type)
@@ -551,11 +686,11 @@ def render_weekly_html(
 
     new_findings = [
         _present_open_finding(f, _match_action(f["finding_key"], actions_index, f["severity"]), "new")
-        for f in data["new_findings"]
+        for f in _group_common_cause_offline(data["new_findings"])
     ]
     tracking_findings = [
         _present_open_finding(f, _match_action(f["finding_key"], actions_index, f["severity"]), "tracking")
-        for f in data["tracking_findings"]
+        for f in _group_common_cause_offline(data["tracking_findings"])
     ]
     resolved_findings = [_present_resolved_finding(f) for f in data["resolved_findings"]]
 
@@ -604,6 +739,8 @@ def render_weekly_html(
             period_word, labels["this_report"],
         ),
         "new_findings": new_findings,
+        "new_count": len(data["new_findings"]),
+        "tracking_count": len(data["tracking_findings"]),
         "tracking_findings": tracking_findings,
         "resolved_findings": resolved_findings,
         "observations": observations,
@@ -612,6 +749,7 @@ def render_weekly_html(
         ),
         "scope_label": (data.get("scope") or {}).get("label") or "",
         "notes_paragraphs": notes_paragraphs,
+        "agent_present": agent_present,
         "generated_at_label": _fmt_datetime(datetime.now(timezone.utc)),
     }
 
