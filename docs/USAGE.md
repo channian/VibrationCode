@@ -484,7 +484,7 @@ python -m vibcore.reporting.cli --days 7 --out output/weekly.html --save
 
 ## 六、串接 Agent 平台（Profet AI）
 
-1. 把 `docs/agent_prompt_weekly.md` 的系統提示貼進工作流
+1. 把系統提示貼進工作流：模型為 Qwen 用 `docs/agent_prompt_weekly_qwen.md`，其他模型用 `docs/agent_prompt_weekly.md`
 2. 依 `docs/agent_tools.md` 設定 8 支工具的呼叫（Base URL、`X-VIB-API-Key`）
 3. 平台端設定排程（週報每週一次、日報每日一次）
 

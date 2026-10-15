@@ -588,11 +588,14 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
 | `detail` | string | 否 | 最多 1000 字元，說明文字 |
 | `suggestion` | string | 否 | 最多 500 字元，建議的下一步 |
 | `target_type` | `"device"` \| `"point"` \| `"global"` | 否 | 與下兩欄合組 `finding_key` |
-| `target` | string | 否 | 例如 `AHU-601/M1` |
-| `issue_type` | string | 否 | 例如 `VEL_HIGH` |
+| `target` | string | 否 | 例如 `AHU-601_M1`（量測點為「設備_位置」，底線相接） |
+| `issue_type` | string | 否 | 例如 `vel_high`（小寫，與 `finding_key` 最後一段相同） |
 | `text` | string | 否 | **舊版契約欄位，等同 `title`**，保留以免既有呼叫端中斷；新呼叫請改用 `title` |
 
 ※ `title` 與 `text` 至少要給一個，否則 422；兩者都給時以 `title` 為準。
+
+**最穩的填法：把該事項的 `finding_key` 依 `:` 拆成三段原樣填入**（例如 `point:AHU-601_M1:impact_rise`
+→ `target_type=point`、`target=AHU-601_M1`、`issue_type=impact_rise`），不要自己重組、不要改大小寫。
 
 `target_type`/`target`/`issue_type` 三者組成 `{target_type}:{target}:{issue_type}`，
 系統據此把你寫的敘述掛到對應的事項卡片上。**對應不到未結案事項的 action 會被
@@ -614,13 +617,13 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
       "title": "AHU-601 M1 衝擊性指標持續上升",
       "detail": "accKURT 由 3.1 升至 4.6，已連續 5 日。",
       "suggestion": "安排專家系統複測。",
-      "target_type": "point", "target": "AHU-601/M1", "issue_type": "IMPACT_RISE"
+      "target_type": "point", "target": "AHU-601_M1", "issue_type": "impact_rise"
     },
     {
       "level": "err",
       "title": "AHU-602 M1 感測器離線已逾 48 小時",
       "suggestion": "請確認接線與供電。",
-      "target_type": "point", "target": "AHU-602/M1", "issue_type": "SENSOR_OFFLINE"
+      "target_type": "point", "target": "AHU-602_M1", "issue_type": "sensor_offline"
     }
   ],
   "notes": "本日資料涵蓋率正常，AHU-602 涵蓋率不足（見 get_weekly_report_data）"
@@ -644,7 +647,7 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
       "text": "AHU-601 M1 衝擊性指標持續上升",
       "detail": "accKURT 由 3.1 升至 4.6，已連續 5 日。",
       "suggestion": "安排專家系統複測。",
-      "target_type": "point", "target": "AHU-601/M1", "issue_type": "IMPACT_RISE"
+      "target_type": "point", "target": "AHU-601_M1", "issue_type": "impact_rise"
     }
   ],
   "notes": "本日資料涵蓋率正常，AHU-602 涵蓋率不足（見 get_weekly_report_data）",

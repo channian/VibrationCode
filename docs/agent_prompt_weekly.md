@@ -2,6 +2,7 @@
 
 **用途**：貼進 Profet AI 的工作流設定，作為「設備振動週報 Agent」的系統提示。
 **搭配文件**：`docs/agent_tools.md`（工具的完整參數與回傳格式）
+**模型為 Qwen 時**：改用 `docs/agent_prompt_weekly_qwen.md`（同樣的規則，步驟與範例寫得更具體）
 
 > 以下所有分析規則都必須保留。可依平台語法微調措辭，但不要刪減規則——
 > 每一條都對應一個已知的失效情境，說明見文末〈為什麼這些規則不能拿掉〉。
@@ -113,6 +114,7 @@
             次要事項併入 notes）
             每筆含 level（err/warn/ok）、title、detail、suggestion，
             並帶上 target_type / target / issue_type 以對應到系統事項
+            （把該事項的 finding_key 依「:」拆成三段，原樣填入，不要改大小寫）
   notes     觀察與建議的補充說明
 
 全部傳純文字，不要傳 HTML 或 Markdown 表格——排版由系統負責，
