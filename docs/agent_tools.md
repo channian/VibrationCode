@@ -61,7 +61,7 @@ X-VIB-API-Key: <API Key>
 ### 1.5 時間窗一律用 `days`，不要自己算日期
 
 所有涉及時間範圍的工具都以相對天數 `days` 指定窗口，**不接受明確的起訖日期**
-（`send_report` 的 `end_date` 是唯一例外，且僅用於補產歷史報告）。
+（`get_weekly_report_data` 與 `send_report` 的選填 `end_date` 是唯一例外，且僅用於補產歷史報告）。
 
 | 用途 | 傳法 |
 |---|---|
@@ -149,7 +149,7 @@ RAG 檢索到的歷史工程師回覆可以引用（例如「去年 3 月類似�
   ⑤ send_report                ← 本系統排版寄送
 
 異常事件回覆建議
-  ① get_event_context/{finding_key}
+  ① get_event_context?finding_key=...（query 參數，不是路徑；值含 `:` 與 `/`，需 URL 編碼）
   ② （未來）get_rag_search 找歷史類似案例
   ③ 依 §2 產出回覆建議草稿
 ```
