@@ -190,6 +190,10 @@ class RuleContext:
     now: datetime
     axis_energy_baseline: dict | None = None
     last_data_at: datetime | None = None
+    #: 最後一次有運轉樣本的時刻（由呼叫端從資料庫查得，不受聚合窗口長度限制）。
+    #: 備機門檻（30 天）比正式排程的聚合窗口（約 28 天）還長，只看窗口永遠湊不到門檻。
+    #: 從未運轉過的點，呼叫端傳第一筆資料的時刻當起算點。
+    last_running_at: datetime | None = None
 
     def analyzable(self) -> pd.DataFrame:
         """只取可用於判定的列（data_status == 'ok'）。"""

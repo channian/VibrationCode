@@ -1,0 +1,176 @@
+{
+  "DEV-STABLE": {
+    "expected": [],
+    "expected_missing": [],
+    "events": [
+      {
+        "rule": "STEP_CHANGE",
+        "kind": "observation",
+        "date": "2026-05-08",
+        "expected": false,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": true
+      },
+      {
+        "rule": "SENSOR_OFFLINE",
+        "kind": "finding",
+        "date": "2026-05-31",
+        "expected": false,
+        "also_expected": false,
+        "after_data_end": true,
+        "unplanned": false
+      }
+    ]
+  },
+  "DEV-GAP": {
+    "expected": [
+      "SENSOR_OFFLINE"
+    ],
+    "expected_missing": [],
+    "events": [
+      {
+        "rule": "STEP_CHANGE",
+        "kind": "observation",
+        "date": "2026-05-11",
+        "expected": false,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": true
+      },
+      {
+        "rule": "SENSOR_OFFLINE",
+        "kind": "finding",
+        "date": "2026-05-16",
+        "expected": true,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": false
+      },
+      {
+        "rule": "IMPACT_RISE",
+        "kind": "observation",
+        "date": "2026-05-20",
+        "expected": false,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": true
+      }
+    ]
+  },
+  "DEV-STANDBY": {
+    "expected": [
+      "STANDBY_NO_RUNTIME"
+    ],
+    "expected_missing": [],
+    "events": [
+      {
+        "rule": "STANDBY_NO_RUNTIME",
+        "kind": "finding",
+        "date": "2026-06-19",
+        "expected": true,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": false
+      }
+    ]
+  },
+  "DEV-DEGRADE": {
+    "expected": [
+      "IMPACT_RISE",
+      "VEL_HIGH"
+    ],
+    "expected_missing": [],
+    "events": [
+      {
+        "rule": "IMPACT_RISE",
+        "kind": "observation",
+        "date": "2026-05-15",
+        "expected": true,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": false
+      },
+      {
+        "rule": "STEP_CHANGE",
+        "kind": "observation",
+        "date": "2026-05-15",
+        "expected": false,
+        "also_expected": true,
+        "after_data_end": false,
+        "unplanned": false
+      },
+      {
+        "rule": "DEGRADE_TREND",
+        "kind": "observation",
+        "date": "2026-05-17",
+        "expected": false,
+        "also_expected": true,
+        "after_data_end": false,
+        "unplanned": false
+      },
+      {
+        "rule": "VEL_HIGH",
+        "kind": "finding",
+        "date": "2026-05-25",
+        "expected": true,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": false
+      },
+      {
+        "rule": "SENSOR_OFFLINE",
+        "kind": "finding",
+        "date": "2026-06-15",
+        "expected": false,
+        "also_expected": false,
+        "after_data_end": true,
+        "unplanned": false
+      }
+    ]
+  },
+  "DEV-ORIENT": {
+    "expected": [
+      "ORIENTATION_CHANGE"
+    ],
+    "expected_missing": [],
+    "events": [
+      {
+        "rule": "STEP_CHANGE",
+        "kind": "observation",
+        "date": "2026-05-11",
+        "expected": false,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": true
+      },
+      {
+        "rule": "ORIENTATION_CHANGE",
+        "kind": "finding",
+        "date": "2026-05-21",
+        "expected": true,
+        "also_expected": false,
+        "after_data_end": false,
+        "unplanned": false
+      },
+      {
+        "rule": "AXIS_SHIFT",
+        "kind": "observation",
+        "date": "2026-05-24",
+        "expected": false,
+        "also_expected": true,
+        "after_data_end": false,
+        "unplanned": false
+      },
+      {
+        "rule": "SENSOR_OFFLINE",
+        "kind": "finding",
+        "date": "2026-05-31",
+        "expected": false,
+        "also_expected": false,
+        "after_data_end": true,
+        "unplanned": false
+      }
+    ]
+  }
+}

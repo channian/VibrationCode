@@ -378,3 +378,49 @@ def detect_baseline(agg: pd.DataFrame,
         f"窗口完整度={best_ratio:.1%}，候選窗口總數={len(scored)}"
     )
     return best_stats
+
+
+#: 排序後三軸能量佔比的鍵（與 `aggregate._axis_energy_sorted` 一致）
+AXIS_KEYS = ('major', 'mid', 'minor')
+
+
+def compute_axis_energy_baseline(agg: pd.DataFrame, start_date=None, end_date=None,
+                                 min_rows: int = 3) -> dict | None:
+    """
+    三軸能量佔比基準：基準期內可信小時的 `axis_energy_sorted` 逐鍵取中位數，另帶基準期的振動量值（`energy`）。
+
+    `AXIS_SHIFT`、`ORIENTATION_CHANGE` 兩條規則拿它當比對對象；沒有它這兩條規則一律不判定。
+    離線回測（`validate/baseline_stub.py`）一直有算，正式排程過去沒有——那兩條規則在正式環境從來不會觸發，
+    而回測的件數把它們算在內。
+
+    `energy` 讓 ORIENTATION_CHANGE 能判斷當下這組佔比是否在可比的能量水準上算出來的：
+    低能量小時的佔比是雜訊，拿來比對會產生大量假跳變。
+
+    Args:
+        agg: 含 `ts_hour`、`data_status`、`axis_energy_sorted` 的每小時聚合。
+        start_date, end_date: 只取這段日期（含）內的小時，通常是基準期的起訖；None 表示不限。
+        min_rows: 可信小時少於此數就不產生（樣本太少的中位數沒有代表性）。
+    """
+    if agg is None or agg.empty or 'data_status' not in agg.columns or 'axis_energy_sorted' not in agg.columns:
+        return None
+    ok = agg[agg['data_status'] == DataStatus.OK]
+    if start_date is not None or end_date is not None:
+        days = pd.to_datetime(ok['ts_hour']).dt.date
+        if start_date is not None:
+            ok = ok[days >= start_date]
+            days = pd.to_datetime(ok['ts_hour']).dt.date
+        if end_date is not None:
+            ok = ok[days <= end_date]
+    rows = [r for r in ok['axis_energy_sorted'] if isinstance(r, dict)]
+    if len(rows) < min_rows:
+        return None
+    out: dict = {}
+    for k in AXIS_KEYS:
+        vals = [float(r[k]) for r in rows if isinstance(r.get(k), (int, float))]
+        if not vals:
+            return None
+        out[k] = float(pd.Series(vals).median())
+    energies = [float(r['energy']) for r in rows if isinstance(r.get('energy'), (int, float))]
+    if energies:
+        out['energy'] = float(pd.Series(energies).median())
+    return out

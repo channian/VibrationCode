@@ -262,6 +262,16 @@ python -m validate.review_sheet score --sheets output/review_*.csv --csv output/
    的那個轉折點，通常代表門檻附近有一群「剛好卡在邊緣」的正常樣本，是
    比較安全的切點；同時要確認調整後的觸發密度落在第 3 點的可負荷範圍。
 
+## 驗證佐證（認證簡報用）
+
+這三支腳本產生 `docs/evidence/` 裡的原始結果與圖表，詳見 `docs/evidence/README.md`。全部走獨立的 `*_test` 資料庫，不碰正式庫。
+
+| 腳本 | 做什麼 |
+|---|---|
+| `python -m validate.agent_guard_scenarios` | Agent 護欄 9 個情境、61 筆案例：腳本寫好的 payload 打真實 HTTP 端點。證明**機制**生效，不是 Agent 輸出的品質 |
+| `python -m validate.replay_synthetic` | 合成的 5 台已知劇本設備，每天一個只含當天資料的資料夾，逐日跑正式排程，記錄每條規則第一次出現的日期 |
+| `python -m validate.evidence_charts` | 讀上面兩份結果畫四張圖（另一張的數字來自真實回測，常數寫在檔內並標明出處） |
+
 ## 已知限制
 
 - **基準期演算法對「低運轉率設備」很嚴格**（`vibcore.metrics.baseline`）：

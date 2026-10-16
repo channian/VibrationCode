@@ -296,6 +296,22 @@ def upsert_measure_point(
         return cur.fetchone()["point_id"]
 
 
+def get_axis_energy_baseline(conn: Connection, point_id: int) -> dict | None:
+    """`measure_point.axis_energy_baseline`；沒有就 None。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT axis_energy_baseline FROM measure_point WHERE point_id = %s", (point_id,))
+        row = cur.fetchone()
+    value = row["axis_energy_baseline"] if row else None
+    return dict(value) if isinstance(value, dict) else None
+
+
+def set_axis_energy_baseline(conn: Connection, point_id: int, value: dict | None) -> None:
+    """寫入（或以 None 清除）三軸能量佔比基準。基準期重建時要連同重算，所以不是 COALESCE 保留舊值。"""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE measure_point SET axis_energy_baseline = %s WHERE point_id = %s",
+                    (Json(value) if value is not None else None, point_id))
+
+
 def get_points_for_device(
     conn: Connection, device_id: str, active_only: bool = True
 ) -> list[dict]:
@@ -380,6 +396,27 @@ def get_agg(conn: Connection, point_id: int, start: Any, end: Any) -> pd.DataFra
     if not rows:
         return pd.DataFrame(columns=cols)
     return pd.DataFrame([dict(r) for r in rows])
+
+
+def get_point_activity(conn: Connection, point_id: int, as_of: Any) -> dict:
+    """
+    這個量測點截至 `as_of`（含）「最後一次有資料」「最後一次有運轉樣本」「第一筆資料」的時刻。
+
+    規則引擎只拿得到一段有限的聚合窗口（`process_point` 約 28 天），而「逾時無資料」「備機長期未運轉」
+    這類規則要看的是比窗口更長的歷史（備機門檻 30 天就超過窗口）。這兩個時刻因此直接問資料庫，不從窗口推。
+
+    「有資料」的定義與 SENSOR_OFFLINE 一致：`data_status` 不是 `no_data`（ok、partial、not_running 都算有收到）。
+    """
+    sql = """
+        SELECT max(ts_hour) FILTER (WHERE data_status <> 'no_data')   AS last_data_at,
+               max(ts_hour) FILTER (WHERE n_samples_running > 0)      AS last_running_at,
+               min(ts_hour) FILTER (WHERE data_status <> 'no_data')   AS first_data_at
+        FROM measurement_agg
+        WHERE point_id = %s AND ts_hour <= %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (point_id, as_of))
+        return dict(cur.fetchone())
 
 
 def upsert_daily(conn: Connection, point_id: int, daily_df: pd.DataFrame) -> int:

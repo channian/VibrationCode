@@ -42,7 +42,7 @@ from vibcore.config import AggregateConfig, DEFAULT_AGG, DEFAULT_TREND, DataStat
 from vibcore.db import repository as repo
 from vibcore.db.connection import transaction
 from vibcore.io.analytic_reader import load_analytic_dir
-from vibcore.metrics.baseline import detect_baseline
+from vibcore.metrics.baseline import compute_axis_energy_baseline, detect_baseline
 from vibcore.pipeline.aggregate import aggregate_hourly, coverage_report, rollup_daily
 from vibcore.rules import evaluate_all, outcome_to_finding
 from vibcore.types import (
@@ -104,6 +104,8 @@ class DailyRunResult:
     #: 單筆失敗只丟掉那一筆（見 `vibcore.db.connection.transaction`），其餘照常寫入；
     #: 但必須數出來——失敗被吞掉而摘要看起來一切正常，是最危險的狀態。
     persist_errors: list[str] = field(default_factory=list)
+    #: 今天的資料裡沒有它、但資料庫認得的量測點（停止送資料的感測器）。只判定「沒有資料／沒有運轉」兩類規則。
+    silent: list = field(default_factory=list)
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
@@ -120,6 +122,8 @@ class DailyRunResult:
                 f"事項 upsert {self.findings_upserted}、"
                 f"觀察名單（不進 SLA）{self.observed_count}、"
                 f"自動結案 {self.auto_resolved}、標記惡化 {self.escalated}")
+        if self.silent:
+            text += f"；今日無資料的量測點 {len(self.silent)} 個（已判定逾時無資料）"
         if self.persist_errors:
             text += f"；⚠ 寫入失敗 {len(self.persist_errors)} 筆（原因見日誌）"
         return text
@@ -255,6 +259,7 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
         with transaction(conn):
             # ── 基準期：已有就沿用，沒有才嘗試建立 ──
             baseline = repo.get_baseline(conn, point_id)
+            baseline_changed = False
 
             # 保養後既有基準失效（ISO 10816-3 §5.4.1）。若不做這件事，
             # `not_before` 只在「第一次建立基準」時生效——設備大修後既有基準
@@ -266,6 +271,7 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
                 logger.info(f"  {device_id}/{position}：基準期起點 {baseline.start_date} 早於"
                             f"最後一次保養 {last_maint.date()}，捨棄並重建")
                 baseline = None
+                baseline_changed = True
 
             if baseline is None:
                 history = repo.get_agg(conn, point_id,
@@ -282,9 +288,26 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
                     )
                     if baseline is not None:
                         repo.save_baseline(conn, baseline)
+                        baseline_changed = True
                         logger.info(f"  {device_id}/{position}：建立基準期 "
                                     f"{baseline.start_date}~{baseline.end_date}"
                                     f"（{baseline.n_hours} 小時）")
+
+            # ── 三軸能量佔比基準（AXIS_SHIFT／ORIENTATION_CHANGE 的比對對象）──
+            # 存在 measure_point.axis_energy_baseline。基準期重建時連同重算；基準還在但這欄是空的
+            # （這項功能之前建立的點）就補算一次。過去這一欄從來沒有人寫入，兩條規則在正式排程永遠不判定。
+            axis_base = repo.get_axis_energy_baseline(conn, point_id)
+            if baseline is None:
+                if axis_base is not None:
+                    repo.set_axis_energy_baseline(conn, point_id, None)
+                    axis_base = None
+            elif baseline_changed or axis_base is None:
+                span = repo.get_agg(
+                    conn, point_id,
+                    datetime.combine(baseline.start_date, datetime.min.time(), tzinfo=timezone.utc),
+                    datetime.combine(baseline.end_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1))
+                axis_base = compute_axis_energy_baseline(span, baseline.start_date, baseline.end_date)
+                repo.set_axis_energy_baseline(conn, point_id, axis_base)
 
             # ── 規則判定 ──
             # 規則需要看趨勢，因此餵入的是歷史區間而非只有當日
@@ -303,9 +326,11 @@ def process_point(conn, device_meta: dict, df: pd.DataFrame, run_date: date,
                 device=device, point_id=point_id, position=position,
                 agg=rule_agg, baseline=baseline, params={},
                 now=rule_now(window_end),
-                axis_energy_baseline=(baseline.stats.get('axis_energy_sorted')
-                                      if baseline and hasattr(baseline, 'stats') else None),
+                axis_energy_baseline=axis_base,
             )
+            # 「最後一次有資料／有運轉」直接問資料庫：聚合窗口只有約 28 天，備機門檻 30 天
+            # 就超過窗口，只看窗口永遠湊不到（備機長期未運轉在正式排程裡永遠不會觸發）。
+            _attach_activity(conn, ctx)
             # active_only=False：停用的規則要查得到（is_active=False），引擎才跳得過它；
             # 只給啟用中的，停用的規則會因為查不到設定而用程式碼預設值照跑。
             rule_configs = repo.get_rule_configs(conn, active_only=False)
@@ -401,6 +426,68 @@ def rule_now(window_end: datetime) -> datetime:
     補跑到某天的資料，那天的新事項與觀察名單就會缺席該期報告。
     """
     return min(datetime.now(timezone.utc), window_end - timedelta(seconds=1))
+
+
+def _attach_activity(conn, ctx) -> None:
+    """把『最後一次有資料／有運轉』從資料庫查來掛到規則上下文（不受聚合窗口長度限制）。"""
+    act = repo.get_point_activity(conn, ctx.point_id, ctx.now)
+    ctx.last_data_at = act['last_data_at']
+    # 從未運轉過的點，以第一筆資料當起算點（與規則本身的後備邏輯一致）
+    ctx.last_running_at = act['last_running_at'] or act['first_data_at']
+
+
+#: 判定的就是「沒有資料／沒有運轉」的規則。今天沒有資料的量測點只能評估這兩條：
+#: 其餘規則看的是資料本身，拿舊資料重判只會讓早就過去的事件每天重新觸發、永遠不結案。
+ABSENCE_RULES = ['SENSOR_OFFLINE', 'STANDBY_NO_RUNTIME']
+
+
+def process_silent_points(conn, seen_point_ids: set, run_date: date,
+                          errors: list[str] | None = None) -> list[PointResult]:
+    """
+    評估「今天的資料裡沒有它」的量測點。
+
+    `run_daily` 只處理資料夾裡讀到的設備。一個感測器徹底停止送資料後，資料夾裡不再有它的列
+    （或不再有它的檔案），它就從處理名單消失——「逾時無資料」這條規則永遠沒有機會對它評估，
+    等於偵測斷線的機制只在『還有舊檔案留在資料夾』時才會動。這裡補上：對資料庫裡啟用中、
+    曾經有過資料、但今天沒被處理到的量測點，只跑 `ABSENCE_RULES`，資料來源是資料庫既有的聚合。
+
+    從沒有過任何資料的點（剛建檔、尚未接上）不判定，沒有可以比對的基準。
+    """
+    errors = errors if errors is not None else []
+    window_end = run_window_end(run_date)
+    now = rule_now(window_end)
+    window_start = (datetime.combine(run_date, datetime.min.time(), tzinfo=timezone.utc)
+                    - timedelta(days=DEFAULT_TREND.min_days * 2))
+    rule_configs = repo.get_rule_configs(conn, active_only=False)
+    out: list[PointResult] = []
+
+    for device in repo.list_devices(conn):
+        for pt in repo.get_points_for_device(conn, device.device_id):
+            point_id = pt['point_id']
+            if point_id in seen_point_ids:
+                continue
+            res = PointResult(device_id=device.device_id, position=pt['position'], point_id=point_id)
+            try:
+                with transaction(conn):
+                    ctx = RuleContext(
+                        device=device, point_id=point_id, position=pt['position'],
+                        agg=repo.get_agg(conn, point_id, window_start, window_end),
+                        baseline=repo.get_baseline(conn, point_id), params={}, now=now,
+                    )
+                    _attach_activity(conn, ctx)
+                    if ctx.last_data_at is None:
+                        continue
+                    outcomes = evaluate_all(ctx, rule_configs, rule_codes=ABSENCE_RULES)
+                res.triggered = [o.rule_code for o in outcomes if is_actionable(o.severity)]
+                res.observed = [o.rule_code for o in outcomes if not is_actionable(o.severity)]
+                res._outcomes = outcomes             # type: ignore[attr-defined]
+                res._ctx = ctx                       # type: ignore[attr-defined]
+            except Exception as e:
+                logger.error(f"{device.device_id}/{pt['position']} 無資料判定失敗：{e}", exc_info=True)
+                _note_error(errors, f"無資料判定失敗（{device.device_id}/{pt['position']}）：{e}")
+                continue
+            out.append(res)
+    return out
 
 
 def _outcome_to_observation(outcome, ctx) -> repo.Observation:
@@ -666,8 +753,11 @@ def run_daily(conn, data_dir: str, run_date: date | None = None,
         # 單一設備失敗不影響其餘設備（見模組說明）
         result.points.append(process_point(conn, meta, df, run_date, agg_cfg=agg_cfg))
 
+    seen = {p.point_id for p in result.points if p.point_id is not None}
+    result.silent = process_silent_points(conn, seen, run_date, errors=result.persist_errors)
+
     result.findings_upserted, result.escalated, result.observed_count = (
-        persist_findings(conn, result.points, errors=result.persist_errors)
+        persist_findings(conn, result.points + result.silent, errors=result.persist_errors)
     )
     result.auto_resolved = auto_resolve_quiet(conn, quiet_days,
                                               now=rule_now(run_window_end(run_date)),

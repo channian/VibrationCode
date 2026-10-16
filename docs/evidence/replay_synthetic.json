@@ -1,0 +1,148 @@
+{
+ "meta": {
+  "what": "合成資料逐日重放（每天的資料夾只含當天的列）；first_day 是每條規則第一次以『未結案事項』或『觀察項目』出現的重放日期",
+  "days": 55,
+  "first_date": "2026-05-01",
+  "last_date": "2026-06-24"
+ },
+ "first_day": {
+  "observation|DEV-STABLE|STEP_CHANGE": "2026-05-08",
+  "observation|DEV-GAP|STEP_CHANGE": "2026-05-11",
+  "observation|DEV-ORIENT|STEP_CHANGE": "2026-05-11",
+  "observation|DEV-DEGRADE|IMPACT_RISE": "2026-05-15",
+  "observation|DEV-DEGRADE|STEP_CHANGE": "2026-05-15",
+  "finding|DEV-GAP|SENSOR_OFFLINE": "2026-05-16",
+  "observation|DEV-DEGRADE|DEGRADE_TREND": "2026-05-17",
+  "observation|DEV-GAP|IMPACT_RISE": "2026-05-20",
+  "finding|DEV-ORIENT|ORIENTATION_CHANGE": "2026-05-21",
+  "observation|DEV-ORIENT|AXIS_SHIFT": "2026-05-24",
+  "finding|DEV-DEGRADE|VEL_HIGH": "2026-05-25",
+  "finding|DEV-ORIENT|SENSOR_OFFLINE": "2026-05-31",
+  "finding|DEV-STABLE|SENSOR_OFFLINE": "2026-05-31",
+  "finding|DEV-DEGRADE|SENSOR_OFFLINE": "2026-06-15",
+  "finding|DEV-STANDBY|STANDBY_NO_RUNTIME": "2026-06-19"
+ },
+ "findings": [
+  {
+   "device_id": "DEV-ORIENT",
+   "rule_code": "ORIENTATION_CHANGE",
+   "severity": "warn",
+   "status": "auto_resolved",
+   "first_seen_at": "2026-05-21T23:59:59+00:00",
+   "last_seen_at": "2026-05-30T23:59:59+00:00",
+   "occurrence_count": 10
+  },
+  {
+   "device_id": "DEV-DEGRADE",
+   "rule_code": "VEL_HIGH",
+   "severity": "warn",
+   "status": "auto_resolved",
+   "first_seen_at": "2026-05-25T23:59:59+00:00",
+   "last_seen_at": "2026-06-14T23:59:59+00:00",
+   "occurrence_count": 21
+  },
+  {
+   "device_id": "DEV-GAP",
+   "rule_code": "SENSOR_OFFLINE",
+   "severity": "err",
+   "status": "open",
+   "first_seen_at": "2026-05-31T23:59:59+00:00",
+   "last_seen_at": "2026-06-24T23:59:59+00:00",
+   "occurrence_count": 25
+  },
+  {
+   "device_id": "DEV-STABLE",
+   "rule_code": "SENSOR_OFFLINE",
+   "severity": "err",
+   "status": "open",
+   "first_seen_at": "2026-05-31T23:59:59+00:00",
+   "last_seen_at": "2026-06-24T23:59:59+00:00",
+   "occurrence_count": 25
+  },
+  {
+   "device_id": "DEV-ORIENT",
+   "rule_code": "SENSOR_OFFLINE",
+   "severity": "err",
+   "status": "open",
+   "first_seen_at": "2026-05-31T23:59:59+00:00",
+   "last_seen_at": "2026-06-24T23:59:59+00:00",
+   "occurrence_count": 25
+  },
+  {
+   "device_id": "DEV-DEGRADE",
+   "rule_code": "SENSOR_OFFLINE",
+   "severity": "err",
+   "status": "open",
+   "first_seen_at": "2026-06-15T23:59:59+00:00",
+   "last_seen_at": "2026-06-24T23:59:59+00:00",
+   "occurrence_count": 10
+  },
+  {
+   "device_id": "DEV-STANDBY",
+   "rule_code": "STANDBY_NO_RUNTIME",
+   "severity": "warn",
+   "status": "open",
+   "first_seen_at": "2026-06-19T23:59:59+00:00",
+   "last_seen_at": "2026-06-24T23:59:59+00:00",
+   "occurrence_count": 6
+  }
+ ],
+ "observations": [
+  {
+   "device_id": "DEV-STABLE",
+   "rule_code": "STEP_CHANGE",
+   "first_seen_at": "2026-05-08T23:59:59+00:00",
+   "last_seen_at": "2026-05-30T23:59:59+00:00",
+   "occurrence_count": 5
+  },
+  {
+   "device_id": "DEV-GAP",
+   "rule_code": "STEP_CHANGE",
+   "first_seen_at": "2026-05-11T23:59:59+00:00",
+   "last_seen_at": "2026-05-11T23:59:59+00:00",
+   "occurrence_count": 1
+  },
+  {
+   "device_id": "DEV-ORIENT",
+   "rule_code": "STEP_CHANGE",
+   "first_seen_at": "2026-05-11T23:59:59+00:00",
+   "last_seen_at": "2026-05-12T23:59:59+00:00",
+   "occurrence_count": 2
+  },
+  {
+   "device_id": "DEV-DEGRADE",
+   "rule_code": "STEP_CHANGE",
+   "first_seen_at": "2026-05-15T23:59:59+00:00",
+   "last_seen_at": "2026-06-05T23:59:59+00:00",
+   "occurrence_count": 22
+  },
+  {
+   "device_id": "DEV-DEGRADE",
+   "rule_code": "IMPACT_RISE",
+   "first_seen_at": "2026-05-15T23:59:59+00:00",
+   "last_seen_at": "2026-06-14T23:59:59+00:00",
+   "occurrence_count": 31
+  },
+  {
+   "device_id": "DEV-DEGRADE",
+   "rule_code": "DEGRADE_TREND",
+   "first_seen_at": "2026-05-17T23:59:59+00:00",
+   "last_seen_at": "2026-06-14T23:59:59+00:00",
+   "occurrence_count": 29
+  },
+  {
+   "device_id": "DEV-GAP",
+   "rule_code": "IMPACT_RISE",
+   "first_seen_at": "2026-05-20T23:59:59+00:00",
+   "last_seen_at": "2026-05-20T23:59:59+00:00",
+   "occurrence_count": 1
+  },
+  {
+   "device_id": "DEV-ORIENT",
+   "rule_code": "AXIS_SHIFT",
+   "first_seen_at": "2026-05-24T23:59:59+00:00",
+   "last_seen_at": "2026-05-30T23:59:59+00:00",
+   "occurrence_count": 7
+  }
+ ]
+}

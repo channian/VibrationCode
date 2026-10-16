@@ -342,18 +342,22 @@ def standby_no_runtime(ctx: RuleContext) -> RuleOutcome:
         return RuleOutcome.no_trigger(rule_code, issue_type, family)
 
     days_th = float(ctx.params.get('days', 30))
-    d = _asof(ctx.agg, ctx.now)
-    if d.empty or 'n_samples_running' not in d.columns:
-        # 沒有任何聚合資料可供比對——無從判定運轉與否，不硬算。
-        return RuleOutcome.no_trigger(rule_code, issue_type, family)
-
-    running = d[d['n_samples_running'] > 0]
-    if running.empty:
-        # 觀測範圍內從未偵測到運轉樣本：以資料起點當作「已知未運轉」的
-        # 起算點（無法斷言更早之前的狀態），而不是憑空給一個 0 天。
-        last_run = d['ts_hour'].min()
+    if ctx.last_running_at is not None:
+        # 呼叫端從資料庫查得的（不受聚合窗口長度限制）。
+        last_run = ctx.last_running_at
     else:
-        last_run = running['ts_hour'].max()
+        d = _asof(ctx.agg, ctx.now)
+        if d.empty or 'n_samples_running' not in d.columns:
+            # 沒有任何聚合資料可供比對——無從判定運轉與否，不硬算。
+            return RuleOutcome.no_trigger(rule_code, issue_type, family)
+
+        running = d[d['n_samples_running'] > 0]
+        if running.empty:
+            # 觀測範圍內從未偵測到運轉樣本：以資料起點當作「已知未運轉」的
+            # 起算點（無法斷言更早之前的狀態），而不是憑空給一個 0 天。
+            last_run = d['ts_hour'].min()
+        else:
+            last_run = running['ts_hour'].max()
 
     days_since = (ctx.now - last_run).total_seconds() / 86400
     triggered = days_since >= days_th

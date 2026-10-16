@@ -20,7 +20,9 @@ synthetic.py — 合成多設備多天測試資料
   DEV-DEGRADE    45 天：前 14 天穩定（供基準期使用），之後
                  accCREST/accKURT/velOA/accRMS 線性劣化，並指派
                  ISO Class I → 應觸發 `IMPACT_RISE`／`DEGRADE_TREND`／
-                 `VEL_HIGH`／`STEP_CHANGE`／`ISO_ZONE`，且**不**觸發
+                 `VEL_HIGH`／`STEP_CHANGE`。`ISO_ZONE` 不在預期內：劇本的速度最大值
+                 約 2.6 mm/s，台帳指定 Group 2 剛性基礎（B/C 邊界 2.8 mm/s），
+                 全程在 Zone B，不會進 Zone C。且**不**觸發
                  `ISO_CLASS_SUSPECT`（基準期本身仍健康，等級沒有填錯，
                  純粹是後來真的劣化——兩者訊號來源不同，這是關鍵區辨）
   DEV-ORIENT     30 天：前 20 天三軸能量分佈固定「x 軸為主」，第 20 天起
@@ -261,7 +263,7 @@ SCENARIOS = {
     'DEV-STABLE': {'expect_min_findings': 0, 'expect_max_findings': 0},
     'DEV-GAP': {'gap_hours': [12, 50], 'expect_rule_triggered': ['SENSOR_OFFLINE']},
     'DEV-STANDBY': {'expect_rule_triggered': ['STANDBY_NO_RUNTIME']},
-    'DEV-DEGRADE': {'expect_rule_triggered': ['IMPACT_RISE', 'VEL_HIGH', 'ISO_ZONE'],
+    'DEV-DEGRADE': {'expect_rule_triggered': ['IMPACT_RISE', 'VEL_HIGH'],
                     'expect_rule_not_triggered': ['ISO_CLASS_SUSPECT']},
     'DEV-ORIENT': {'expect_rule_triggered': ['ORIENTATION_CHANGE']},
 }

@@ -2768,6 +2768,8 @@ def test_db(dbname: str) -> None:
 
     _test_migration_status_and_008(dbname, env)
     _test_error_isolation(dbname, env)
+    _test_silent_points(dbname, env)
+    _test_axis_baseline(dbname, env)
 
     subprocess.run(["dropdb", "--if-exists", dbname], env=env, capture_output=True)
 
@@ -3007,6 +3009,149 @@ def _test_error_isolation(dbname: str, env: dict) -> None:
           f"devices={left} agg_bad={n_agg_bad} ingest={bad_ingest}")
     check("失敗點之後的量測點照常處理並 commit（聚合都在）", good.ok and n_agg_ok > 0,
           f"{good.error} agg_ok={n_agg_ok}")
+    conn.close()
+
+
+def _test_silent_points(dbname: str, env: dict) -> None:
+    """
+    停止送資料的感測器：今天的資料夾裡沒有它的列，`run_daily` 只處理讀得到的設備，它就從處理名單消失，
+    「逾時無資料」永遠沒有機會對它評估。以及：備機門檻（30 天）比正式排程的聚合窗口（約 28 天）還長，
+    只看窗口永遠湊不到。這一節走真的 `run_daily`（資料夾 → 資料庫 → 規則 → 事項），不是直接呼叫規則函式。
+    """
+    from vibcore.db import repository as repo
+    from vibcore.pipeline import daily as daily_mod
+    from validate.synthetic import _dev_stable, _dev_standby
+    import tempfile as _tf
+
+    print("\n[13d] 停止送資料的感測器與備機：正式排程要評估到它們")
+    conn = _connect_db(env, dbname)
+
+    def write_days(directory, name, frame, first, last):
+        t = pd.to_datetime(frame['Time'], format='%Y/%m/%d %H:%M')
+        keep = (t >= pd.Timestamp(first)) & (t < pd.Timestamp(last) + pd.Timedelta(days=1))
+        frame[keep].assign(Name=name).to_csv(os.path.join(directory, f'{name}.csv'),
+                                              index=False, encoding='utf-8-sig')
+
+    # 測試庫是共用的，前面的小節改過規則設定；這一節明確指定要用的設定，不依賴殘留狀態
+    with conn.cursor() as cur:
+        cur.execute("UPDATE rule_config SET params = '{\"hours\": 24}'::jsonb, severity = 'err', is_active = TRUE "
+                    "WHERE rule_code = 'SENSOR_OFFLINE'")
+        cur.execute("UPDATE rule_config SET params = '{\"days\": 30}'::jsonb, severity = 'warn', is_active = TRUE "
+                    "WHERE rule_code = 'STANDBY_NO_RUNTIME'")
+    conn.commit()
+
+    stable = _dev_stable(np.random.default_rng(3))
+    with _tf.TemporaryDirectory() as d1:
+        write_days(d1, 'SIL-A', stable, '2026-05-01', '2026-05-02')
+        write_days(d1, 'SIL-B', stable, '2026-05-01', '2026-05-02')
+        r1 = daily_mod.run_daily(conn, d1, dt.date(2026, 5, 2))
+    conn.commit()
+    # 測試庫裡還留著前面各節建立的設備（它們今天也沒有資料），所以只看本節自己的 SIL- 設備
+    mine = lambda r: [(p.device_id, p.position) for p in r.silent if p.device_id.startswith('SIL-')]
+    check("（準備）第一天兩個感測器都有資料，沒有人被當成靜默", mine(r1) == [] and r1.n_ok == 2,
+          f"silent={mine(r1)} ok={r1.n_ok}")
+
+    # 一個無資料也無人認得的點：建了設備與量測點，從來沒有聚合資料
+    repo.upsert_device(conn, DeviceContext(device_id='SIL-C', device_name='從沒有資料', building='A棟',
+                                           floor='1F', system_name='冰水'))
+    repo.upsert_measure_point(conn, 'SIL-C', 'M1')
+    conn.commit()
+
+    with _tf.TemporaryDirectory() as d2:                    # 第二天只剩 SIL-A 的檔案
+        write_days(d2, 'SIL-A', stable, '2026-05-03', '2026-05-03')
+        r2 = daily_mod.run_daily(conn, d2, dt.date(2026, 5, 3))
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT finding_key, status, severity FROM finding "
+                    "WHERE device_id LIKE 'SIL-%' AND rule_code = 'SENSOR_OFFLINE' ORDER BY finding_key")
+        offline = [dict(x) for x in cur.fetchall()]
+    check("今天的資料裡沒有它的感測器被列為靜默，且不算在『成功量測點』裡",
+          mine(r2) == [('SIL-B', 'M1')] and r2.n_ok == 1, f"silent={mine(r2)} ok={r2.n_ok}")
+    check("靜默的感測器照樣得到『逾時無資料』事項；有資料的、從沒有資料的都沒有",
+          [o['finding_key'] for o in offline] == ['point:SIL-B_M1:sensor_offline'], str(offline))
+    check("排程摘要講出有幾個靜默量測點", '今日無資料的量測點' in r2.summary(), r2.summary())
+
+    for day in (4, 5, 6, 7):                                  # 之後連續幾天都沒有它
+        with _tf.TemporaryDirectory() as dn:
+            write_days(dn, 'SIL-A', stable, f'2026-05-0{day}', f'2026-05-0{day}')
+            daily_mod.run_daily(conn, dn, dt.date(2026, 5, day))
+        conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT status, occurrence_count FROM finding WHERE finding_key = 'point:SIL-B_M1:sensor_offline'")
+        f = dict(cur.fetchone())
+    check("感測器持續沒有資料時，事項每天重新觸發、不會因為『連續 3 天沒再觸發』被自動結案",
+          f['status'] not in ('auto_resolved', 'resolved') and f['occurrence_count'] >= 5, str(f))
+
+    # ── 備機：門檻 30 天比聚合窗口（約 28 天）長 ──
+    repo.upsert_device(conn, DeviceContext(device_id='SIL-S', device_name='備機', building='A棟', floor='1F',
+                                           system_name='冰水', is_standby=True))
+    conn.commit()
+    with _tf.TemporaryDirectory() as d3:
+        write_days(d3, 'SIL-S', _dev_standby(), '2026-05-01', '2026-06-24')
+        daily_mod.run_daily(conn, d3, dt.date(2026, 6, 24))
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT severity, detail FROM finding WHERE device_id = 'SIL-S' AND rule_code = 'STANDBY_NO_RUNTIME'")
+        sb = cur.fetchall()
+    check("備機最後一次運轉在 35 天前：正式排程報出『備機長期未啟動』（門檻 30 天，超過聚合窗口也要看得到）",
+          len(sb) == 1 and '35' in sb[0]['detail'], str([dict(x) for x in sb]))
+    conn.close()
+
+
+def _test_axis_baseline(dbname: str, env: dict) -> None:
+    """
+    AXIS_SHIFT／ORIENTATION_CHANGE 要拿『三軸能量佔比基準』比對，沒有基準就一律不判定。離線回測一直有算這個基準，
+    正式排程過去從來沒有人寫入 `measure_point.axis_energy_baseline`——兩條規則在正式環境永遠不會觸發，
+    而回測的件數把它們算在內。這一節走真的 `run_daily`。
+    """
+    from vibcore.db import repository as repo
+    from vibcore.metrics.baseline import compute_axis_energy_baseline
+    from vibcore.pipeline import daily as daily_mod
+    from validate.synthetic import _dev_orientation, _dev_stable
+    import tempfile as _tf
+
+    print("\n[13e] 三軸能量佔比基準：正式排程要算出並存庫，方向跳變才偵測得到")
+
+    # ── 純函式 ──
+    ts = pd.date_range('2026-05-01', periods=6, freq='h', tz='UTC')
+    mk = lambda i, v: {'major': v, 'mid': 0.2, 'minor': 0.1, 'energy': 10.0 + i}
+    frame = pd.DataFrame({'ts_hour': ts, 'data_status': ['ok'] * 5 + ['no_data'],
+                          'axis_energy_sorted': [mk(i, 0.6 + 0.01 * i) for i in range(6)]})
+    got = compute_axis_energy_baseline(frame)
+    check("基準取可信小時的中位數（no_data 的小時不算），並帶出基準期的振動量值",
+          got is not None and abs(got['major'] - 0.62) < 1e-9 and got['energy'] == 12.0, str(got))
+    check("可信小時不到 3 筆時不產生基準（樣本太少的中位數沒有代表性）",
+          compute_axis_energy_baseline(frame.iloc[:2]) is None)
+    check("只取指定日期範圍內的小時",
+          compute_axis_energy_baseline(frame, dt.date(2026, 5, 2), dt.date(2026, 5, 2)) is None
+          and compute_axis_energy_baseline(frame, dt.date(2026, 5, 1), dt.date(2026, 5, 1)) is not None)
+
+    # ── 正式排程 ──
+    conn = _connect_db(env, dbname)
+    with conn.cursor() as cur:
+        cur.execute("UPDATE rule_config SET is_active = TRUE, severity = 'warn' "
+                    "WHERE rule_code = 'ORIENTATION_CHANGE'")
+    conn.commit()
+    flip, calm = _dev_orientation(), _dev_stable(np.random.default_rng(3))
+    with _tf.TemporaryDirectory() as d:
+        flip.assign(Name='AXB-FLIP').to_csv(os.path.join(d, 'a.csv'), index=False, encoding='utf-8-sig')
+        calm.assign(Name='AXB-CALM').to_csv(os.path.join(d, 'b.csv'), index=False, encoding='utf-8-sig')
+        daily_mod.run_daily(conn, d, dt.date(2026, 5, 30))
+    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("SELECT device_id, axis_energy_baseline AS b FROM measure_point "
+                    "WHERE device_id IN ('AXB-FLIP', 'AXB-CALM') ORDER BY device_id")
+        stored = {r['device_id']: r['b'] for r in cur.fetchall()}
+        cur.execute("SELECT device_id FROM finding WHERE rule_code = 'ORIENTATION_CHANGE' "
+                    "AND device_id IN ('AXB-FLIP', 'AXB-CALM')")
+        flagged = sorted(r['device_id'] for r in cur.fetchall())
+    check("正式排程把三軸能量佔比基準算出來並存進量測點",
+          all(isinstance(v, dict) and {'major', 'mid', 'minor', 'energy'} <= set(v) for v in stored.values())
+          and len(stored) == 2, str(stored))
+    check("基準期取自穩定的前 14 天：主軸佔比約 0.65（跳變前的形狀），不是跳變後的 0.92",
+          abs(stored['AXB-FLIP']['major'] - 0.65) < 0.03, str(stored['AXB-FLIP']))
+    check("第 20 天起軸能量分佈形狀跳變的設備報出『軸能量分佈排列跳變』；形狀沒變的不報",
+          flagged == ['AXB-FLIP'], str(flagged))
     conn.close()
 
 
