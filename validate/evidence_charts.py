@@ -14,6 +14,7 @@ evidence_charts.py — 驗證報告的佐證圖表
     python -m validate.evidence_charts --dir DIR
 
 圖檔：
+    fig0_summary.png             簡報用的一頁總表：各腳本的通過／總數與通過率（讀 test_summary.json）
     fig1_guard_scenarios.png     九個情境、逐筆案例的結果（通過／已知缺口／需真實 Agent 才能測）
     fig2_guard_effect.png        每道機制處理了幾筆壞 payload，以及合法對照組有沒有被誤擋
     fig3_rule_calibration.png    規則校正閉環：以真實回測數據改變判定規則的三次調整
@@ -324,6 +325,56 @@ def fig4(replay: dict, out: Path) -> dict:
     return summary
 
 
+
+# ──────────────────────────────────────────────────────────
+# 圖 0：簡報用的一頁總表（腳本、驗證內容、通過／總數、通過率）
+# ──────────────────────────────────────────────────────────
+
+def fig0(scen: dict, replay_summary: dict | None, tests: dict, out: Path) -> None:
+    t = scen["meta"]["totals"]
+    rows = [
+        ("test_rules.py", tests["test_rules"]["scope"], tests["test_rules"]["passed"], tests["test_rules"]["total"], 0, 0),
+        ("test_reporting.py", tests["test_reporting"]["scope"], tests["test_reporting"]["passed"],
+         tests["test_reporting"]["total"], 0, 0),
+        ("agent_guard_scenarios", "Agent 護欄 9 情境（診斷用語、數字、總評、越權、注入、隔離）",
+         t["PASS"], sum(t.values()), t["GAP"], t["NOT_TESTED"]),
+    ]
+    if replay_summary:
+        n_exp = sum(len(v["expected"]) for v in replay_summary.values())
+        n_ok = n_exp - sum(len(v["expected_missing"]) for v in replay_summary.values())
+        rows.append(("replay_synthetic", "合成資料逐日重放：劇本預期的觸發", n_ok, n_exp, 0, 0))
+
+    fig = base_fig(11, 1.8 + 0.95 * len(rows))
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    top = 0.80
+    row_h = (top - 0.10) / len(rows)
+    ax.text(0.04, 0.93, "驗證腳本通過率", fontsize=17, fontweight="bold", color=INK, va="center")
+    cols = [0.04, 0.27, 0.62, 0.70]            # 腳本、驗證內容、通過／總數、通過率條
+    for x, label in zip(cols, ("腳本", "驗證內容", "通過／總數", "通過率")):
+        ax.text(x, top + 0.035, label, fontsize=9.5, color=INK2, va="center")
+    ax.plot([0.04, 0.96], [top, top], color=GRID, linewidth=1.2)
+    for i, (name, scope, ok, total, gap, untested) in enumerate(rows):
+        y = top - row_h * (i + 0.5)
+        ax.text(cols[0], y, name, fontsize=11, color=INK, va="center", fontweight="bold")
+        ax.text(cols[1], y, scope, fontsize=9, color=INK2, va="center", wrap=True)
+        ax.text(cols[2], y, f"{ok} / {total}", fontsize=12, color=INK, va="center", fontweight="bold")
+        x0, w = cols[3], 0.20
+        ax.add_patch(plt.Rectangle((x0, y - 0.022), w, 0.044, color=GRID))
+        ax.add_patch(plt.Rectangle((x0, y - 0.022), w * ok / total, 0.044, color=GOOD))
+        ax.text(x0 + w + 0.012, y, f"{ok / total:.0%}", fontsize=12, color=INK, va="center", fontweight="bold")
+        if gap or untested:
+            ax.text(cols[1], y - 0.045, f"另有 {gap} 項已知缺口、{untested} 項需真實 Agent 才能測；未通過 0 項",
+                    fontsize=8.5, color=INK2, va="center")
+        ax.plot([0.04, 0.96], [top - row_h * (i + 1)] * 2, color=GRID, linewidth=0.8)
+    fig.text(0.04, 0.03, "自動測試與腳本結果；護欄情境為腳本 payload 驗證機制，不是 Agent 輸出；Agent 實測欄位仍待實測。",
+             fontsize=8, color=MUTED)
+    fig.savefig(out, facecolor=SURFACE)
+    plt.close(fig)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", default="docs/evidence")
@@ -331,6 +382,8 @@ def main() -> int:
     d = Path(args.dir)
     setup_font()
     scen = json.loads((d / "agent_guard_scenarios.json").read_text(encoding="utf-8"))
+    tests = json.loads((d / "test_summary.json").read_text(encoding="utf-8"))
+    rs = d / "replay_summary.json"
     fig1(scen, d / "fig1_guard_scenarios.png")
     fig2(scen, d / "fig2_guard_effect.png")
     fig3(d / "fig3_rule_calibration.png")
@@ -341,6 +394,7 @@ def main() -> int:
         for dev, v in s.items():
             evs = ", ".join(f"{e['rule']}{'*' if e['unplanned'] else ''}@{e['date'][5:]}" for e in v["events"])
             print(f"{dev}: 預期 {v['expected']} → 實際 {evs}" + (f"  缺：{v['expected_missing']}" if v["expected_missing"] else ""))
+    fig0(scen, json.loads(rs.read_text(encoding="utf-8")) if rs.exists() else None, tests, d / "fig0_summary.png")
     print(f"圖已寫入 {d}")
     return 0
 

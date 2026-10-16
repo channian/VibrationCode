@@ -7,6 +7,7 @@
 | `agent_guard_scenarios.json` / `.csv` | Agent 護欄 9 個情境、61 筆案例的逐筆結果（payload 樣本、設計意圖、實際結果、狀態） | `python -m validate.agent_guard_scenarios` |
 | `replay_synthetic.json` | 合成資料逐日重放：每條規則第一次出現的日期（`first_day`）、最終的事項與觀察項目 | `python -m validate.replay_synthetic` |
 | `replay_summary.json` | 每台合成設備：劇本預期觸發 vs 實際觸發（標出劇本之外的觸發） | `python -m validate.evidence_charts` |
+| `fig0_summary.png` | **簡報用的一頁總表**：各腳本的通過／總數與通過率（兩份自動測試的項數記在 `test_summary.json`，重跑後要更新） | `python -m validate.evidence_charts` |
 | `fig1_guard_scenarios.png` | 各情境的案例結果（通過／已知缺口／需真實 Agent 才能測） | 同上 |
 | `fig2_guard_effect.png` | 每道機制處理了幾筆壞 payload、合法對照組有沒有被誤擋 | 同上 |
 | `fig3_rule_calibration.png` | 規則校正閉環的三次調整（衝擊性、偏高規則、每週工作量） | 同上；**數字來自真實回測，寫在 `validate/evidence_charts.py` 的 `REAL_BACKTEST`** |

@@ -1,0 +1,6 @@
+{
+  "note": "兩份自動測試的通過項數，由 python test_rules.py 與 python test_reporting.py 結尾的「全部通過（N 項）」手動記錄；重跑後請一併更新",
+  "recorded_on": "2026-10-16",
+  "test_rules": {"passed": 485, "total": 485, "scope": "規則、管線、資料庫、migration、台帳、錯誤隔離"},
+  "test_reporting": {"passed": 99, "total": 99, "scope": "週報、API、send_report、Agent 把關"}
+}
